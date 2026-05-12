@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-01-15T12:00:00.000Z",
+  "source_type": "http_request",
+  "source_data": {
+    "method": "POST",
+    "path": "/api/users",
+    "status_code": 201,
+    "controller": "app/api/users",
+    "action": "POST",
+    "format": "json",
+    "user_agent": "Mozilla/5.0",
+    "remote_ip": "127.0.0.1",
+    "request_params": {
+      "email": "alice@example.com",
+      "password": "[FILTERED]",
+      "api_key": "[FILTERED]",
+      "name": "Alice"
+    }
+  },
+  "outcome": "success",
+  "correlation_id": "ezl_1737000000000_deadbeef",
+  "resource_ids": [],
+  "context": {
+    "actor": {
+      "id": "42",
+      "label": "alice@example.com"
+    }
+  },
+  "duration_ms": 230,
+  "error_message": null
+}

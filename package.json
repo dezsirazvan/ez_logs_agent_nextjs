@@ -1,0 +1,150 @@
+{
+  "name": "@ezlogs/nextjs",
+  "version": "0.1.53-dev",
+  "description": "EZLogs agent for Next.js — capture HTTP, database, and background-job events as plain-English Action cards.",
+  "license": "MIT",
+  "author": "EZLogs",
+  "homepage": "https://ezlogs.io",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dezsirazvan/ez_logs_agent_nextjs"
+  },
+  "bugs": {
+    "url": "https://github.com/dezsirazvan/ez_logs_agent_nextjs/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.17"
+  },
+  "files": [
+    "dist",
+    "sql",
+    "bin",
+    "LICENSE",
+    "README.md"
+  ],
+  "bin": {
+    "install-triggers": "./bin/install-triggers.cjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./prisma": {
+      "types": "./dist/db/prisma.d.ts",
+      "import": "./dist/db/prisma.js",
+      "require": "./dist/db/prisma.cjs"
+    },
+    "./drizzle": {
+      "types": "./dist/db/drizzle.d.ts",
+      "import": "./dist/db/drizzle.js",
+      "require": "./dist/db/drizzle.cjs"
+    },
+    "./supabase": {
+      "types": "./dist/db/supabase.d.ts",
+      "import": "./dist/db/supabase.js",
+      "require": "./dist/db/supabase.cjs"
+    },
+    "./bullmq": {
+      "types": "./dist/jobs/bullmq.d.ts",
+      "import": "./dist/jobs/bullmq.js",
+      "require": "./dist/jobs/bullmq.cjs"
+    },
+    "./inngest": {
+      "types": "./dist/jobs/inngest.d.ts",
+      "import": "./dist/jobs/inngest.js",
+      "require": "./dist/jobs/inngest.cjs"
+    },
+    "./trigger": {
+      "types": "./dist/jobs/trigger.d.ts",
+      "import": "./dist/jobs/trigger.js",
+      "require": "./dist/jobs/trigger.cjs"
+    },
+    "./supabase-queues": {
+      "types": "./dist/jobs/supabase-queues.d.ts",
+      "import": "./dist/jobs/supabase-queues.js",
+      "require": "./dist/jobs/supabase-queues.cjs"
+    },
+    "./upstash-workflow": {
+      "types": "./dist/jobs/upstash-workflow.d.ts",
+      "import": "./dist/jobs/upstash-workflow.js",
+      "require": "./dist/jobs/upstash-workflow.cjs"
+    },
+    "./plugin": {
+      "types": "./dist/nextjs-plugin/index.d.ts",
+      "import": "./dist/nextjs-plugin/index.js",
+      "require": "./dist/nextjs-plugin/index.cjs"
+    },
+    "./actors": {
+      "types": "./dist/actors/index.d.ts",
+      "import": "./dist/actors/index.js",
+      "require": "./dist/actors/index.cjs"
+    },
+    "./triggers": {
+      "types": "./dist/triggers/index.d.ts",
+      "import": "./dist/triggers/index.js",
+      "require": "./dist/triggers/index.cjs"
+    },
+    "./sql/postgres/install.sql": "./sql/postgres/00_install.sql"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:parity": "vitest run tests/parity",
+    "typecheck": "tsc --noEmit",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "@prisma/client": ">=5",
+    "@supabase/supabase-js": ">=2",
+    "@trigger.dev/sdk": ">=3",
+    "@upstash/qstash": ">=2",
+    "@upstash/workflow": ">=1",
+    "bullmq": ">=4",
+    "drizzle-orm": ">=0.30",
+    "inngest": ">=3",
+    "next": ">=14"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/client": {
+      "optional": true
+    },
+    "@supabase/supabase-js": {
+      "optional": true
+    },
+    "@trigger.dev/sdk": {
+      "optional": true
+    },
+    "@upstash/qstash": {
+      "optional": true
+    },
+    "@upstash/workflow": {
+      "optional": true
+    },
+    "bullmq": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "inngest": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.20.0",
+    "pg": "^8.20.0",
+    "sucrase": "^3.35.0",
+    "tsup": "^8.0.2",
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0"
+  }
+}

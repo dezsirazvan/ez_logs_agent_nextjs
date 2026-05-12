@@ -1,0 +1,14 @@
+tests/
+example/
+src/
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+.gitignore
+.npmignore
+node_modules/
+*.log
+*.tsbuildinfo
+coverage/
+.vitest-cache/
+AGENT_PARITY_NOTES.md.bak

@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-01-15T12:00:00.000Z",
+  "source_type": "database_callback",
+  "source_data": {
+    "model_class": "User",
+    "operation": "create"
+  },
+  "outcome": "success",
+  "correlation_id": "ezl_1737000000000_deadbeef",
+  "resource_ids": [
+    {
+      "resource_type": "User",
+      "resource_id": "42"
+    }
+  ],
+  "context": {
+    "initial_attributes": {
+      "email": "alice@example.com",
+      "name": "Alice",
+      "role": "customer"
+    },
+    "display_name": "alice@example.com"
+  },
+  "duration_ms": null,
+  "error_message": null
+}

@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-01-15T12:00:00.000Z",
+  "source_type": "http_request",
+  "source_data": {
+    "method": "POST",
+    "path": "/api/orders",
+    "status_code": 500,
+    "controller": "app/api/orders",
+    "action": "POST",
+    "format": "json",
+    "user_agent": "Mozilla/5.0",
+    "remote_ip": "10.0.0.5"
+  },
+  "outcome": "failure",
+  "correlation_id": "ezl_1737000000000_deadbeef",
+  "resource_ids": [],
+  "context": null,
+  "duration_ms": 88,
+  "error_message": "RuntimeError: payment provider unreachable"
+}

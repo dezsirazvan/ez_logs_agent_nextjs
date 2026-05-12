@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-01-15T12:00:00.000Z",
+  "source_type": "database_callback",
+  "source_data": {
+    "model_class": "Order",
+    "operation": "update"
+  },
+  "outcome": "success",
+  "correlation_id": "ezl_1737000000000_deadbeef",
+  "resource_ids": [
+    {
+      "resource_type": "Order",
+      "resource_id": "1001"
+    }
+  ],
+  "context": {
+    "changes": [
+      {
+        "attribute": "status",
+        "from": "pending",
+        "to": "shipped"
+      },
+      {
+        "attribute": "tracking_number",
+        "from": null,
+        "to": "1Z999AA10123456784"
+      }
+    ],
+    "display_name": "ORD-1001"
+  },
+  "duration_ms": null,
+  "error_message": null
+}
