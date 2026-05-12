@@ -23,7 +23,7 @@ const LEVEL_RANK: Record<LogLevel, number> = {
 // Without globalThis-pinning, the latter sees the default "warn" and
 // silently swallows everything. Same fix we use for correlation
 // storage and the global config singleton.
-const LEVEL_KEY = Symbol.for("@ezlogs/nextjs:log-level");
+const LEVEL_KEY = Symbol.for("ezlogs-nextjs:log-level");
 
 interface GlobalWithLogLevel {
   [LEVEL_KEY]?: LogLevel;

@@ -11,7 +11,7 @@
 // Public API:
 //
 //   import { Queue, Worker } from "bullmq"
-//   import { wrapBullQueue, wrapBullWorker } from "@ezlogs/nextjs/bullmq"
+//   import { wrapBullQueue, wrapBullWorker } from "ezlogs-nextjs/bullmq"
 //
 //   const queue = wrapBullQueue(new Queue("emails"))
 //   const worker = wrapBullWorker(new Worker("emails", processor))

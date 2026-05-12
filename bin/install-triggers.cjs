@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// CLI shim for `npx @ezlogs/nextjs install-triggers`.
+// CLI shim for `npx ezlogs-nextjs install-triggers`.
 //
 // Lazy-imports the dist CJS bundle + `pg` so we don't load either when
 // the customer is just installing the package. `pg` is a devDependency

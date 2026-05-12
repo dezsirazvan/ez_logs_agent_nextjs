@@ -23,7 +23,7 @@
 //   import {
 //     wrapSupabaseQueueClient,
 //     captureQueueMessage,
-//   } from "@ezlogs/nextjs/supabase-queues"
+//   } from "ezlogs-nextjs/supabase-queues"
 //
 //   const supabase = wrapSupabaseQueueClient(createClient(url, key))
 //   await supabase.schema("pgmq_public").rpc("send", {

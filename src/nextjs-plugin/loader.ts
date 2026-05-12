@@ -71,7 +71,7 @@ const ALREADY_WRAPPED_MARKER = "__ezlogs_orig_";
 // route handler uses this — its output contains `export const GET =
 // __ezlogs_capture(handler, ...)` with no rename, so we need a
 // separate sentinel to detect already-wrapped files on second pass.
-const REEXPORT_WRAP_MARKER = "@ezlogs/nextjs auto-wrap re-export";
+const REEXPORT_WRAP_MARKER = "ezlogs-nextjs auto-wrap re-export";
 
 /**
  * Loader entry point. Receives the user's source file as a string,
@@ -161,14 +161,14 @@ function rewriteAppRoute(source: string, routeModulePath: string): string {
   const meta = JSON.stringify({ routeModulePath });
   const wrapperBlock = [
     "",
-    "// --- @ezlogs/nextjs auto-wrap (build-time) ---",
-    `import { captureRoute as __ezlogs_capture } from "@ezlogs/nextjs";`,
+    "// --- ezlogs-nextjs auto-wrap (build-time) ---",
+    `import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs";`,
     `const __ezlogs_meta = ${meta};`,
     ...Array.from(detected).map(
       (method) =>
         `export const ${method} = __ezlogs_capture(${ALREADY_WRAPPED_MARKER}${method}, __ezlogs_meta);`,
     ),
-    "// --- end @ezlogs/nextjs auto-wrap ---",
+    "// --- end ezlogs-nextjs auto-wrap ---",
     "",
   ].join("\n");
 
@@ -254,13 +254,13 @@ function rewriteLocalAliasedRouteExports(
 
   const meta = JSON.stringify({ routeModulePath });
   const wrapperLines = [
-    "// --- @ezlogs/nextjs auto-wrap re-export (build-time) ---",
-    `import { captureRoute as __ezlogs_capture } from "@ezlogs/nextjs";`,
+    "// --- ezlogs-nextjs auto-wrap re-export (build-time) ---",
+    `import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs";`,
     `const __ezlogs_meta = ${meta};`,
     ...entries.map(
       (e) => `export const ${e.exported} = __ezlogs_capture(${e.local}, __ezlogs_meta);`,
     ),
-    "// --- end @ezlogs/nextjs auto-wrap re-export ---",
+    "// --- end ezlogs-nextjs auto-wrap re-export ---",
   ];
 
   const before = source.slice(0, matchedBlock.start);
@@ -311,7 +311,7 @@ const SUPABASE_FACTORY_IMPORTS: ReadonlyArray<{
  * becomes:
  *
  *   import { createServerClient as __ezlogs_orig_createServerClient } from "@supabase/ssr";
- *   import { wrapSupabase as __ezlogs_wrap } from "@ezlogs/nextjs/supabase";
+ *   import { wrapSupabase as __ezlogs_wrap } from "ezlogs-nextjs/supabase";
  *   const createServerClient = (...args) => __ezlogs_wrap(__ezlogs_orig_createServerClient(...args));
  *   const c = createServerClient(url, key, opts);
  *
@@ -359,7 +359,7 @@ function rewriteSupabaseFactoryImports(source: string): string {
   if (!changed) return source;
 
   if (needsWrapImport) {
-    rewritten = `import { wrapSupabase as ${ALREADY_WRAPPED_MARKER}wrap } from "@ezlogs/nextjs/supabase";\n${rewritten}`;
+    rewritten = `import { wrapSupabase as ${ALREADY_WRAPPED_MARKER}wrap } from "ezlogs-nextjs/supabase";\n${rewritten}`;
   }
 
   return rewritten;
@@ -426,13 +426,13 @@ function rewriteServerActionFile(source: string): string {
 
   const wrapperBlock = [
     "",
-    "// --- @ezlogs/nextjs auto-wrap server action (build-time) ---",
-    `import { captureServerActionExport as __ezlogs_capture_sa } from "@ezlogs/nextjs";`,
+    "// --- ezlogs-nextjs auto-wrap server action (build-time) ---",
+    `import { captureServerActionExport as __ezlogs_capture_sa } from "ezlogs-nextjs";`,
     ...detected.map(
       (name) =>
         `export const ${name} = __ezlogs_capture_sa(${ALREADY_WRAPPED_MARKER}${name}, ${JSON.stringify(name)});`,
     ),
-    "// --- end @ezlogs/nextjs auto-wrap server action ---",
+    "// --- end ezlogs-nextjs auto-wrap server action ---",
     "",
   ].join("\n");
 
@@ -619,7 +619,7 @@ export function rewriteInlineServerActions(
 
   // Prepend the import. Idempotency check at the top of the function
   // already guarded against double-prepending.
-  return `import { ${INLINE_HELPER_NAME} } from "@ezlogs/nextjs";\n${out}`;
+  return `import { ${INLINE_HELPER_NAME} } from "ezlogs-nextjs";\n${out}`;
 }
 
 /**
@@ -868,10 +868,10 @@ function rewriteMiddleware(source: string): string {
   if (namedRenamed.changed) {
     const wrapperBlock = [
       "",
-      "// --- @ezlogs/nextjs auto-wrap middleware (build-time) ---",
-      `import { withMiddlewareCapture as __ezlogs_with_mw } from "@ezlogs/nextjs";`,
+      "// --- ezlogs-nextjs auto-wrap middleware (build-time) ---",
+      `import { withMiddlewareCapture as __ezlogs_with_mw } from "ezlogs-nextjs";`,
       `export const middleware = __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}middleware);`,
-      "// --- end @ezlogs/nextjs auto-wrap middleware ---",
+      "// --- end ezlogs-nextjs auto-wrap middleware ---",
       "",
     ].join("\n");
     return namedRenamed.source + wrapperBlock;
@@ -881,10 +881,10 @@ function rewriteMiddleware(source: string): string {
   if (defaultRenamed.changed) {
     const wrapperBlock = [
       "",
-      "// --- @ezlogs/nextjs auto-wrap middleware (build-time) ---",
-      `import { withMiddlewareCapture as __ezlogs_with_mw } from "@ezlogs/nextjs";`,
+      "// --- ezlogs-nextjs auto-wrap middleware (build-time) ---",
+      `import { withMiddlewareCapture as __ezlogs_with_mw } from "ezlogs-nextjs";`,
       `export default __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}default);`,
-      "// --- end @ezlogs/nextjs auto-wrap middleware ---",
+      "// --- end ezlogs-nextjs auto-wrap middleware ---",
       "",
     ].join("\n");
     return defaultRenamed.source + wrapperBlock;
@@ -907,13 +907,13 @@ function rewritePagesApi(source: string, routeModulePath: string): string {
   const meta = JSON.stringify({ routeModulePath });
   const wrapperBlock = [
     "",
-    "// --- @ezlogs/nextjs auto-wrap (build-time) ---",
-    `import { capturePagesApi as __ezlogs_capture_pages } from "@ezlogs/nextjs";`,
+    "// --- ezlogs-nextjs auto-wrap (build-time) ---",
+    `import { capturePagesApi as __ezlogs_capture_pages } from "ezlogs-nextjs";`,
     `const __ezlogs_meta = ${meta};`,
     `export default typeof ${ALREADY_WRAPPED_MARKER}default === "function"`,
     `  ? __ezlogs_capture_pages(${ALREADY_WRAPPED_MARKER}default, __ezlogs_meta)`,
     `  : ${ALREADY_WRAPPED_MARKER}default;`,
-    "// --- end @ezlogs/nextjs auto-wrap ---",
+    "// --- end ezlogs-nextjs auto-wrap ---",
     "",
   ].join("\n");
 

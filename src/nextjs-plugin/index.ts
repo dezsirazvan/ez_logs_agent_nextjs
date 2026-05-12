@@ -2,7 +2,7 @@
 //
 // Usage (in next.config.js):
 //
-//   const { withEzlogsConfig } = require("@ezlogs/nextjs/plugin")
+//   const { withEzlogsConfig } = require("ezlogs-nextjs/plugin")
 //   module.exports = withEzlogsConfig({
 //     // your existing Next.js config
 //   })
@@ -14,7 +14,7 @@
 // Database adapters (Supabase / Prisma / Drizzle) are NOT auto-wrapped.
 // Wrap your client factory once per file:
 //
-//   import { wrapSupabase } from "@ezlogs/nextjs/supabase"
+//   import { wrapSupabase } from "ezlogs-nextjs/supabase"
 //   const client = wrapSupabase(createServerClient(...))
 //
 // Why no auto-alias for Supabase: build-time aliasing of @supabase/ssr

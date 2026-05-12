@@ -86,7 +86,7 @@ describe("Postgres trigger install — end-to-end", () => {
     }
 
     // 1. Run our install via the programmatic entry, executing against
-    //    the live Postgres. This is what `npx @ezlogs/nextjs install-triggers`
+    //    the live Postgres. This is what `npx ezlogs-nextjs install-triggers`
     //    does at runtime.
     const lines: string[] = [];
     const code = await runInstall(parseArgs(["--connection=" + CONNECTION]), {

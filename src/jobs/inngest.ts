@@ -4,7 +4,7 @@
 // on the client, which gives us per-function-run lifecycle hooks:
 //
 //   import { Inngest } from "inngest"
-//   import { ezlogsInngestMiddleware } from "@ezlogs/nextjs/inngest"
+//   import { ezlogsInngestMiddleware } from "ezlogs-nextjs/inngest"
 //
 //   export const inngest = new Inngest({
 //     id: "my-app",
@@ -57,7 +57,7 @@ interface InngestSendContext {
  */
 export function ezlogsInngestMiddleware(): unknown {
   return {
-    name: "@ezlogs/nextjs",
+    name: "ezlogs-nextjs",
     init() {
       return {
         // Hook called once per function run (e.g. one trigger fires

@@ -7,7 +7,7 @@
 // Usage:
 //
 //   import { createClient } from "@supabase/supabase-js"
-//   import { wrapSupabase } from "@ezlogs/nextjs/supabase"
+//   import { wrapSupabase } from "ezlogs-nextjs/supabase"
 //
 //   const supabase = wrapSupabase(createClient(url, anonKey))
 //
@@ -206,7 +206,7 @@ export function wrapSupabase<T>(client: T): T {
 // Per-async-context "current Supabase client" — the most recent one
 // constructed inside the current correlation scope. Stored on globalThis
 // so it survives Next.js / Webpack / Turbopack module duplication.
-const GLOBAL_CLIENT_KEY = Symbol.for("@ezlogs/nextjs:supabase-current-client");
+const GLOBAL_CLIENT_KEY = Symbol.for("ezlogs-nextjs:supabase-current-client");
 
 interface GlobalWithCurrentClient {
   [GLOBAL_CLIENT_KEY]?: SupabaseClientLike | null;

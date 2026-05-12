@@ -2,8 +2,8 @@
 //
 // Usage in a customer's instrumentation.ts:
 //
-//   import { ezlogs } from "@ezlogs/nextjs";
-//   import { clerkActor } from "@ezlogs/nextjs/actors";
+//   import { ezlogs } from "ezlogs-nextjs";
+//   import { clerkActor } from "ezlogs-nextjs/actors";
 //
 //   ezlogs.init({
 //     // ...

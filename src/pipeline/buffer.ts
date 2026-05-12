@@ -13,7 +13,7 @@ import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
 import type { Event } from "../event-builder.js";
 
-const GLOBAL_QUEUE_KEY = Symbol.for("@ezlogs/nextjs:buffer-queue");
+const GLOBAL_QUEUE_KEY = Symbol.for("ezlogs-nextjs:buffer-queue");
 
 interface GlobalWithQueue {
   [GLOBAL_QUEUE_KEY]?: Event[];

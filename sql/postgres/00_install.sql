@@ -1,4 +1,4 @@
--- @ezlogs/nextjs — Postgres trigger-based change-data-capture install.
+-- ezlogs-nextjs — Postgres trigger-based change-data-capture install.
 --
 -- Run once per database. Idempotent: safe to re-run after upgrades.
 -- After this, attach the trigger to specific tables with:

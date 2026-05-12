@@ -52,7 +52,7 @@ const PLATFORM_REQUEST_ID_HEADERS = [
 // events ship with correlation_id=NONE despite running inside the
 // Server Action's scope.
 const storage = createScopedStorage<string>(
-  Symbol.for("@ezlogs/nextjs:correlation-storage"),
+  Symbol.for("ezlogs-nextjs:correlation-storage"),
 );
 
 /**

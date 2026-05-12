@@ -47,7 +47,7 @@ describe("loader — App Router rewrite", () => {
     expect(out).toContain("async function __ezlogs_orig_GET(");
     expect(out).not.toMatch(/^export\s+async\s+function\s+GET\b/m);
     // Wrapped re-export appended
-    expect(out).toContain('import { captureRoute as __ezlogs_capture } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs"');
     expect(out).toContain("export const GET = __ezlogs_capture(__ezlogs_orig_GET, __ezlogs_meta)");
     expect(out).toContain('"routeModulePath":"app/api/users"');
     // Rest of the user's code is preserved verbatim
@@ -170,7 +170,7 @@ export { handler as GET, handler as POST };
     // Original export statement removed.
     expect(out).not.toMatch(/export\s*\{\s*handler\s+as\s+GET/);
     // Wrapped exports added.
-    expect(out).toContain('import { captureRoute as __ezlogs_capture } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs"');
     expect(out).toContain("export const GET = __ezlogs_capture(handler, __ezlogs_meta)");
     expect(out).toContain("export const POST = __ezlogs_capture(handler, __ezlogs_meta)");
     // Route module path computed from the resource path.
@@ -232,7 +232,7 @@ describe("loader — Pages Router rewrite", () => {
     const source = `export default async function handler(req, res) {\n  res.status(200).json({ ok: true });\n}\n`;
     const out = loader.call(ctx as never, source);
     expect(out).toContain("const __ezlogs_orig_default = async function");
-    expect(out).toContain('import { capturePagesApi as __ezlogs_capture_pages } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { capturePagesApi as __ezlogs_capture_pages } from "ezlogs-nextjs"');
     expect(out).toContain("__ezlogs_capture_pages(__ezlogs_orig_default, __ezlogs_meta)");
     expect(out).toContain('"routeModulePath":"pages/api/users"');
   });
@@ -319,7 +319,7 @@ describe("loader — Middleware rewrite", () => {
     const out = loader.call(ctx as never, source);
 
     expect(out).toContain("function __ezlogs_orig_middleware(");
-    expect(out).toContain('import { withMiddlewareCapture as __ezlogs_with_mw } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { withMiddlewareCapture as __ezlogs_with_mw } from "ezlogs-nextjs"');
     expect(out).toContain("export const middleware = __ezlogs_with_mw(__ezlogs_orig_middleware)");
     // config export must pass through untouched
     expect(out).toContain('export const config = { matcher: ["/:path*"] }');
@@ -412,7 +412,7 @@ describe("loader — Server Action rewrite", () => {
     const out = loader.call(saCtx() as never, source);
     expect(out).toContain("'use server'"); // directive preserved verbatim
     expect(out).toContain("async function __ezlogs_orig_createUser(");
-    expect(out).toContain('import { captureServerActionExport as __ezlogs_capture_sa } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { captureServerActionExport as __ezlogs_capture_sa } from "ezlogs-nextjs"');
     expect(out).toContain('export const createUser = __ezlogs_capture_sa(__ezlogs_orig_createUser, "createUser")');
   });
 
@@ -541,7 +541,7 @@ describe("loader — Supabase factory import rewrite", () => {
 
   it("is idempotent — already-rewritten sources pass through", () => {
     const source =
-      `import { wrapSupabase as __ezlogs_orig_wrap } from "@ezlogs/nextjs/supabase";\nimport { createServerClient as __ezlogs_orig_createServerClient } from "@supabase/ssr";\nconst createServerClient = (...args) => __ezlogs_orig_wrap(__ezlogs_orig_createServerClient(...args));\nexport const c = createServerClient(u, k);\n`;
+      `import { wrapSupabase as __ezlogs_orig_wrap } from "ezlogs-nextjs/supabase";\nimport { createServerClient as __ezlogs_orig_createServerClient } from "@supabase/ssr";\nconst createServerClient = (...args) => __ezlogs_orig_wrap(__ezlogs_orig_createServerClient(...args));\nexport const c = createServerClient(u, k);\n`;
     const out = loader.call(sbCtx() as never, source);
     expect(out).toBe(source);
   });
@@ -565,7 +565,7 @@ async function deletePost(formData: FormData) {
 export default function Page() { return null; }
 `;
     const out = loader.call(inlineCtx() as never, source);
-    expect(out).toContain('import { __ezlogs_run_inline_server_action } from "@ezlogs/nextjs"');
+    expect(out).toContain('import { __ezlogs_run_inline_server_action } from "ezlogs-nextjs"');
     // Declaration intact (SWC needs it to register the action).
     expect(out).toMatch(/async\s+function\s+deletePost\s*\(formData:\s*FormData\)/);
     // Directive still the first inner statement.
@@ -650,7 +650,7 @@ export async function action() { return 1; }
   });
 
   it("is idempotent — already-rewritten sources pass through", () => {
-    const source = `import { __ezlogs_run_inline_server_action } from "@ezlogs/nextjs";
+    const source = `import { __ezlogs_run_inline_server_action } from "ezlogs-nextjs";
 async function deletePost() { "use server";
 return await __ezlogs_run_inline_server_action(\"deletePost\", async () => { await x(); });
 }

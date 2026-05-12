@@ -2,9 +2,9 @@
 //
 // Usage:
 //
-//   npx @ezlogs/nextjs install-triggers --tables=users,orders
-//   npx @ezlogs/nextjs install-triggers --connection=postgres://... --tables=users
-//   npx @ezlogs/nextjs install-triggers --print              (just print SQL, don't apply)
+//   npx ezlogs-nextjs install-triggers --tables=users,orders
+//   npx ezlogs-nextjs install-triggers --connection=postgres://... --tables=users
+//   npx ezlogs-nextjs install-triggers --print              (just print SQL, don't apply)
 //
 // Detects the database engine from the connection URL. Postgres-only
 // in v0.1.x; MySQL is a separate command in a follow-up. PlanetScale
@@ -40,7 +40,7 @@ interface ParsedArgs {
 
 export function parseArgs(argv: string[]): ParsedArgs {
   // Default to auto-detect when no --tables= is passed. Customers
-  // running `npx @ezlogs/nextjs install-triggers` with no other flags
+  // running `npx ezlogs-nextjs install-triggers` with no other flags
   // get every business table tracked in one command — matching the
   // "drop in, capture every write" promise of the rest of the agent.
   const out: ParsedArgs = {
@@ -79,10 +79,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
 }
 
 const HELP = `\
-Install the @ezlogs/nextjs row-trigger audit capture for Postgres.
+Install the ezlogs-nextjs row-trigger audit capture for Postgres.
 
 Usage:
-  npx @ezlogs/nextjs install-triggers [options]
+  npx ezlogs-nextjs install-triggers [options]
 
 Options:
   --connection=<url>   Database connection string. Defaults to DATABASE_URL

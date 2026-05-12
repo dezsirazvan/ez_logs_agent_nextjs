@@ -137,7 +137,7 @@ describe("triggers install — run paths", () => {
       out: (l) => lines.push(l),
     });
     expect(code).toBe(0);
-    expect(lines.join("\n")).toMatch(/Install the @ezlogs\/nextjs/);
+    expect(lines.join("\n")).toMatch(/Install the ezlogs-nextjs/);
   });
 
   it("PlanetScale connection prints fallback message and returns 0", async () => {

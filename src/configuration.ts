@@ -117,7 +117,7 @@ export interface InitOptions {
    * Trigger-based DB capture path. When set, the HTTP capturers flush
    * `ezlogs_audit_log` rows tagged with the current correlation_id at
    * the end of each request and emit them as `database_callback`
-   * events. Run `npx @ezlogs/nextjs install-triggers` once per
+   * events. Run `npx ezlogs-nextjs install-triggers` once per
    * database to set up the audit table + trigger function, then
    * either:
    *   - set this option to a function that runs a single SQL
@@ -395,7 +395,7 @@ export class Configuration {
 //
 // The Symbol is unique to the package so we don't collide with any
 // host code that uses globalThis.
-const GLOBAL_CONFIG_KEY = Symbol.for("@ezlogs/nextjs:configuration");
+const GLOBAL_CONFIG_KEY = Symbol.for("ezlogs-nextjs:configuration");
 
 interface GlobalWithConfig {
   [GLOBAL_CONFIG_KEY]?: Configuration;

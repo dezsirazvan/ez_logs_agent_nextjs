@@ -22,7 +22,7 @@ export type { ActorContext } from "./configuration.js";
 
 // Same globalThis-pinning as correlation.ts — see comment there.
 const storage = createScopedStorage<ActorContext | null>(
-  Symbol.for("@ezlogs/nextjs:actor-storage"),
+  Symbol.for("ezlogs-nextjs:actor-storage"),
 );
 
 /**

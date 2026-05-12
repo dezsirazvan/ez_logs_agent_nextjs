@@ -38,7 +38,7 @@ import { createScopedStorage } from "../edge-fallback.js";
  * request — same reasoning as `correlation.ts` and `actor.ts`.
  */
 const storage = createScopedStorage<bigint>(
-  Symbol.for("@ezlogs/nextjs:audit-snapshot-storage"),
+  Symbol.for("ezlogs-nextjs:audit-snapshot-storage"),
 );
 
 /** Read the current request's audit snapshot, if any. */

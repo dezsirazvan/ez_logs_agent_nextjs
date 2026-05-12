@@ -17,7 +17,7 @@
 // Usage:
 //
 //   import { drizzle } from "drizzle-orm/postgres-js"
-//   import { ezlogsDrizzleLogger } from "@ezlogs/nextjs/drizzle"
+//   import { ezlogsDrizzleLogger } from "ezlogs-nextjs/drizzle"
 //
 //   const db = drizzle(client, { logger: ezlogsDrizzleLogger() })
 //

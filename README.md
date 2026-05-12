@@ -1,4 +1,4 @@
-# @ezlogs/nextjs
+# ezlogs-nextjs
 
 **Drop-in activity logging for Next.js.** Captures HTTP requests, database changes, Server Actions, and background jobs. Ships them to the EZLogs server as plain-English Action cards your whole team can read.
 
@@ -57,11 +57,11 @@ Your support team, PM, and CEO can read that without an engineer.
 ## Install
 
 ```bash
-pnpm add @ezlogs/nextjs
+pnpm add ezlogs-nextjs
 # or
-npm install @ezlogs/nextjs
+npm install ezlogs-nextjs
 # or
-bun add @ezlogs/nextjs
+bun add ezlogs-nextjs
 ```
 
 **Requirements:**
@@ -84,7 +84,7 @@ Sign in to your EZLogs dashboard → **Settings → API Keys → Create API key*
 Create `instrumentation.ts` at your project root (or `src/instrumentation.ts` if you use the `src/` layout):
 
 ```ts
-import { ezlogs } from "@ezlogs/nextjs";
+import { ezlogs } from "ezlogs-nextjs";
 
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
@@ -106,7 +106,7 @@ If you already have a `next.config.*` file, keep everything that's there. The pl
 
 ```ts
 import type { NextConfig } from "next";
-import { withEzlogsConfig } from "@ezlogs/nextjs/plugin";
+import { withEzlogsConfig } from "ezlogs-nextjs/plugin";
 
 const nextConfig: NextConfig = {
   // ⬇ Anything you had before (or leave empty {} if this is a fresh project).
@@ -126,7 +126,7 @@ The cast is harmless: `withEzlogsConfig` declares a stricter `NextConfig` shape 
 **`next.config.mjs` (ESM):**
 
 ```js
-import { withEzlogsConfig } from "@ezlogs/nextjs/plugin";
+import { withEzlogsConfig } from "ezlogs-nextjs/plugin";
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -139,7 +139,7 @@ export default withEzlogsConfig(nextConfig);
 **`next.config.js` (CommonJS):**
 
 ```js
-const { withEzlogsConfig } = require("@ezlogs/nextjs/plugin");
+const { withEzlogsConfig } = require("ezlogs-nextjs/plugin");
 
 module.exports = withEzlogsConfig({
   // ⬇ Anything you had before (or leave empty {} if this is a fresh project).
@@ -240,7 +240,7 @@ Both produce the same `Server Action` event with actor, correlation, and `redire
 If you need manual control (e.g., aliased imports, non-standard file layouts):
 
 ```ts
-import { captureServerAction } from "@ezlogs/nextjs";
+import { captureServerAction } from "ezlogs-nextjs";
 
 export const updateProfile = captureServerAction(
   async (formData: FormData) => {
@@ -258,7 +258,7 @@ Two paths. Pick the one that fits your stack. Both emit the same `database_callb
 
 ```bash
 # One-time install (per database). Reads DATABASE_URL from env.
-npx @ezlogs/nextjs install-triggers
+npx ezlogs-nextjs install-triggers
 ```
 
 That single command introspects your schema and tracks every business table automatically. Migration tables (`_prisma_migrations`, `schema_migrations`), session tables (`Session`, `sessions`), and the agent's own audit table are skipped — you'll see exactly what's tracked in the output. Pass `--tables=<a,b,c>` for an explicit list, `--tables=none` to install infrastructure only, or `--print` to dump the SQL without applying.
@@ -266,7 +266,7 @@ That single command introspects your schema and tracks every business table auto
 Wire it up in `instrumentation.ts`:
 
 ```ts
-import { ezlogs } from "@ezlogs/nextjs";
+import { ezlogs } from "ezlogs-nextjs";
 
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
@@ -285,9 +285,9 @@ Your existing `prisma.post.create(...)` / `db.update(users)...` / `pool.query("I
 
 **Fallback: per-ORM adapters.** When the trigger path isn't viable (PlanetScale, supabase-js, customers who can't run the migration), adapters keep working with reduced fidelity (writes captured, but Drizzle gives no pre-state, Prisma's `$extends` gives only `to`, and supabase-js multi-`.eq()` filters drop `from`):
 
-- **Prisma** — `import { ezlogsPrisma } from "@ezlogs/nextjs/prisma"`
-- **Drizzle** — `import { ezlogsDrizzleLogger } from "@ezlogs/nextjs/drizzle"`
-- **Supabase** — `import { wrapSupabase } from "@ezlogs/nextjs/supabase"`
+- **Prisma** — `import { ezlogsPrisma } from "ezlogs-nextjs/prisma"`
+- **Drizzle** — `import { ezlogsDrizzleLogger } from "ezlogs-nextjs/drizzle"`
+- **Supabase** — `import { wrapSupabase } from "ezlogs-nextjs/supabase"`
 
 ### 4. Background Jobs
 
@@ -295,17 +295,17 @@ Five runners. Pick the one(s) you use. All emit the same `background_job` event.
 
 | Runner | Import |
 |---|---|
-| BullMQ | `@ezlogs/nextjs/bullmq` |
-| Inngest | `@ezlogs/nextjs/inngest` |
-| Trigger.dev | `@ezlogs/nextjs/trigger` |
-| Supabase Queues (pgmq) | `@ezlogs/nextjs/supabase-queues` |
-| Upstash Workflow / QStash | `@ezlogs/nextjs/upstash-workflow` |
+| BullMQ | `ezlogs-nextjs/bullmq` |
+| Inngest | `ezlogs-nextjs/inngest` |
+| Trigger.dev | `ezlogs-nextjs/trigger` |
+| Supabase Queues (pgmq) | `ezlogs-nextjs/supabase-queues` |
+| Upstash Workflow / QStash | `ezlogs-nextjs/upstash-workflow` |
 
 Example (BullMQ):
 
 ```ts
 import { Queue, Worker } from "bullmq";
-import { wrapBullQueue, wrapBullWorker } from "@ezlogs/nextjs/bullmq";
+import { wrapBullQueue, wrapBullWorker } from "ezlogs-nextjs/bullmq";
 
 export const queue = wrapBullQueue(new Queue("emails"));
 export const worker = wrapBullWorker(new Worker("emails", processor));
@@ -322,7 +322,7 @@ EZLogs tracks **who** triggered each action. Built-in extractors for the four mo
 ### Clerk
 
 ```ts
-import { clerkActor } from "@ezlogs/nextjs/actors";
+import { clerkActor } from "ezlogs-nextjs/actors";
 
 ezlogs.init({
   // ...
@@ -333,7 +333,7 @@ ezlogs.init({
 ### NextAuth.js (v4)
 
 ```ts
-import { nextAuthActor } from "@ezlogs/nextjs/actors";
+import { nextAuthActor } from "ezlogs-nextjs/actors";
 import { authOptions } from "@/lib/auth";
 
 ezlogs.init({
@@ -345,7 +345,7 @@ ezlogs.init({
 ### Auth.js (v5)
 
 ```ts
-import { authJsActor } from "@ezlogs/nextjs/actors";
+import { authJsActor } from "ezlogs-nextjs/actors";
 import { auth } from "@/auth";
 
 ezlogs.init({
@@ -528,7 +528,7 @@ The plugin is idempotent and safe to re-run. The loader fast-paths files that do
 
 ```ts
 import { Queue, Worker } from "bullmq";
-import { wrapBullQueue, wrapBullWorker } from "@ezlogs/nextjs/bullmq";
+import { wrapBullQueue, wrapBullWorker } from "ezlogs-nextjs/bullmq";
 
 export const queue = wrapBullQueue(new Queue("emails"));
 export const worker = wrapBullWorker(new Worker("emails", processor));
@@ -538,7 +538,7 @@ export const worker = wrapBullWorker(new Worker("emails", processor));
 
 ```ts
 import { Inngest } from "inngest";
-import { ezlogsInngestMiddleware } from "@ezlogs/nextjs/inngest";
+import { ezlogsInngestMiddleware } from "ezlogs-nextjs/inngest";
 
 export const inngest = new Inngest({
   id: "my-app",
@@ -551,7 +551,7 @@ export const inngest = new Inngest({
 ```ts
 // trigger/init.ts — call once at task-runtime startup
 import { tasks } from "@trigger.dev/sdk/v3";
-import { registerTriggerHooks } from "@ezlogs/nextjs/trigger";
+import { registerTriggerHooks } from "ezlogs-nextjs/trigger";
 
 registerTriggerHooks(tasks);
 ```
@@ -563,7 +563,7 @@ import { createClient } from "@supabase/supabase-js";
 import {
   wrapSupabaseQueueClient,
   captureQueueMessage,
-} from "@ezlogs/nextjs/supabase-queues";
+} from "ezlogs-nextjs/supabase-queues";
 
 const supabase = wrapSupabaseQueueClient(createClient(url, key));
 
@@ -590,7 +590,7 @@ import { serve } from "@upstash/workflow/nextjs";
 import {
   wrapQStashClient,
   captureWorkflowRequest,
-} from "@ezlogs/nextjs/upstash-workflow";
+} from "ezlogs-nextjs/upstash-workflow";
 
 export const qstash = wrapQStashClient(new Client({ token: process.env.QSTASH_TOKEN! }));
 
@@ -615,7 +615,7 @@ The agent auto-detects Vercel, AWS Lambda, Netlify Functions, and Cloudflare Pag
 For runtimes the auto-detect doesn't recognize, call `await ezlogs.flush()` before your handler returns:
 
 ```ts
-import { ezlogs, captureRoute } from "@ezlogs/nextjs";
+import { ezlogs, captureRoute } from "ezlogs-nextjs";
 
 export const POST = captureRoute(async (request) => {
   /* ... your handler ... */

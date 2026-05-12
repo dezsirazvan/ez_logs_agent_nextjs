@@ -1,5 +1,5 @@
 {
-  "name": "@ezlogs/nextjs",
+  "name": "ezlogs-nextjs",
   "version": "0.1.0",
   "description": "EZLogs agent for Next.js — capture HTTP, database, and background-job events as plain-English Action cards.",
   "license": "MIT",

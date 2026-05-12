@@ -2,8 +2,8 @@
 //
 // Usage in a customer's instrumentation.ts:
 //
-//   import { ezlogs } from "@ezlogs/nextjs";
-//   import { nextAuthActor } from "@ezlogs/nextjs/actors";
+//   import { ezlogs } from "ezlogs-nextjs";
+//   import { nextAuthActor } from "ezlogs-nextjs/actors";
 //   import { authOptions } from "@/lib/auth";  // user's NextAuth config
 //
 //   ezlogs.init({

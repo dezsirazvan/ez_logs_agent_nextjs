@@ -485,7 +485,7 @@ interface PagesApiRes {
  * So Server Actions are a manual opt-in:
  *
  *   "use server"
- *   import { captureServerAction } from "@ezlogs/nextjs"
+ *   import { captureServerAction } from "ezlogs-nextjs"
  *
  *   export const updateProfile = captureServerAction(
  *     async (formData: FormData) => {

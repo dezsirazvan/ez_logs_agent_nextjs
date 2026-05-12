@@ -1,4 +1,4 @@
-// @ezlogs/nextjs/triggers — public API for the trigger-based capture path.
+// ezlogs-nextjs/triggers — public API for the trigger-based capture path.
 //
 // Phase 5 introduces row-trigger-based change-data-capture as the
 // primary DB capture path. The per-ORM adapters (`./drizzle`,

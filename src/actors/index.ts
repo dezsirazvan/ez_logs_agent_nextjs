@@ -1,9 +1,9 @@
-// @ezlogs/nextjs/actors — built-in actor extractors for the most
+// ezlogs-nextjs/actors — built-in actor extractors for the most
 // common Next.js auth providers. Each adapter is a one-line opt-in:
 //
-//   import { clerkActor }    from "@ezlogs/nextjs/actors";
-//   import { nextAuthActor } from "@ezlogs/nextjs/actors";
-//   import { authJsActor }   from "@ezlogs/nextjs/actors";
+//   import { clerkActor }    from "ezlogs-nextjs/actors";
+//   import { nextAuthActor } from "ezlogs-nextjs/actors";
+//   import { authJsActor }   from "ezlogs-nextjs/actors";
 //
 //   ezlogs.init({ actorFromRequest: clerkActor() });
 //

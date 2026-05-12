@@ -17,7 +17,7 @@
 //
 //    Use:
 //      import { Client } from "@upstash/qstash"
-//      import { wrapQStashClient } from "@ezlogs/nextjs/upstash-workflow"
+//      import { wrapQStashClient } from "ezlogs-nextjs/upstash-workflow"
 //      const qstash = wrapQStashClient(new Client({ token }))
 //
 // 2. captureWorkflowRequest({ request, workflowName, ...}, work):
@@ -30,7 +30,7 @@
 //
 //    Use:
 //      import { serve } from "@upstash/workflow/nextjs"
-//      import { captureWorkflowRequest } from "@ezlogs/nextjs/upstash-workflow"
+//      import { captureWorkflowRequest } from "ezlogs-nextjs/upstash-workflow"
 //
 //      export const { POST } = serve(async (context) => {
 //        await captureWorkflowRequest(

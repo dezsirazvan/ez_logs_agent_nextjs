@@ -1,12 +1,12 @@
 /**
- * @ezlogs/nextjs — public entry point.
+ * ezlogs-nextjs — public entry point.
  *
  * `ezlogs.init()` configures the agent and starts the periodic flush
  * scheduler. `ezlogs.flush()` drains the in-memory buffer and ships
  * synchronously — call this before serverless handlers return.
  *
  * Capture surfaces (HTTP, DB, jobs) attach themselves via subpath
- * imports (`@ezlogs/nextjs/prisma`, etc.). The core entry point only
+ * imports (`ezlogs-nextjs/prisma`, etc.). The core entry point only
  * runs the pipeline.
  */
 

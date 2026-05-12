@@ -2,7 +2,7 @@
 //
 // Loads node:async_hooks via a runtime-only require so static
 // analyzers (Turbopack/Webpack) don't follow the import into the
-// browser bundle. Why: when @ezlogs/nextjs is imported from a
+// browser bundle. Why: when ezlogs-nextjs is imported from a
 // supabase-shim path that ALSO appears in the client bundle, any
 // static `import "node:async_hooks"` makes Turbopack fail because
 // async_hooks doesn't exist on the browser. The runtime-only path
@@ -85,7 +85,7 @@ interface GlobalScopedStores {
  * itself is stable across modules.
  */
 export function createScopedStorage<T>(
-  key: symbol = Symbol.for("@ezlogs/nextjs:default-scoped-storage"),
+  key: symbol = Symbol.for("ezlogs-nextjs:default-scoped-storage"),
 ): ScopedStorage<T> {
   const globalStore = globalThis as unknown as GlobalScopedStores;
   let entry = globalStore[key];

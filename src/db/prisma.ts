@@ -4,7 +4,7 @@
 // Usage:
 //
 //   import { PrismaClient } from "@prisma/client"
-//   import { ezlogsPrisma } from "@ezlogs/nextjs/prisma"
+//   import { ezlogsPrisma } from "ezlogs-nextjs/prisma"
 //
 //   const prisma = new PrismaClient().$extends(ezlogsPrisma())
 //

@@ -17,7 +17,7 @@ import { logger } from "../logger.js";
 import { drainEvents } from "./buffer.js";
 import { retrySender } from "./retry-sender.js";
 
-const GLOBAL_KEY = Symbol.for("@ezlogs/nextjs:flush-scheduler-state");
+const GLOBAL_KEY = Symbol.for("ezlogs-nextjs:flush-scheduler-state");
 
 interface SchedulerState {
   timer: ReturnType<typeof setInterval> | null;

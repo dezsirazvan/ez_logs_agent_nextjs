@@ -5,7 +5,7 @@
 // `init.ts` at the trigger directory root:
 //
 //   import { tasks } from "@trigger.dev/sdk/v3"
-//   import { registerTriggerHooks } from "@ezlogs/nextjs/trigger"
+//   import { registerTriggerHooks } from "ezlogs-nextjs/trigger"
 //   registerTriggerHooks(tasks)
 //
 // Per Trigger.dev's lifecycle docs, the stable global hooks are:
