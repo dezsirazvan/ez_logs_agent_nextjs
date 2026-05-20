@@ -110,6 +110,18 @@ export function withEzlogsConfig(nextConfig: NextConfig = {}): NextConfig {
 
   return {
     ...nextConfig,
+    // Mark the agent as a server-external package so Next.js's webpack
+    // doesn't try to bundle it through its own pipeline. The agent
+    // imports Node built-ins (`node:crypto`, `node:async_hooks`),
+    // and Next's bundler can strip the `node:` prefix on some compile
+    // paths (notably the Next-15 instrumentation.ts bundle) — turning
+    // `import "node:crypto"` into `import "crypto"`, which then fails
+    // to resolve. Treating the agent as a regular Node dependency
+    // mirrors what Node's resolver does natively at runtime and works
+    // across Next 14, 15, and the App Router / Pages Router splits.
+    serverExternalPackages: mergeServerExternalPackages(
+      (nextConfig as { serverExternalPackages?: string[] }).serverExternalPackages,
+    ),
     webpack(config, options): WebpackConfig {
       const merged = userWebpack ? userWebpack(config, options) : config;
       // Server-side only — capturing client bundles would emit events
@@ -118,7 +130,16 @@ export function withEzlogsConfig(nextConfig: NextConfig = {}): NextConfig {
       return installLoaders(merged, options);
     },
     turbopack: mergeTurbopackConfig(nextConfig.turbopack, loaderPath),
-  };
+  } as NextConfig;
+}
+
+function mergeServerExternalPackages(
+  user: readonly string[] | undefined,
+): string[] {
+  const ezlogsPkg = "ezlogs-nextjs";
+  if (!user) return [ezlogsPkg];
+  if (user.includes(ezlogsPkg)) return [...user];
+  return [...user, ezlogsPkg];
 }
 
 function mergeTurbopackConfig(

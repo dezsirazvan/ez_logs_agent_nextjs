@@ -11,11 +11,20 @@
 
 import type { LogLevel } from "./logger.js";
 
+/** Categories of who/what performed an action. Mirrors the Ruby
+ *  `Event#actor_kind` enum. Defaults to "human" on the server when
+ *  absent. */
+export type ActorKind = "human" | "agent" | "system" | "hybrid";
+
 export interface ActorContext {
   /** Stable identifier for the user (e.g. `user.id`). REQUIRED. */
   id: string;
   /** Human-readable label (e.g. `user.email`). Optional. */
   label?: string;
+  /** Category of actor. Optional — the server stamps `human` when
+   *  absent. Auto-detection from the User-Agent fills this when the
+   *  request looks like it came from an LLM client. */
+  kind?: ActorKind;
 }
 
 /**
@@ -59,7 +68,7 @@ export type DisplayNameMap = Record<string, DisplayNameResolver>;
 /**
  * Classifier for Server Action failure return values.
  *
- * Many Next.js codebases (next-safe-action templates, the
+ * Many Next.js codebases (Velory, next-safe-action templates, the
  * Vercel App Router examples, tRPC) catch errors inside the action and
  * return `{ success: false, error: "..." }` instead of throwing. The
  * HTTP response is 200, so the agent can't tell the action failed
@@ -79,8 +88,7 @@ export type ServerActionErrorClassifier = (
 ) => boolean | { errorMessage: string } | null | undefined;
 
 export interface InitOptions {
-  /** Defaults to `https://app.ezlogs.io` (the hosted EZLogs service). Override for self-hosting. */
-  serverUrl?: string;
+  serverUrl: string;
   projectToken: string;
   captureHttp?: boolean;
   captureDb?: boolean;
@@ -105,6 +113,16 @@ export interface InitOptions {
   isServerActionError?: ServerActionErrorClassifier;
   /** Patch globalThis.fetch to inject X-Correlation-ID. Default true. */
   patchGlobalFetch?: boolean;
+  /**
+   * Suppress the "serverUrl is not HTTPS" warning when intentionally
+   * pointing the agent at a non-HTTPS endpoint (a local relay, a
+   * staging proxy on a private network, …). HTTPS is otherwise
+   * enforced by warning at init time so a typo in production
+   * (`http://app.ezlogs.io`) doesn't silently ship events in
+   * cleartext. localhost / 127.0.0.1 / [::1] / *.local are exempt
+   * by default — those are dev environments. Default false.
+   */
+  allowInsecureTransport?: boolean;
   /**
    * When true (default), the HTTP capturer extracts the current actor
    * from the most-recently-constructed Supabase client by calling
@@ -283,10 +301,8 @@ export const DEFAULT_EXCLUDED_JOB_CLASSES: readonly string[] = Object.freeze([])
 export const DEFAULT_EXCLUDED_GRAPHQL_OPERATIONS: readonly string[] =
   Object.freeze(["IntrospectionQuery", "__*"]);
 
-export const DEFAULT_SERVER_URL = "https://app.ezlogs.io";
-
 export class Configuration {
-  serverUrl: string | null = DEFAULT_SERVER_URL;
+  serverUrl: string | null = null;
   projectToken: string | null = null;
   captureHttp = true;
   captureDb = true;
@@ -298,6 +314,7 @@ export class Configuration {
   logLevel: LogLevel = "warn";
   patchGlobalFetch = true;
   actorFromSupabase = true;
+  allowInsecureTransport = false;
 
   excludedPaths: string[] = [];
   excludedTables: string[] = [];
@@ -329,7 +346,7 @@ export class Configuration {
   triggerTrackedTables: Set<string> | null = null;
 
   apply(options: InitOptions): void {
-    if (options.serverUrl !== undefined) this.serverUrl = options.serverUrl;
+    this.serverUrl = options.serverUrl;
     this.projectToken = options.projectToken;
     if (options.captureHttp !== undefined) this.captureHttp = options.captureHttp;
     if (options.captureDb !== undefined) this.captureDb = options.captureDb;
@@ -353,6 +370,9 @@ export class Configuration {
     if (options.isServerActionError) this.isServerActionError = options.isServerActionError;
     if (options.patchGlobalFetch !== undefined) {
       this.patchGlobalFetch = options.patchGlobalFetch;
+    }
+    if (options.allowInsecureTransport !== undefined) {
+      this.allowInsecureTransport = options.allowInsecureTransport;
     }
     if (options.actorFromSupabase !== undefined) {
       this.actorFromSupabase = options.actorFromSupabase;

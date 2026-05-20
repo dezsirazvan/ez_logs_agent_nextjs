@@ -22,13 +22,14 @@
  * shape is identical regardless of entry point.
  */
 
-import { configuration } from "../configuration.js";
+import { configuration, type ActorContext } from "../configuration.js";
 import { logger } from "../logger.js";
 import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
 import { flushScheduler } from "../pipeline/flush-scheduler.js";
 import { isServerless } from "../pipeline/serverless.js";
 import { getCurrentActor, runWithActorScope, setActor } from "../actor.js";
+import { classifyUserAgent, type AgentDetection } from "../user-agent-detector.js";
 import {
   current as currentCorrelation,
   resolveCorrelation,
@@ -85,78 +86,98 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
   context: CaptureContext = {},
 ): (...args: TArgs) => Promise<Response> {
   return async (...args: TArgs): Promise<Response> => {
-    if (!configuration().captureHttp) {
-      return Promise.resolve(handler(...args));
-    }
+    // Pre-handler fail-open guard. Any throw from snapshotRequest,
+    // resolveCorrelation, runWithCorrelation, or runWithActorAndAuditScope
+    // SETUP must not break the host: we bypass capture and call the
+    // handler directly. Once the handler has been invoked (handlerInvoked
+    // flips to true), errors must propagate naturally — re-invoking the
+    // handler would run it twice. EZLogs must never break the host.
+    let handlerInvoked = false;
+    const runHandler = (...invokeArgs: TArgs) => {
+      handlerInvoked = true;
+      return handler(...invokeArgs);
+    };
 
-    const request = args[0] as Request | undefined;
-    if (!request || typeof request !== "object" || !("url" in request)) {
-      // Not a request-shaped first arg — pass through. We only capture
-      // when the handler matches the expected route signature.
-      return Promise.resolve(handler(...args));
-    }
+    try {
+      if (!configuration().captureHttp) {
+        return Promise.resolve(runHandler(...args));
+      }
 
-    const snapshot = await snapshotRequest(request as Request);
-    if (snapshot === null) return Promise.resolve(handler(...args)); // excluded
+      const request = args[0] as Request | undefined;
+      if (!request || typeof request !== "object" || !("url" in request)) {
+        // Not a request-shaped first arg — pass through. We only capture
+        // when the handler matches the expected route signature.
+        return Promise.resolve(runHandler(...args));
+      }
 
-    // Reuse the correlation id seeded by middleware (or upstream) when
-    // present; otherwise derive one from a platform-injected request id
-    // (`x-vercel-id`, `cf-ray`, `x-request-id`) so multiple cold-started
-    // entry points in the same request still group; finally fall back
-    // to a fresh generated id. This is what lets DB events from inside
-    // Server Actions, RSC renders, and route handlers all share the
-    // same id and group into one Action card — even without
-    // `middleware.ts`.
-    const correlationId = resolveCorrelation((request as Request).headers ?? null);
+      const snapshot = await snapshotRequest(request as Request);
+      if (snapshot === null) return Promise.resolve(runHandler(...args)); // excluded
 
-    return runWithCorrelation(correlationId, () =>
-      runWithActorAndAuditScope(async () => {
-        await maybeRunActorHook(request as Request);
+      // Reuse the correlation id seeded by middleware (or upstream) when
+      // present; otherwise derive one from a platform-injected request id
+      // (`x-vercel-id`, `cf-ray`, `x-request-id`) so multiple cold-started
+      // entry points in the same request still group; finally fall back
+      // to a fresh generated id. This is what lets DB events from inside
+      // Server Actions, RSC renders, and route handlers all share the
+      // same id and group into one Action card — even without
+      // `middleware.ts`.
+      const correlationId = resolveCorrelation((request as Request).headers ?? null);
 
-        const startMs = Date.now();
-        let statusCode: number | null = null;
-        let response: Response | null = null;
-        let exception: Error | null = null;
-        let graphqlErrorMessage: string | null = null;
+      return await runWithCorrelation(correlationId, () =>
+        runWithActorAndAuditScope(async () => {
+          await maybeRunActorHook(request as Request);
 
-        try {
-          response = await Promise.resolve(handler(...args));
-          statusCode = response.status;
+          const startMs = Date.now();
+          let statusCode: number | null = null;
+          let response: Response | null = null;
+          let exception: Error | null = null;
+          let graphqlErrorMessage: string | null = null;
 
-          if (snapshot.graphqlBody !== null && response.status === 200) {
-            graphqlErrorMessage = await readGraphqlErrors(response);
-          }
-          return response;
-        } catch (e) {
-          exception = e instanceof Error ? e : new Error(String(e));
-          throw e;
-        } finally {
-          // Last chance to populate the actor — at this point any
-          // Supabase client constructed during the handler is
-          // registered, and its auth cookies have been read.
-          await maybeExtractSupabaseActor();
+          try {
+            response = await Promise.resolve(runHandler(...args));
+            statusCode = response.status;
 
-          await emitEvent({
-            snapshot,
-            context,
-            statusCode,
-            exception,
-            graphqlErrorMessage,
-            durationMs: Date.now() - startMs,
-            startedAt: new Date(startMs),
-          });
-          // In serverless mode, the periodic flush scheduler can't be
-          // trusted (the process freezes between invocations). Drain
-          // synchronously here so this request's events ship before
-          // the function returns.
-          if (isServerless()) {
-            await flushScheduler.flushNow().catch(() => {
-              // never break the host request — flushNow already swallows
+            if (snapshot.graphqlBody !== null && response.status === 200) {
+              graphqlErrorMessage = await readGraphqlErrors(response);
+            }
+            return response;
+          } catch (e) {
+            exception = e instanceof Error ? e : new Error(String(e));
+            throw e;
+          } finally {
+            // Last chance to populate the actor — at this point any
+            // Supabase client constructed during the handler is
+            // registered, and its auth cookies have been read.
+            await maybeExtractSupabaseActor();
+
+            await emitEvent({
+              snapshot,
+              context,
+              statusCode,
+              exception,
+              graphqlErrorMessage,
+              durationMs: Date.now() - startMs,
+              startedAt: new Date(startMs),
             });
+            // In serverless mode, the periodic flush scheduler can't be
+            // trusted (the process freezes between invocations). Drain
+            // synchronously here so this request's events ship before
+            // the function returns.
+            if (isServerless()) {
+              await flushScheduler.flushNow().catch(() => {
+                // never break the host request — flushNow already swallows
+              });
+            }
           }
-        }
-      }),
-    );
+        }),
+      );
+    } catch (preCaptureError) {
+      if (handlerInvoked) throw preCaptureError;
+      logger.warn(
+        `captureRoute pre-handler setup failed (${describeError(preCaptureError)}); bypassing capture for this request`,
+      );
+      return Promise.resolve(handler(...args));
+    }
   };
 }
 
@@ -210,71 +231,85 @@ export function withMiddlewareCapture<
   middleware: (request: TRequest, ...rest: unknown[]) => Promise<TResponse> | TResponse,
 ): (request: TRequest, ...rest: unknown[]) => Promise<TResponse> {
   return async (request, ...rest): Promise<TResponse> => {
-    // Read existing id (forwarded from upstream — load balancer, prior
-    // ezlogs hop, etc). Otherwise derive from a platform-injected
-    // request id, otherwise generate fresh. We never overwrite —
-    // caller intent wins, mirroring our outgoing-fetch injector.
-    const correlationId = resolveCorrelation(request.headers);
+    let middlewareInvoked = false;
+    const runMiddleware = (req: TRequest, ...mRest: unknown[]) => {
+      middlewareInvoked = true;
+      return middleware(req, ...mRest);
+    };
 
-    // Mutate the incoming request's headers so every downstream
-    // handler sees the id via `headers()` from `next/headers`. Next.js's
-    // middleware request-headers ARE mutable until the response is
-    // returned — this is the documented pattern Sentry, Datadog, etc.
-    // use to thread tracing context through.
     try {
-      request.headers.set(CORRELATION_HEADER, correlationId);
-    } catch {
-      // headers locked — fall back to response-only stamping below.
+      // Read existing id (forwarded from upstream — load balancer, prior
+      // ezlogs hop, etc). Otherwise derive from a platform-injected
+      // request id, otherwise generate fresh. We never overwrite —
+      // caller intent wins, mirroring our outgoing-fetch injector.
+      const correlationId = resolveCorrelation(request.headers);
+
+      // Mutate the incoming request's headers so every downstream
+      // handler sees the id via `headers()` from `next/headers`. Next.js's
+      // middleware request-headers ARE mutable until the response is
+      // returned — this is the documented pattern Sentry, Datadog, etc.
+      // use to thread tracing context through.
+      try {
+        request.headers.set(CORRELATION_HEADER, correlationId);
+      } catch {
+        // headers locked — fall back to response-only stamping below.
+      }
+
+      return await runWithCorrelation(correlationId, () =>
+        runWithActorAndAuditScope(async () => {
+          const startMs = Date.now();
+          const startedAt = new Date(startMs);
+          const response = await Promise.resolve(runMiddleware(request, ...rest));
+
+          // Stamp on the response too so the browser can pick it up for
+          // client-side telemetry, and so any RSC payload returned to the
+          // client carries a correlatable id.
+          try {
+            if (response?.headers && typeof response.headers.set === "function") {
+              response.headers.set(CORRELATION_HEADER, correlationId);
+            }
+          } catch {
+            // ignore — never break the host's middleware return value
+          }
+
+          // Emit a page-navigation event when the request looks like a
+          // human navigating to a page (HTML accept, GET, no Server Action
+          // header, no RSC payload marker). Route handlers, API calls,
+          // and Server Actions are filtered out here so they don't double-
+          // emit alongside captureRoute / captureServerAction.
+          try {
+            if (shouldEmitPageNavigation(request)) {
+              // Run the user's actor hook so page navigations carry
+              // "Triggered by" too. Without this every page view in the
+              // dashboard renders "Unknown" while the route-handler
+              // events from the same user show their email — confusing.
+              // Casting because the middleware request and `Request` are
+              // structurally compatible at the headers.get() / cookies
+              // level the hook actually uses.
+              await maybeRunActorHook(request as unknown as Request);
+              await maybeExtractSupabaseActor();
+              await emitPageNavigationEvent({
+                request,
+                statusCode:
+                  typeof response?.status === "number" ? response.status : null,
+                durationMs: Date.now() - startMs,
+                startedAt,
+              });
+            }
+          } catch (error) {
+            logger.debug(`page navigation capture failed: ${describeError(error)}`);
+          }
+
+          return response;
+        }),
+      );
+    } catch (preCaptureError) {
+      if (middlewareInvoked) throw preCaptureError;
+      logger.warn(
+        `withMiddlewareCapture pre-handler setup failed (${describeError(preCaptureError)}); bypassing capture for this request`,
+      );
+      return await Promise.resolve(middleware(request, ...rest));
     }
-
-    return runWithCorrelation(correlationId, () =>
-      runWithActorAndAuditScope(async () => {
-        const startMs = Date.now();
-        const startedAt = new Date(startMs);
-        const response = await Promise.resolve(middleware(request, ...rest));
-
-        // Stamp on the response too so the browser can pick it up for
-        // client-side telemetry, and so any RSC payload returned to the
-        // client carries a correlatable id.
-        try {
-          if (response?.headers && typeof response.headers.set === "function") {
-            response.headers.set(CORRELATION_HEADER, correlationId);
-          }
-        } catch {
-          // ignore — never break the host's middleware return value
-        }
-
-        // Emit a page-navigation event when the request looks like a
-        // human navigating to a page (HTML accept, GET, no Server Action
-        // header, no RSC payload marker). Route handlers, API calls,
-        // and Server Actions are filtered out here so they don't double-
-        // emit alongside captureRoute / captureServerAction.
-        try {
-          if (shouldEmitPageNavigation(request)) {
-            // Run the user's actor hook so page navigations carry
-            // "Triggered by" too. Without this every page view in the
-            // dashboard renders "Unknown" while the route-handler
-            // events from the same user show their email — confusing.
-            // Casting because the middleware request and `Request` are
-            // structurally compatible at the headers.get() / cookies
-            // level the hook actually uses.
-            await maybeRunActorHook(request as unknown as Request);
-            await maybeExtractSupabaseActor();
-            await emitPageNavigationEvent({
-              request,
-              statusCode:
-                typeof response?.status === "number" ? response.status : null,
-              durationMs: Date.now() - startMs,
-              startedAt,
-            });
-          }
-        } catch (error) {
-          logger.debug(`page navigation capture failed: ${describeError(error)}`);
-        }
-
-        return response;
-      }),
-    );
   };
 }
 
@@ -406,54 +441,68 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
   context: CaptureContext = {},
 ): (...args: TArgs) => Promise<unknown> {
   return async (...args: TArgs): Promise<unknown> => {
-    if (!configuration().captureHttp) {
+    let handlerInvoked = false;
+    const runHandler = (...invokeArgs: TArgs) => {
+      handlerInvoked = true;
+      return handler(...invokeArgs);
+    };
+
+    try {
+      if (!configuration().captureHttp) {
+        return Promise.resolve(runHandler(...args));
+      }
+      const req = args[0];
+      const res = args[1];
+      if (!req || !res) return Promise.resolve(runHandler(...args));
+
+      const snapshot = snapshotPagesRequest(req);
+      if (snapshot === null) return Promise.resolve(runHandler(...args)); // excluded
+
+      // Pages Router gives us a plain headers object, not a Headers
+      // instance. Adapt to the same get-shape the resolver expects, then
+      // run through the platform-id fallback chain.
+      const correlationId = resolveCorrelation({
+        get: (name: string) => readPagesHeader(req, name),
+      });
+
+      return await runWithCorrelation(correlationId, () =>
+        runWithActorAndAuditScope(async () => {
+          await maybeRunActorHookFromPages(req);
+
+          const startMs = Date.now();
+          let exception: Error | null = null;
+
+          try {
+            const result = await Promise.resolve(runHandler(...args));
+            return result;
+          } catch (e) {
+            exception = e instanceof Error ? e : new Error(String(e));
+            throw e;
+          } finally {
+            await maybeExtractSupabaseActor();
+
+            await emitEvent({
+              snapshot,
+              context,
+              statusCode: typeof res.statusCode === "number" ? res.statusCode : null,
+              exception,
+              graphqlErrorMessage: null,
+              durationMs: Date.now() - startMs,
+              startedAt: new Date(startMs),
+            });
+            if (isServerless()) {
+              await flushScheduler.flushNow().catch(() => undefined);
+            }
+          }
+        }),
+      );
+    } catch (preCaptureError) {
+      if (handlerInvoked) throw preCaptureError;
+      logger.warn(
+        `capturePagesApi pre-handler setup failed (${describeError(preCaptureError)}); bypassing capture for this request`,
+      );
       return Promise.resolve(handler(...args));
     }
-    const req = args[0];
-    const res = args[1];
-    if (!req || !res) return Promise.resolve(handler(...args));
-
-    const snapshot = snapshotPagesRequest(req);
-    if (snapshot === null) return Promise.resolve(handler(...args)); // excluded
-
-    // Pages Router gives us a plain headers object, not a Headers
-    // instance. Adapt to the same get-shape the resolver expects, then
-    // run through the platform-id fallback chain.
-    const correlationId = resolveCorrelation({
-      get: (name: string) => readPagesHeader(req, name),
-    });
-
-    return runWithCorrelation(correlationId, () =>
-      runWithActorAndAuditScope(async () => {
-        await maybeRunActorHookFromPages(req);
-
-        const startMs = Date.now();
-        let exception: Error | null = null;
-
-        try {
-          const result = await Promise.resolve(handler(...args));
-          return result;
-        } catch (e) {
-          exception = e instanceof Error ? e : new Error(String(e));
-          throw e;
-        } finally {
-          await maybeExtractSupabaseActor();
-
-          await emitEvent({
-            snapshot,
-            context,
-            statusCode: typeof res.statusCode === "number" ? res.statusCode : null,
-            exception,
-            graphqlErrorMessage: null,
-            durationMs: Date.now() - startMs,
-            startedAt: new Date(startMs),
-          });
-          if (isServerless()) {
-            await flushScheduler.flushNow().catch(() => undefined);
-          }
-        }
-      }),
-    );
   };
 }
 
@@ -502,99 +551,113 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
   actionName: string,
 ): (...args: TArgs) => Promise<TResult> {
   return async (...args: TArgs): Promise<TResult> => {
-    if (!configuration().captureHttp) {
-      return Promise.resolve(action(...args));
-    }
+    let actionInvoked = false;
+    const runAction = (...invokeArgs: TArgs) => {
+      actionInvoked = true;
+      return action(...invokeArgs);
+    };
 
-    // Reuse the correlation id seeded by middleware. Server Actions are
-    // dispatched by Next's RSC pipeline with no Request argument, so we
-    // can't read headers off args[0] like captureRoute does. Instead we
-    // pull from `next/headers` which is the documented way to read the
-    // current request's headers from inside a Server Action. We wrap
-    // it as a `HeadersLike` so the same fallback chain (ezlogs header
-    // -> x-vercel-id -> cf-ray -> x-request-id -> generate) runs here
-    // as in `captureRoute`.
-    const headersAdapter = await readNextHeadersAsAdapter();
-    const correlationId = resolveCorrelation(headersAdapter);
+    try {
+      if (!configuration().captureHttp) {
+        return Promise.resolve(runAction(...args));
+      }
 
-    return runWithCorrelation(correlationId, () =>
-      runWithActorAndAuditScope(async () => {
-        const startMs = Date.now();
-        const startedAt = new Date(startMs);
-        let exception: Error | null = null;
+      // Reuse the correlation id seeded by middleware. Server Actions are
+      // dispatched by Next's RSC pipeline with no Request argument, so we
+      // can't read headers off args[0] like captureRoute does. Instead we
+      // pull from `next/headers` which is the documented way to read the
+      // current request's headers from inside a Server Action. We wrap
+      // it as a `HeadersLike` so the same fallback chain (ezlogs header
+      // -> x-vercel-id -> cf-ray -> x-request-id -> generate) runs here
+      // as in `captureRoute`.
+      const headersAdapter = await readNextHeadersAsAdapter();
+      const correlationId = resolveCorrelation(headersAdapter);
 
-        // Resolve the actor BEFORE the user's action body runs so any
-        // DB / job events it emits inherit the actor through scope.
-        // Without this the HTTP event would carry the actor (we
-        // resolve again before emit) but every DB Change event emitted
-        // from inside the same action would ship with `actor: null`,
-        // and the dashboard would render "Triggered by: Unknown" on
-        // each Database Change row even though the parent action knew
-        // who triggered it.
-        await maybeRunActorHookFromServerAction();
+      return await runWithCorrelation(correlationId, () =>
+        runWithActorAndAuditScope(async () => {
+          const startMs = Date.now();
+          const startedAt = new Date(startMs);
+          let exception: Error | null = null;
 
-        try {
-          const result = await Promise.resolve(action(...args));
-          // Late-fallback: a Supabase client constructed inside the
-          // action might only have its auth cookies attached now.
-          // maybeExtractSupabaseActor short-circuits when an actor
-          // is already set, so this is a no-op when the hook above
-          // succeeded.
-          await maybeExtractSupabaseActor();
+          // Resolve the actor BEFORE the user's action body runs so any
+          // DB / job events it emits inherit the actor through scope.
+          // Without this the HTTP event would carry the actor (we
+          // resolve again before emit) but every DB Change event emitted
+          // from inside the same action would ship with `actor: null`,
+          // and the dashboard would render "Triggered by: Unknown" on
+          // each Database Change row even though the parent action knew
+          // who triggered it.
+          await maybeRunActorHookFromServerAction();
 
-          // Many apps (next-safe-action, Vercel templates, hand-rolled
-          // wrappers) don't throw on failure — they catch the error and return
-          // `{ success: false, error: "..." }` so the client can render
-          // the message inline. The HTTP response stays 200, so we have
-          // to inspect the value to know the action failed. See
-          // ServerActionErrorClassifier in configuration.ts.
-          const failure = classifyServerActionResult(result);
-          await emitServerActionEvent({
-            actionName,
-            statusCode: failure ? 500 : 200,
-            exception: failure ? new Error(failure.errorMessage) : null,
-            durationMs: Date.now() - startMs,
-            startedAt,
-            args,
-          });
-          return result;
-        } catch (e) {
-          // Next.js implements redirect() and notFound() by THROWING
-          // sentinel errors that the RSC pipeline catches upstream.
-          // These aren't application failures — they're control flow.
-          // Re-throw without recording the action as failed.
-          if (isNextControlFlowError(e)) {
-            // Actor was resolved up-front; just collect any
-            // late-bound Supabase actor as a final fallback.
+          try {
+            const result = await Promise.resolve(runAction(...args));
+            // Late-fallback: a Supabase client constructed inside the
+            // action might only have its auth cookies attached now.
+            // maybeExtractSupabaseActor short-circuits when an actor
+            // is already set, so this is a no-op when the hook above
+            // succeeded.
+            await maybeExtractSupabaseActor();
+
+            // Many apps (next-safe-action, Vercel templates, Velory, …)
+            // don't throw on failure — they catch the error and return
+            // `{ success: false, error: "..." }` so the client can render
+            // the message inline. The HTTP response stays 200, so we have
+            // to inspect the value to know the action failed. See
+            // ServerActionErrorClassifier in configuration.ts.
+            const failure = classifyServerActionResult(result);
+            await emitServerActionEvent({
+              actionName,
+              statusCode: failure ? 500 : 200,
+              exception: failure ? new Error(failure.errorMessage) : null,
+              durationMs: Date.now() - startMs,
+              startedAt,
+              args,
+            });
+            return result;
+          } catch (e) {
+            // Next.js implements redirect() and notFound() by THROWING
+            // sentinel errors that the RSC pipeline catches upstream.
+            // These aren't application failures — they're control flow.
+            // Re-throw without recording the action as failed.
+            if (isNextControlFlowError(e)) {
+              // Actor was resolved up-front; just collect any
+              // late-bound Supabase actor as a final fallback.
+              await maybeExtractSupabaseActor();
+              await emitServerActionEvent({
+                actionName,
+                statusCode: 200,
+                exception: null,
+                durationMs: Date.now() - startMs,
+                startedAt,
+                args,
+              });
+              throw e;
+            }
+            exception = e instanceof Error ? e : new Error(String(e));
             await maybeExtractSupabaseActor();
             await emitServerActionEvent({
               actionName,
-              statusCode: 200,
-              exception: null,
+              statusCode: 500,
+              exception,
               durationMs: Date.now() - startMs,
               startedAt,
               args,
             });
             throw e;
+          } finally {
+            if (isServerless()) {
+              await flushScheduler.flushNow().catch(() => undefined);
+            }
           }
-          exception = e instanceof Error ? e : new Error(String(e));
-          await maybeExtractSupabaseActor();
-          await emitServerActionEvent({
-            actionName,
-            statusCode: 500,
-            exception,
-            durationMs: Date.now() - startMs,
-            startedAt,
-            args,
-          });
-          throw e;
-        } finally {
-          if (isServerless()) {
-            await flushScheduler.flushNow().catch(() => undefined);
-          }
-        }
-      }),
-    );
+        }),
+      );
+    } catch (preCaptureError) {
+      if (actionInvoked) throw preCaptureError;
+      logger.warn(
+        `captureServerAction pre-handler setup failed (${describeError(preCaptureError)}); bypassing capture for this action`,
+      );
+      return Promise.resolve(action(...args));
+    }
   };
 }
 
@@ -681,8 +744,8 @@ export async function __ezlogs_run_inline_server_action<TResult>(
  *   6. **Zod safeParse**: `{ success: false, error: { issues: [...] } }`.
  *      Discriminator vs (7) is `error` being an object with `issues`.
  *   7. **Existing fallback**: `{ success: false, error: <truthy string> }`.
- *      The original Phase 3 heuristic — the Vercel App Router examples
- *      and most hand-rolled `createServerAction`-style wrappers.
+ *      The original Phase 3 heuristic — Velory's `createServerAction`
+ *      shape, the Vercel App Router examples, most hand-rolled wrappers.
  *
  * No imports of next-safe-action / zsa / Conform / Zod — purely
  * structural matching. Returns null on success, `{errorMessage}` on
@@ -1242,24 +1305,30 @@ async function snapshotRequest(request: Request): Promise<RawRequestSnapshot | n
 
 async function maybeRunActorHook(request: Request): Promise<void> {
   const hook = configuration().actorFromRequest;
-  if (!hook) return;
-  try {
-    const result = await Promise.resolve(hook(request));
-    setActor(result ?? null);
-  } catch (error) {
-    logger.debug(`actorFromRequest hook failed: ${describeError(error)}`);
+  let hookResult: unknown = null;
+  if (hook) {
+    try {
+      hookResult = await Promise.resolve(hook(request));
+    } catch (error) {
+      logger.debug(`actorFromRequest hook failed: ${describeError(error)}`);
+    }
   }
+  const userAgent = safeGetHeader(request.headers, "user-agent");
+  applyActorFromHookAndUa(hookResult, userAgent);
 }
 
 async function maybeRunActorHookFromPages(req: PagesApiReq): Promise<void> {
   const hook = configuration().actorFromRequest;
-  if (!hook) return;
-  try {
-    const result = await Promise.resolve(hook(req));
-    setActor(result ?? null);
-  } catch (error) {
-    logger.debug(`actorFromRequest hook (pages) failed: ${describeError(error)}`);
+  let hookResult: unknown = null;
+  if (hook) {
+    try {
+      hookResult = await Promise.resolve(hook(req));
+    } catch (error) {
+      logger.debug(`actorFromRequest hook (pages) failed: ${describeError(error)}`);
+    }
   }
+  const userAgent = readPagesHeader(req, "user-agent");
+  applyActorFromHookAndUa(hookResult, userAgent);
 }
 
 /**
@@ -1278,41 +1347,37 @@ async function maybeRunActorHookFromPages(req: PagesApiReq): Promise<void> {
  */
 async function maybeRunActorHookFromServerAction(): Promise<void> {
   const hook = configuration().actorFromRequest;
-  if (!hook) {
-    logger.debug("actorFromRequest hook (server action): no hook configured");
-    return;
-  }
   const headers = await loadNextHeaders();
-  if (!headers) {
-    // `next/headers` unavailable (older Next, edge runtime quirks).
-    // loadNextHeaders has already logged the underlying reason.
-    logger.debug(
-      "actorFromRequest hook (server action): skipped, no next/headers available",
-    );
+  if (!hook && !headers) {
+    logger.debug("actorFromRequest (server action): no hook + no next/headers");
     return;
   }
-  const facade = {
-    headers,
-    method: "POST",
-    url: "",
-  };
-  try {
-    const result = await Promise.resolve(hook(facade));
-    if (result) {
+
+  let hookResult: unknown = null;
+  if (hook) {
+    if (!headers) {
       logger.debug(
-        `actorFromRequest hook (server action): set actor id=${(result as { id?: unknown }).id ?? "?"}`,
+        "actorFromRequest hook (server action): skipped, no next/headers available",
       );
     } else {
-      logger.debug(
-        "actorFromRequest hook (server action): returned null/undefined",
-      );
+      const facade = { headers, method: "POST", url: "" };
+      try {
+        hookResult = await Promise.resolve(hook(facade));
+        logger.debug(
+          hookResult
+            ? `actorFromRequest hook (server action): set actor id=${(hookResult as { id?: unknown }).id ?? "?"}`
+            : "actorFromRequest hook (server action): returned null/undefined",
+        );
+      } catch (error) {
+        logger.debug(
+          `actorFromRequest hook (server action) failed: ${describeError(error)}`,
+        );
+      }
     }
-    setActor(result ?? null);
-  } catch (error) {
-    logger.debug(
-      `actorFromRequest hook (server action) failed: ${describeError(error)}`,
-    );
   }
+
+  const userAgent = headers ? safeGetHeader(headers, "user-agent") : null;
+  applyActorFromHookAndUa(hookResult, userAgent);
 }
 
 /**
@@ -1449,29 +1514,53 @@ async function readNextHeadersAsAdapter(): Promise<{
   };
 }
 
+type NextHeadersMod = {
+  headers: () => Headers | Promise<Headers>;
+};
+
 async function loadNextHeaders(): Promise<Headers | null> {
+  // Try `next/headers` first (the documented specifier — what Next's
+  // bundler resolves through its `exports`-aware layer). If that
+  // throws — typically when this runs in a runtime that uses strict
+  // ESM resolution (Node 18+ ESM, Next 15's instrumentation-bundling
+  // path) and Next's `package.json` has no `exports["./headers"]`
+  // entry — fall back to the literal-file `next/headers.js` which
+  // strict ESM resolves directly.
+  //
+  // CRITICAL: both specifiers are string LITERALS in `import("…")`,
+  // not variables. A variable specifier (`import(someVar)`) would
+  // trigger Webpack's lazy-namespace code-splitting and pull every
+  // `*.js` in the parent dir into the customer's bundle — including
+  // `nextjs-plugin/*.js` which has Node-only imports.
+  //
+  // `next` is declared as an optional peer dep — apps that don't
+  // install Next won't reach this code (Server Action capture is a
+  // Next-only feature), and the catches below cover the missing
+  // module case.
+  const mod = await tryLoadNextHeadersModule();
+  if (!mod) return null;
   try {
-    // Use a literal-string `import("next/headers")` so Next's bundler
-    // (Webpack / Turbopack) resolves the module at the host site
-    // and threads it through the correct app-rsc layer at runtime.
-    // The earlier `Function("s","return import(s)")(specifier)` trick
-    // hid the specifier from the bundler, which then failed to
-    // resolve the module from inside our pre-bundled `dist/index.js`.
-    //
-    // `next` is declared as an optional peer dep — apps that don't
-    // install Next won't reach this code (Server Action capture is a
-    // Next-only feature), and if they somehow do the catch below
-    // covers the missing module. The @ts-expect-error swallows the
-    // typecheck failure that fires when `next` isn't installed in
-    // the agent's own dev environment.
-    // @ts-expect-error -- next is an optional peer dep, not present at typecheck time
-    const mod = (await import("next/headers")) as {
-      headers: () => Headers | Promise<Headers>;
-    };
     return await Promise.resolve(mod.headers());
   } catch (error) {
-    logger.debug(`loadNextHeaders failed: ${describeError(error)}`);
+    logger.debug(`loadNextHeaders mod.headers() failed: ${describeError(error)}`);
     return null;
+  }
+}
+
+async function tryLoadNextHeadersModule(): Promise<NextHeadersMod | null> {
+  try {
+    // @ts-expect-error -- next is an optional peer dep, not present at typecheck time
+    return (await import("next/headers")) as NextHeadersMod;
+  } catch (firstError) {
+    try {
+      // @ts-expect-error -- same optional-peer-dep caveat
+      return (await import("next/headers.js")) as NextHeadersMod;
+    } catch (secondError) {
+      logger.debug(
+        `loadNextHeaders: neither "next/headers" nor "next/headers.js" resolved (${describeError(firstError)}; ${describeError(secondError)})`,
+      );
+      return null;
+    }
   }
 }
 
@@ -1569,7 +1658,12 @@ async function emitEvent(input: EmitInput): Promise<void> {
 
     pushEvent(event);
   } catch (error) {
-    logger.error(`http capture emit failed: ${describeError(error)}`);
+    // Best-effort diagnostic context: correlation_id is the single
+    // most useful field for tracing a missing event back to the
+    // surrounding request — without it we'd be blind.
+    const cid = currentCorrelation();
+    const cidLabel = cid ? ` (correlation_id=${cid})` : "";
+    logger.error(`http capture emit failed${cidLabel}: ${describeError(error)}`);
   }
 }
 
@@ -1700,4 +1794,64 @@ async function readGraphqlErrors(response: Response): Promise<string | null> {
 function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+/**
+ * Merge the hook's actor result with UA-derived actor_kind detection,
+ * then push the final actor into the request scope.
+ *
+ * Rules (parity with Ruby `Middleware::HttpRequest#merge_actor_with_ua`):
+ * - Hook actor present, no UA match  -> use hook actor as-is.
+ * - Hook actor present, UA match     -> hook keeps id/label; `kind` is
+ *   filled from the UA only when the hook didn't supply one. Models
+ *   "Claude operating on Jessica's behalf via API key."
+ * - No hook actor, UA match          -> synthesize an agent actor so
+ *   the Pulse Agent view has something to anchor on.
+ * - No hook actor, no UA match       -> leave the scope empty.
+ */
+function applyActorFromHookAndUa(hookResult: unknown, userAgent: string | null): void {
+  const uaMatch = classifyUserAgent(userAgent);
+
+  if (hookResult != null && typeof hookResult === "object" && !Array.isArray(hookResult)) {
+    if (uaMatch === null) {
+      setActor(hookResult);
+      return;
+    }
+    const hookObj = hookResult as Record<string, unknown>;
+    const existingKind = hookObj.kind;
+    if (typeof existingKind === "string" && existingKind.length > 0) {
+      setActor(hookObj);
+      return;
+    }
+    setActor({ ...hookObj, kind: uaMatch.kind });
+    return;
+  }
+
+  if (uaMatch !== null) {
+    setActor(synthesizeAgentActor(uaMatch));
+    return;
+  }
+
+  setActor(null);
+}
+
+function synthesizeAgentActor(detection: AgentDetection): ActorContext {
+  return {
+    id: detection.suggestedId,
+    label: detection.label,
+    kind: detection.kind,
+  };
+}
+
+/**
+ * Read a header without ever throwing — some Edge-runtime Headers
+ * implementations refuse certain lookups. Fail closed (null) so the
+ * detector treats it as "no UA available" rather than crashing capture.
+ */
+function safeGetHeader(headers: Headers, name: string): string | null {
+  try {
+    return headers.get(name);
+  } catch {
+    return null;
+  }
 }

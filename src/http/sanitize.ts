@@ -35,6 +35,8 @@ export const SENSITIVE_VARIABLE_PATTERNS: readonly string[] = Object.freeze([
   "apikey",
   "private_key",
   "privatekey",
+  "public_key",
+  "signing_key",
   "secret_key",
   "secretkey",
   "credential",
@@ -48,6 +50,17 @@ export const SENSITIVE_VARIABLE_PATTERNS: readonly string[] = Object.freeze([
   "card_number",
   "cvv",
   "cvc",
+  // Crypto-material patterns — aligned with DB_SENSITIVE_PATTERNS
+  // (PR #45). Request bodies can carry the same key material as DB
+  // columns (a webhook POST containing a `signature` field, an HMAC
+  // header echoed into a JSON body, a `pem`-encoded cert blob, etc).
+  "pem",
+  "cipher",
+  "nonce",
+  "salt",
+  "digest",
+  "signature",
+  "hmac",
 ]);
 
 const MAX_NESTING_DEPTH = 3;

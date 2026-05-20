@@ -24,13 +24,47 @@
 // need it.
 
 import { sep } from "node:path";
-// Sucrase's deep parser entry point has no published types. We pin
-// the version (^3.35) and declare the surface we use locally so the
-// loader stays type-checked. If a future sucrase release moves the
-// parser path, swap to `@babel/parser` (~50 LOC fallback).
-// @ts-expect-error - no .d.ts published for the deep parser path
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-import { parse as sucraseParse } from "sucrase/dist/parser/index.js";
+
+// Sucrase's deep parser entry point has no published types and lives
+// at an internal path that could move in a future sucrase release.
+// To keep a sucrase upgrade from breaking customer builds at module-
+// load time, we lazy-resolve the parser the first time we need it
+// and memoize the result. On resolution failure we cache the failure
+// (warn-once) and return null; callers fall open by returning the
+// source unchanged. The customer's build still succeeds; that one
+// inline server action just isn't auto-captured (they can still wrap
+// manually with `captureServerAction`).
+type SucraseParseFn = (
+  source: string,
+  isJSX: boolean,
+  isTS: boolean,
+  isFlow: boolean,
+) => SucraseParseResult;
+
+let cachedSucraseParse: SucraseParseFn | null | undefined;
+
+function getSucraseParse(): SucraseParseFn | null {
+  if (cachedSucraseParse !== undefined) return cachedSucraseParse;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require("sucrase/dist/parser/index.js") as {
+      parse?: SucraseParseFn;
+    };
+    if (typeof mod.parse !== "function") {
+      throw new Error("sucrase parser module has no `parse` export");
+    }
+    cachedSucraseParse = mod.parse;
+    return cachedSucraseParse;
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[ezlogs] sucrase parser unavailable; inline Server Actions won't be auto-captured. Wrap them manually with captureServerAction(). Reason: ${message}`,
+    );
+    cachedSucraseParse = null;
+    return null;
+  }
+}
 
 interface PitchContext {
   query: string | { [key: string]: unknown };
@@ -66,19 +100,55 @@ const HTTP_METHOD_NAMES = [
 type HttpMethodName = (typeof HTTP_METHOD_NAMES)[number];
 
 const ALREADY_WRAPPED_MARKER = "__ezlogs_orig_";
+// The npm package name. Single source of truth for every `import …
+// from "<package>"` that the loader injects into customer code, AND
+// for the in-file sentinel strings the loader's re-export transform
+// uses to detect already-wrapped files. The runtime package is
+// unscoped (`ezlogs-nextjs` on npm); the loader used to emit a
+// scoped `@ezlogs/nextjs` import which broke every customer's
+// `next build`.
+const PACKAGE_NAME = "ezlogs-nextjs";
+
 // Idempotency marker emitted by transforms that don't rename a local
 // declaration (so `__ezlogs_orig_` never appears). The re-export
 // route handler uses this — its output contains `export const GET =
 // __ezlogs_capture(handler, ...)` with no rename, so we need a
 // separate sentinel to detect already-wrapped files on second pass.
-const REEXPORT_WRAP_MARKER = "ezlogs-nextjs auto-wrap re-export";
+const REEXPORT_WRAP_MARKER = `${PACKAGE_NAME} auto-wrap re-export`;
 
 /**
  * Loader entry point. Receives the user's source file as a string,
  * returns transformed source. Both Webpack and Turbopack call this
  * the same way (Turbopack uses loader-runner under the hood).
+ *
+ * Outer fail-open guard: this loader runs at the customer's `next
+ * build` time on every file Next.js routes through it. A throw in
+ * ANY of the rewrite helpers (regex catastrophe, malformed source,
+ * future sucrase incompatibility) would break the customer's build.
+ * EZLogs must never break the host. On any exception we log a warn
+ * with the file path + error, and return the source unchanged so
+ * the build continues — that one file just isn't auto-instrumented.
+ * The customer can still wrap manually via `captureRoute()` /
+ * `captureServerAction()`.
  */
 export default function loader(this: PitchContext, source: string): string {
+  try {
+    return loaderImpl.call(this, source);
+  } catch (loaderError) {
+    const path = this.resourcePath ?? "<unknown>";
+    const message =
+      loaderError instanceof Error
+        ? `${loaderError.name}: ${loaderError.message}`
+        : String(loaderError);
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[ezlogs] loader failed for ${path}; leaving source unchanged so the build succeeds. ${message}`,
+    );
+    return source;
+  }
+}
+
+function loaderImpl(this: PitchContext, source: string): string {
   // Idempotent: if the file already contains our marker, it's been
   // wrapped (e.g. by a re-evaluation during dev hot reload). Don't
   // wrap again.
@@ -162,7 +232,7 @@ function rewriteAppRoute(source: string, routeModulePath: string): string {
   const wrapperBlock = [
     "",
     "// --- ezlogs-nextjs auto-wrap (build-time) ---",
-    `import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs";`,
+    `import { captureRoute as __ezlogs_capture } from "${PACKAGE_NAME}";`,
     `const __ezlogs_meta = ${meta};`,
     ...Array.from(detected).map(
       (method) =>
@@ -255,7 +325,7 @@ function rewriteLocalAliasedRouteExports(
   const meta = JSON.stringify({ routeModulePath });
   const wrapperLines = [
     "// --- ezlogs-nextjs auto-wrap re-export (build-time) ---",
-    `import { captureRoute as __ezlogs_capture } from "ezlogs-nextjs";`,
+    `import { captureRoute as __ezlogs_capture } from "${PACKAGE_NAME}";`,
     `const __ezlogs_meta = ${meta};`,
     ...entries.map(
       (e) => `export const ${e.exported} = __ezlogs_capture(${e.local}, __ezlogs_meta);`,
@@ -359,7 +429,7 @@ function rewriteSupabaseFactoryImports(source: string): string {
   if (!changed) return source;
 
   if (needsWrapImport) {
-    rewritten = `import { wrapSupabase as ${ALREADY_WRAPPED_MARKER}wrap } from "ezlogs-nextjs/supabase";\n${rewritten}`;
+    rewritten = `import { wrapSupabase as ${ALREADY_WRAPPED_MARKER}wrap } from "${PACKAGE_NAME}/supabase";\n${rewritten}`;
   }
 
   return rewritten;
@@ -427,7 +497,7 @@ function rewriteServerActionFile(source: string): string {
   const wrapperBlock = [
     "",
     "// --- ezlogs-nextjs auto-wrap server action (build-time) ---",
-    `import { captureServerActionExport as __ezlogs_capture_sa } from "ezlogs-nextjs";`,
+    `import { captureServerActionExport as __ezlogs_capture_sa } from "${PACKAGE_NAME}";`,
     ...detected.map(
       (name) =>
         `export const ${name} = __ezlogs_capture_sa(${ALREADY_WRAPPED_MARKER}${name}, ${JSON.stringify(name)});`,
@@ -519,6 +589,12 @@ export function rewriteInlineServerActions(
 
   // Fast path 2: already transformed (e.g. a re-evaluation in dev).
   if (source.includes(INLINE_HELPER_NAME)) return source;
+
+  // Fast path 3: sucrase parser unavailable (deep-import path moved,
+  // package not installed). `getSucraseParse` warns once on first
+  // failed resolution; we just return source unchanged here.
+  const sucraseParse = getSucraseParse();
+  if (sucraseParse === null) return source;
 
   let parsed: SucraseParseResult;
   try {
@@ -619,7 +695,7 @@ export function rewriteInlineServerActions(
 
   // Prepend the import. Idempotency check at the top of the function
   // already guarded against double-prepending.
-  return `import { ${INLINE_HELPER_NAME} } from "ezlogs-nextjs";\n${out}`;
+  return `import { ${INLINE_HELPER_NAME} } from "${PACKAGE_NAME}";\n${out}`;
 }
 
 /**
@@ -869,7 +945,7 @@ function rewriteMiddleware(source: string): string {
     const wrapperBlock = [
       "",
       "// --- ezlogs-nextjs auto-wrap middleware (build-time) ---",
-      `import { withMiddlewareCapture as __ezlogs_with_mw } from "ezlogs-nextjs";`,
+      `import { withMiddlewareCapture as __ezlogs_with_mw } from "${PACKAGE_NAME}";`,
       `export const middleware = __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}middleware);`,
       "// --- end ezlogs-nextjs auto-wrap middleware ---",
       "",
@@ -882,7 +958,7 @@ function rewriteMiddleware(source: string): string {
     const wrapperBlock = [
       "",
       "// --- ezlogs-nextjs auto-wrap middleware (build-time) ---",
-      `import { withMiddlewareCapture as __ezlogs_with_mw } from "ezlogs-nextjs";`,
+      `import { withMiddlewareCapture as __ezlogs_with_mw } from "${PACKAGE_NAME}";`,
       `export default __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}default);`,
       "// --- end ezlogs-nextjs auto-wrap middleware ---",
       "",
@@ -908,7 +984,7 @@ function rewritePagesApi(source: string, routeModulePath: string): string {
   const wrapperBlock = [
     "",
     "// --- ezlogs-nextjs auto-wrap (build-time) ---",
-    `import { capturePagesApi as __ezlogs_capture_pages } from "ezlogs-nextjs";`,
+    `import { capturePagesApi as __ezlogs_capture_pages } from "${PACKAGE_NAME}";`,
     `const __ezlogs_meta = ${meta};`,
     `export default typeof ${ALREADY_WRAPPED_MARKER}default === "function"`,
     `  ? __ezlogs_capture_pages(${ALREADY_WRAPPED_MARKER}default, __ezlogs_meta)`,

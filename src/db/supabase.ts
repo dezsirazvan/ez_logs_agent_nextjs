@@ -555,9 +555,9 @@ function emitOneRow(
   //   1. Result row id (when user chained `.select()`)
   //   2. Values payload's `id` (when explicit on insert/upsert)
   //   3. Filter chain's id (when `.update().eq('id', X)` / `.match({id: X})`)
-  // This is what makes the common pattern `.update({...}).eq('id', X)`
-  // produce an event with the right resource_id even when the caller
-  // doesn't chain `.select()` on the mutation.
+  // This is what makes Velory's `.update({...}).eq('id', X)` produce an
+  // event with the right resource_id even though Velory never chains
+  // `.select()` on its mutations.
   const resourceId = (resultRow?.id ??
     values.id ??
     idFromFilters(filters) ??

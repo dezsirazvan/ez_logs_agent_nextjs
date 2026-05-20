@@ -174,7 +174,7 @@ const KNOWN_VERBS = new Map<string, string>([
  * Parse a Server Action function name into a verb + entity pair.
  *
  * Conventions we recognize (lifted from the App Router community
- * patterns + Vercel templates):
+ * patterns + Velory-Next + Vercel templates):
  *
  *   updateHardwareAction          -> { verb: "update", entity: "Hardware" }
  *   createSpaceAction             -> { verb: "create", entity: "Space" }
