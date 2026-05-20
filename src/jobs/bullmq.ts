@@ -29,15 +29,38 @@ import {
 // Loose structural types — we don't take a hard dep on bullmq types
 // because the adapter must work across BullMQ 4 and 5, which have
 // different type exports.
+//
+// `add` and `addBulk` are typed as `Function` so a real BullMQ
+// `Queue.add(name: string, data: T, opts?: JobsOptions)` is
+// assignable to the constraint without a contravariance failure.
+// The wrap's internal calls re-cast to the right shape on the way
+// in — see the comment on BullWorkerLike below for the deeper TS
+// rationale.
 interface BullQueueLike {
-  add: (name: string, data: unknown, opts?: unknown) => Promise<unknown>;
-  addBulk?: (jobs: Array<{ name: string; data: unknown; opts?: unknown }>) => Promise<unknown>;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  add: Function;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  addBulk?: Function;
   name?: string;
 }
 
+/**
+ * BullMQ's real Worker type is strictly typed (`on<U extends keyof
+ * WorkerListener<…>>`), so a generic `(event: string, listener: …) => …`
+ * structural type fails the `T extends BullWorkerLike` constraint
+ * with a contravariance error: TypeScript can't prove the typed
+ * worker's `on` is assignable to the looser shape, even though
+ * we only call it with valid event names.
+ *
+ * We accept `on` as `Function` instead — looser than `unknown` but
+ * still typed enough to read. The wrap's internal calls cast to the
+ * right shape on the way in.
+ */
 interface BullWorkerLike {
-  on: (event: string, listener: (...args: unknown[]) => void) => unknown;
-  off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  on: Function;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  off?: Function;
   name?: string;
 }
 
@@ -69,10 +92,16 @@ export function wrapBullQueue<T extends BullQueueLike>(queue: T): T {
   }) as T["add"];
 
   if (typeof queue.addBulk === "function") {
-    const originalAddBulk = queue.addBulk.bind(queue);
-    const wrappedAddBulk: NonNullable<BullQueueLike["addBulk"]> = (jobs) =>
+    // queue.addBulk is typed as `Function` on BullQueueLike (see the
+    // interface's comment for why). Cast through the loose-typed
+    // shape so we can call the original safely and re-attach a
+    // wrapping function of the same shape.
+    type BulkJob = { name: string; data: unknown; opts?: unknown };
+    type BulkFn = (jobs: BulkJob[]) => Promise<unknown>;
+    const originalAddBulk = (queue.addBulk as BulkFn).bind(queue);
+    const wrappedAddBulk: BulkFn = (jobs: BulkJob[]) =>
       originalAddBulk(jobs.map((j) => ({ ...j, data: stampPayload(j.data) })));
-    (queue as { addBulk?: typeof wrappedAddBulk }).addBulk = wrappedAddBulk;
+    (queue as unknown as { addBulk?: BulkFn }).addBulk = wrappedAddBulk;
   }
 
   Object.defineProperty(queue, WRAPPED_FLAG, {

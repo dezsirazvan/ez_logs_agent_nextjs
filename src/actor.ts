@@ -58,10 +58,11 @@ export function runWithActorScope<R>(callback: () => R): R {
  * - null input is valid (returns null — "unknown provenance").
  * - Must be a plain object with a non-empty `id` field.
  * - `label` is optional, stringified if present.
- * - Both `id` (string | symbol-style key) variants accepted; we
- *   coerce to string. Ruby checks `actor[:id] || actor["id"]`; in
- *   JS, only string keys exist on plain objects.
+ * - `kind` is optional; only the documented actor_kind enum values
+ *   (human|agent|system|hybrid) survive — anything else is dropped.
  */
+const VALID_KINDS = new Set<string>(["human", "agent", "system", "hybrid"]);
+
 export function validateActor(input: unknown): ActorContext | null {
   if (input === null || input === undefined) return null;
   if (typeof input !== "object") return null;
@@ -78,6 +79,13 @@ export function validateActor(input: unknown): ActorContext | null {
 
   if (obj.label !== undefined && obj.label !== null) {
     result.label = String(obj.label);
+  }
+
+  if (obj.kind !== undefined && obj.kind !== null) {
+    const kind = String(obj.kind);
+    if (VALID_KINDS.has(kind)) {
+      result.kind = kind as NonNullable<ActorContext["kind"]>;
+    }
   }
 
   return result;

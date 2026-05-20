@@ -49,13 +49,34 @@ export {
 } from "./http/capture.js";
 
 let initialized = false;
-let beforeExitInstalled = false;
+
+// Pinned to globalThis so a Next.js HMR cycle (which re-evaluates this
+// module) doesn't stack a second `beforeExit` listener on top of the
+// first. Same Symbol.for pattern as the configuration singleton.
+// Multiple flushes wouldn't corrupt data — flushNow is idempotent —
+// but stacked listeners violate the "no accumulation" contract and
+// would leak handles across reload cycles in long-running dev sessions.
+const BEFORE_EXIT_INSTALLED_KEY = Symbol.for("ezlogs-nextjs:beforeExitInstalled");
+
+interface GlobalWithBeforeExitFlag {
+  [BEFORE_EXIT_INSTALLED_KEY]?: boolean;
+}
+
+function isBeforeExitInstalled(): boolean {
+  return (globalThis as GlobalWithBeforeExitFlag)[BEFORE_EXIT_INSTALLED_KEY] === true;
+}
+
+function markBeforeExitInstalled(): void {
+  (globalThis as GlobalWithBeforeExitFlag)[BEFORE_EXIT_INSTALLED_KEY] = true;
+}
 
 export const ezlogs = {
   init(options: InitOptions): void {
     const config = configuration();
     config.apply(options);
     if (options.logLevel) setLogLevel(options.logLevel);
+
+    warnIfInsecureServerUrl(config.serverUrl, config.allowInsecureTransport);
 
     flushScheduler.start();
     if (config.patchGlobalFetch) patchGlobalFetch();
@@ -314,7 +335,7 @@ function runTriggerTrackedTablesDetection(): void {
 }
 
 function installBeforeExitHook(): void {
-  if (beforeExitInstalled) return;
+  if (isBeforeExitInstalled()) return;
   if (typeof process === "undefined" || !process.on) return;
   process.on("beforeExit", () => {
     // beforeExit can run async work; we kick off a flush and let the
@@ -322,7 +343,48 @@ function installBeforeExitHook(): void {
     // inside FlushScheduler.
     void flushScheduler.flushNow();
   });
-  beforeExitInstalled = true;
+  markBeforeExitInstalled();
+}
+
+/**
+ * Warn once at init time if `serverUrl` is HTTP and points at a
+ * non-local host. The transport will still send events — this is a
+ * heads-up, not an enforcement — but in production a typo
+ * (`http://app.ezlogs.io`) would silently ship events in cleartext.
+ * Local-host shapes (localhost, 127.0.0.1, [::1], *.local) are
+ * exempt because those are dev environments. Customers who
+ * intentionally point at a non-HTTPS internal endpoint can set
+ * `allowInsecureTransport: true` to suppress.
+ */
+function warnIfInsecureServerUrl(
+  serverUrl: string | null,
+  allowInsecure: boolean,
+): void {
+  if (!serverUrl || allowInsecure) return;
+  let parsed: URL;
+  try {
+    parsed = new URL(serverUrl);
+  } catch {
+    // Configuration is invalid; transport will surface a clearer
+    // error when it tries to send. No HTTPS warning needed here.
+    return;
+  }
+  if (parsed.protocol === "https:") return;
+  const host = parsed.hostname.toLowerCase();
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "[::1]" ||
+    host === "::1" ||
+    host.endsWith(".local")
+  ) {
+    return;
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[ezlogs] serverUrl is not HTTPS (${serverUrl}); events will be sent in cleartext. ` +
+      `Set allowInsecureTransport: true to suppress this warning.`,
+  );
 }
 
 /** Test-only. Not exported from package entry. */

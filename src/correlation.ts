@@ -13,7 +13,15 @@
 // invocation is a fresh V8 isolate so the fallback is correct
 // per-request.
 
-import { randomBytes, createHash } from "node:crypto";
+// No `node:crypto` import — Next.js's webpack on some compile paths
+// (notably the Next-15 `instrumentation.ts` bundle) refuses bare
+// `crypto` AND raises `UnhandledSchemeError` on `node:crypto`. The
+// safest portable choice is the Web Crypto global, which is a
+// stable Node built-in since 19 (and exposed on Node 18.17+ via
+// the same `globalThis.crypto` namespace). That gives us
+// synchronous random bytes via `getRandomValues`. For the platform-
+// id → 8-hex derivation we use FNV-1a (non-crypto, but the goal
+// is deterministic grouping, not collision resistance).
 import { createScopedStorage } from "./edge-fallback.js";
 
 /**
@@ -63,8 +71,23 @@ const storage = createScopedStorage<string>(
  */
 export function generate(): string {
   const ts = Date.now();
-  const hex = randomBytes(4).toString("hex");
+  const hex = randomHexBytes(4);
   return `ezl_${ts}_${hex}`;
+}
+
+/**
+ * Synchronous random hex via Web Crypto. `getRandomValues` is a
+ * Node global since 18.17 (and stable since 19); no module import
+ * needed, no async API.
+ */
+function randomHexBytes(byteCount: number): string {
+  const buf = new Uint8Array(byteCount);
+  globalThis.crypto.getRandomValues(buf);
+  let out = "";
+  for (let i = 0; i < buf.length; i++) {
+    out += buf[i]!.toString(16).padStart(2, "0");
+  }
+  return out;
 }
 
 /**
@@ -117,8 +140,30 @@ function safeRead(headers: HeadersLike, name: string): string | null {
 
 function wrapPlatformId(platformId: string): string {
   const ts = Date.now();
-  const hex = createHash("sha1").update(platformId).digest("hex").slice(0, 8);
+  const hex = fnv1aHex(platformId);
   return `ezl_${ts}_${hex}`;
+}
+
+/**
+ * FNV-1a 32-bit hash → 8-char zero-padded hex. We only need a
+ * deterministic, low-collision-rate fingerprint of a
+ * platform-injected request id (`x-vercel-id`, `cf-ray`,
+ * `x-request-id`) so concurrent invocations of the same request
+ * group into one action. This is not a security boundary — no
+ * crypto-grade hash needed, and going async (Web Crypto's
+ * `subtle.digest`) would ripple through every sync `current()`
+ * call site.
+ */
+function fnv1aHex(input: string): string {
+  let hash = 0x811c9dc5; // 2166136261, FNV-1a 32-bit offset basis
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    // FNV prime = 16777619; multiplication via Math.imul stays in
+    // 32-bit signed range without precision loss.
+    hash = Math.imul(hash, 0x01000193);
+  }
+  // Convert to unsigned 32-bit then 8-char zero-padded hex.
+  return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
 /**

@@ -48,8 +48,16 @@ export const IGNORED_ATTRIBUTES: readonly string[] = Object.freeze([
 // DB-specific sensitive patterns. NOTE: this list intentionally differs
 // from EventBuilder's SENSITIVE_KEYS (5 entries) AND from the HTTP
 // middleware's SENSITIVE_VARIABLE_PATTERNS (27 entries). The DB list
-// has 8 entries and is the smallest of the three because column names
-// in real schemas are more terse and less varied. Same as Ruby.
+// has 18 entries — DB columns surface a wider class of crypto material
+// (signing keys, IVs, salts, signatures) than HTTP params do, and
+// defense-in-depth catches schemas that store these in dedicated
+// columns rather than encrypted blobs.
+//
+// Source of truth: ez_logs_agent's database_capturer.rb. Keep this
+// list in lockstep with the Ruby agent's `SENSITIVE_PATTERNS` so the
+// two agents redact the same column names. The server's
+// EventIngest::SensitiveFieldRedactor backstop uses the same 18
+// patterns — agent + server form one consistent redaction layer.
 export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "password",
   "token",
@@ -59,6 +67,16 @@ export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "ssn",
   "social_security",
   "encrypted",
+  "private_key",
+  "public_key",
+  "signing_key",
+  "pem",
+  "cipher",
+  "nonce",
+  "salt",
+  "digest",
+  "signature",
+  "hmac",
 ]);
 
 export interface DbAttributeChange {
