@@ -42,6 +42,7 @@ import {
   currentAuditSnapshot,
   setAuditSnapshot,
 } from "./audit-snapshot.js";
+import { currentEmittedAuditIds } from "./emit-dedup.js";
 import type { SqlExecutor } from "./context.js";
 
 /**
@@ -51,6 +52,13 @@ import type { SqlExecutor } from "./context.js";
  * drivers return strings) — `coerceJsonb` below handles both.
  */
 export interface AuditRow {
+  /**
+   * The audit log row's primary key, stringified. Used only for
+   * within-request emit dedup — never reaches the wire. We stringify
+   * here so drivers that return bigint, number, or string all live in
+   * one Set comparable type.
+   */
+  id: string;
   table_name: string;
   op: "INSERT" | "UPDATE" | "DELETE";
   old_row: Record<string, unknown> | string | null;
@@ -109,11 +117,11 @@ export async function readAuditRows(
     // so we don't accidentally pick up unrelated rows.
     const sql =
       snapshotMaxId === null
-        ? `SELECT table_name, op, old_row, new_row, resource_id
+        ? `SELECT id, table_name, op, old_row, new_row, resource_id
              FROM ezlogs_audit_log
             WHERE correlation_id = $1
             ORDER BY id ASC`
-        : `SELECT table_name, op, old_row, new_row, resource_id
+        : `SELECT id, table_name, op, old_row, new_row, resource_id
              FROM ezlogs_audit_log
             WHERE correlation_id = $1
                OR (correlation_id IS NULL AND id > $2)
@@ -256,7 +264,26 @@ export async function flushAuditLog(exec: SqlExecutor | null | undefined): Promi
   const snapshot = currentAuditSnapshot();
   const rows = await readAuditRows(exec, correlationId, snapshot);
   if (rows.length === 0) return;
-  emitAuditRows(rows);
+
+  // Within-request dedup. The HTTP capture path can call this multiple
+  // times in one request (middleware page-nav, server-action exit,
+  // generic capture); each call re-reads the same rows by correlation.
+  // The emitted-ids set is per-request scope, so concurrent requests
+  // don't interfere. Null = no scope open = adapter call path; emit
+  // unconditionally so we don't break callers that bypass the wrapper.
+  const emitted = currentEmittedAuditIds();
+  if (emitted === null) {
+    emitAuditRows(rows);
+    return;
+  }
+  const fresh: AuditRow[] = [];
+  for (const row of rows) {
+    if (row.id === "" || emitted.has(row.id)) continue;
+    emitted.add(row.id);
+    fresh.push(row);
+  }
+  if (fresh.length === 0) return;
+  emitAuditRows(fresh);
 }
 
 // ---------------------------------------------------------------------
@@ -394,6 +421,7 @@ function extractRows(result: ExecResult): ReadonlyArray<unknown> {
 function normalizeAuditRow(raw: unknown): AuditRow {
   const r = (raw ?? {}) as Record<string, unknown>;
   return {
+    id: r.id == null ? "" : String(r.id),
     table_name: String(r.table_name ?? ""),
     op: r.op as AuditRow["op"],
     old_row: (r.old_row ?? null) as AuditRow["old_row"],
