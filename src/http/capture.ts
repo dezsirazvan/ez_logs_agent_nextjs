@@ -37,6 +37,7 @@ import {
 } from "../correlation.js";
 import { flushAuditLog, takeAuditSnapshot } from "../triggers/reader.js";
 import { runWithAuditSnapshotScope } from "../triggers/audit-snapshot.js";
+import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
 import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
 import {
@@ -1709,10 +1710,10 @@ async function takeTriggerAuditSnapshotIfEnabled(): Promise<void> {
 }
 
 /**
- * Wrap a handler in (actor scope) + optional (audit-snapshot scope)
- * for capturers. Replaces the bare `runWithActorScope` calls so the
- * snapshot mode is wired in one place rather than at every entry
- * point. Capturers do:
+ * Wrap a handler in (actor scope) + optional (audit-snapshot scope) +
+ * optional (audit-emit-dedup scope) for capturers. Replaces the bare
+ * `runWithActorScope` calls so the trigger plumbing is wired in one
+ * place rather than at every entry point. Capturers do:
  *
  *   return runWithCorrelation(correlationId, () =>
  *     runWithActorAndAuditScope(async () => {
@@ -1720,19 +1721,36 @@ async function takeTriggerAuditSnapshotIfEnabled(): Promise<void> {
  *     }),
  *   );
  *
- * When `databaseSnapshotMode` is off (default) this is identical to a
- * plain `runWithActorScope`. When on, we additionally open the
- * audit-snapshot scope and take a `MAX(id)` snapshot before the user
- * handler runs.
+ * Scope layers:
+ *   - actor scope: always (the agent needs `getCurrentActor()` everywhere).
+ *   - audit-snapshot scope: only when `databaseSnapshotMode` is on
+ *     (supabase / no-SET-LOCAL fallback path).
+ *   - audit-emit-dedup scope: whenever a `databaseReader` is configured.
+ *     The trigger reader can be flushed more than once per request
+ *     (middleware page-nav, server-action exit, generic capture). Each
+ *     flush re-reads the same audit rows by correlation — the dedup
+ *     scope holds the set of ids already emitted so re-reads no-op.
+ *     Always opened together with snapshot mode so the snapshot scope
+ *     itself doesn't accidentally enable dedup independently.
  */
 function runWithActorAndAuditScope<R>(callback: () => Promise<R>): Promise<R> {
-  if (!configuration().databaseSnapshotMode) {
+  const config = configuration();
+  const hasReader = config.databaseReader != null;
+  const snapshotEnabled = config.databaseSnapshotMode;
+
+  if (!hasReader) {
     return runWithActorScope(callback);
   }
+
+  // Trigger path is wired (databaseReader configured). Always open the
+  // dedup scope; optionally open the snapshot scope on top.
   return runWithActorScope(() =>
-    runWithAuditSnapshotScope(async () => {
-      await takeTriggerAuditSnapshotIfEnabled();
-      return callback();
+    runWithEmittedAuditIdsScope(() => {
+      if (!snapshotEnabled) return callback();
+      return runWithAuditSnapshotScope(async () => {
+        await takeTriggerAuditSnapshotIfEnabled();
+        return callback();
+      });
     }),
   );
 }
