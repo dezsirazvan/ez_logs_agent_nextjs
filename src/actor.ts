@@ -60,6 +60,9 @@ export function runWithActorScope<R>(callback: () => R): R {
  * - `label` is optional, stringified if present.
  * - `kind` is optional; only the documented actor_kind enum values
  *   (human|agent|system|hybrid) survive — anything else is dropped.
+ * - `principal` is optional; same id-required, label-optional shape
+ *   as the top-level actor. Malformed principals are dropped silently
+ *   (don't reject the whole actor).
  */
 const VALID_KINDS = new Set<string>(["human", "agent", "system", "hybrid"]);
 
@@ -88,6 +91,33 @@ export function validateActor(input: unknown): ActorContext | null {
     }
   }
 
+  const principal = sanitizePrincipal(obj.principal);
+  if (principal) result.principal = principal;
+
+  return result;
+}
+
+/**
+ * Sanitize the optional principal sub-structure. Returns null if the
+ * principal is missing or malformed; we drop silently rather than
+ * rejecting the parent actor — principal is purely advisory.
+ */
+function sanitizePrincipal(input: unknown): { id: string; label?: string } | null {
+  if (input === null || input === undefined) return null;
+  if (typeof input !== "object") return null;
+  if (Array.isArray(input)) return null;
+
+  const obj = input as Record<string, unknown>;
+  const rawId = obj.id;
+  if (rawId === null || rawId === undefined) return null;
+
+  const id = String(rawId);
+  if (id === "") return null;
+
+  const result: { id: string; label?: string } = { id };
+  if (obj.label !== undefined && obj.label !== null) {
+    result.label = String(obj.label);
+  }
   return result;
 }
 
