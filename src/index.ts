@@ -25,6 +25,7 @@ import { logger } from "./logger.js";
 export type {
   ActorContext,
   ActorFromRequest,
+  ActorPrincipal,
   DisplayNameMap,
   InitOptions,
 } from "./configuration.js";

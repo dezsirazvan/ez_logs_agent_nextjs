@@ -25,6 +25,24 @@ export interface ActorContext {
    *  absent. Auto-detection from the User-Agent fills this when the
    *  request looks like it came from an LLM client. */
   kind?: ActorKind;
+  /** The human principal who authorized this agent / hybrid action.
+   *  Optional — only meaningful when `kind` is `"hybrid"` (or sometimes
+   *  `"agent"` if the customer wants to surface the human owner of
+   *  the running agent). Drives the "Claude updated employee, on
+   *  behalf of Razvan" framing on the server's AiExplainer. */
+  principal?: ActorPrincipal;
+}
+
+/**
+ * Sub-actor representing the human principal who authorized an agent
+ * action. Always human; mirrors the shape of `ActorContext` minus the
+ * `kind` field (principals don't nest indefinitely).
+ */
+export interface ActorPrincipal {
+  /** Stable identifier (e.g. `user.id`). REQUIRED. */
+  id: string;
+  /** Human-readable label. Optional. */
+  label?: string;
 }
 
 /**
