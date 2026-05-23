@@ -54,6 +54,66 @@ the `databaseReader` / `patchDatabaseClient` options at all. Pass them
 explicitly only when you need a non-default pool or when you're not on
 a conventional connection-string env var.
 
+## Prisma (`@prisma/adapter-pg`)
+
+Prisma's driver-adapter mode runs queries through a NAPI engine
+boundary that breaks AsyncLocalStorage propagation. Without an extra
+step the agent's correlation id never reaches the adapter, so audit
+rows from `prisma.foo.create(...)` calls land with NULL
+`correlation_id` even though the request itself is correctly scoped.
+
+Wire two wrappers at the place you construct your Prisma client:
+
+```ts
+// src/lib/prisma.ts
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import {
+  patchPrismaClient,
+  patchPrismaPgAdapter,
+} from "ezlogs-nextjs/prisma";
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
+const adapter = patchPrismaPgAdapter(new PrismaPg(pool));
+export const prisma = patchPrismaClient(
+  new PrismaClient({ adapter }),
+  adapter,
+);
+```
+
+What each wrapper does:
+
+- **`patchPrismaPgAdapter(adapter)`** replaces the adapter's
+  `queryRaw` / `executeRaw` / `transactionContext` methods so each
+  one runs the original inside a snapshot stored on the adapter
+  instance.
+
+- **`patchPrismaClient(client, adapter)`** wraps the PrismaClient in
+  a Proxy that, before each method call, takes an
+  `AsyncLocalStorage.snapshot()` of the current request scope,
+  deposits it on the adapter, and clears it once the method's
+  promise settles.
+
+The Proxy serializes Prisma method calls per-adapter via an internal
+Promise mutex so the snapshot deposited for THIS call is what the
+adapter wrap reads — not one set by a concurrent call. The cost is
+real per-adapter throughput: 10 concurrent Prisma calls on one
+adapter become 10 sequential calls. For the v0.1.x line we accept
+that cost for correlation correctness; a future version may relax
+this to per-tx-context or use an engine-aware approach.
+
+Without `patchPrismaPgAdapter` the `patchPrismaClient` wrap falls
+back to a best-effort snapshot-on-the-PrismaClient-call path that
+empirically does NOT survive the engine boundary on PrismaPg. Agent
+logs `patchPrismaClient: adapter is not the output of
+patchPrismaPgAdapter(). Correlation_id will be NULL on concurrent
+requests.` in dev.
+
+Drizzle and raw `pg` users do NOT need any wrappers: the agent's
+existing `patchPgClient` already handles those paths because there's
+no engine boundary between the caller and `pg.Client.prototype.query`.
+
 ## Fallback: per-ORM adapters
 
 When the trigger path isn't viable (PlanetScale, supabase-js, customers

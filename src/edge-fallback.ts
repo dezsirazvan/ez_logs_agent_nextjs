@@ -68,6 +68,51 @@ export interface ScopedStorage<T> {
   _isAsyncLocalStorage(): boolean;
 }
 
+/**
+ * Returns a `captureAndRun` factory built on Node 18.16+'s static
+ * `AsyncLocalStorage.snapshot()`. Calling the factory captures the
+ * CURRENT ALS context (across every active ALS instance, including
+ * the agent's correlation + actor stores) and returns a runner that
+ * re-establishes it.
+ *
+ * Usage:
+ *
+ *   const captureAndRun = makeAsyncContextCapture();
+ *   if (captureAndRun) {
+ *     // Inside a request scope — snapshot captures it.
+ *     const run = captureAndRun();
+ *     // Later, possibly across an ALS-stripping async boundary:
+ *     run(() => { // sees the captured context });
+ *   }
+ *
+ * Critical: capture must happen LAZILY — inside the wrapper's
+ * call site — not once at agent init. The init-time scope is empty
+ * (no request is in flight), so snapshotting then yields a runner
+ * that re-establishes the empty scope. The correct moment to capture
+ * is the boundary between the user's request-scoped code and the
+ * engine entry point we're trying to bind across.
+ *
+ * Runtime requirement: Node >= 18.16 (or any runtime that exposes
+ * `AsyncLocalStorage.snapshot` statically — current Vercel Edge does).
+ * Returns null on older runtimes; callers should fall back to calling
+ * the underlying function unbound. The agent's `engines.node` floor is
+ * `>=18.17` so this branch is unreachable in supported deployments.
+ */
+export function makeAsyncContextCapture():
+  | (() => <R>(fn: () => R) => R)
+  | null {
+  if (!ALS_CTOR) return null;
+  const ctor = ALS_CTOR as unknown as {
+    snapshot?: () => <R>(fn: () => R, ...args: unknown[]) => R;
+  };
+  if (typeof ctor.snapshot !== "function") return null;
+  const snapshot = ctor.snapshot.bind(ctor);
+  return () => {
+    const runSnapshot = snapshot();
+    return <R>(fn: () => R): R => runSnapshot(fn);
+  };
+}
+
 interface GlobalScopedStores {
   [key: symbol]: { als: unknown; edgeFallback: { value: unknown } | null } | undefined;
 }
