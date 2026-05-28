@@ -1,5 +1,7 @@
 # ezlogs-nextjs
 
+[Website](https://ezlogs.io/) · [Documentation](https://ezlogs.io/nextjs/) · [Ruby sister agent](https://github.com/dezsirazvan/ez_logs_agent)
+
 **Drop-in activity logging for Next.js.** Captures HTTP requests,
 database changes, Server Actions, and background jobs. Ships them to
 the EZLogs server as plain-English Action cards your whole team can
