@@ -28,6 +28,7 @@
 
 export { runInstall, parseArgs, detectEngine, buildTrackingSql } from "./install.js";
 export type { Detected } from "./install.js";
+export { loadEnvFiles } from "./env-files.js";
 
 export {
   applyDatabaseContext,

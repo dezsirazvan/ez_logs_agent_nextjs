@@ -213,6 +213,11 @@ function rewriteAppRoute(source: string, routeModulePath: string): string {
       rewritten = renamed.source;
     }
   }
+  // `export const { GET, POST } = handlers` (Auth.js v5), possibly
+  // several statements, possibly beside `export async function PUT`.
+  const destructured = renameDestructuredExports(rewritten);
+  rewritten = destructured.source;
+  for (const method of destructured.methods) detected.add(method);
 
   if (detected.size === 0) {
     // No top-level `export async function NAME` / `export const NAME =`
@@ -336,6 +341,32 @@ function rewriteLocalAliasedRouteExports(
   const before = source.slice(0, matchedBlock.start);
   const after = source.slice(matchedBlock.end);
   return `${before}${wrapperLines.join("\n")}${after}`;
+}
+
+/**
+ * Rename the destructured export Auth.js v5 documents (and
+ * create-t3-app ships):
+ *
+ *   export const { GET, POST } = handlers
+ *
+ * to `const { GET: __ezlogs_orig_GET, POST: __ezlogs_orig_POST } = handlers`
+ * so `rewriteAppRoute` can append the wrapped exports. Every statement
+ * in the file is handled; one with a non-method name (`{ GET, auth }`)
+ * is left alone.
+ */
+function renameDestructuredExports(source: string): { source: string; methods: HttpMethodName[] } {
+  const methodSet = new Set<string>(HTTP_METHOD_NAMES);
+  const methods: HttpMethodName[] = [];
+  const out = source.replace(
+    /(^|\n)([ \t]*)export\s+const\s*\{([^}]+)\}\s*=/g,
+    (full, lead: string, indent: string, list: string) => {
+      const names = list.split(",").map((n) => n.trim()).filter(Boolean);
+      if (names.length === 0 || !names.every((n) => methodSet.has(n))) return full;
+      methods.push(...(names as HttpMethodName[]));
+      return `${lead}${indent}const { ${names.map((n) => `${n}: ${ALREADY_WRAPPED_MARKER}${n}`).join(", ")} } =`;
+    },
+  );
+  return { source: out, methods };
 }
 
 /**

@@ -71,7 +71,8 @@ ezlogs.init({
   // ==========================================
   isServerActionError: (result) => {
     // Built-ins handle next-safe-action, zsa, Conform, Zod safeParse,
-    // and `{success: false}` shapes. Override here only when needed.
+    // `{success: false, error}`, `{error: "…"}` and `{errors: …}`
+    // form-state shapes. Override here only when needed.
     if (result?.code === "VALIDATION_FAILED") {
       return { errorMessage: result.message };
     }
@@ -102,7 +103,7 @@ at build time. Both Webpack and Turbopack are supported.
 
 | Pattern | Loader kind | What it wraps |
 |---|---|---|
-| `app/**/route.{ts,tsx,js,jsx}` | `app-route-handler` | App Router route handlers (GET / POST / …) |
+| `app/**/route.{ts,tsx,js,jsx}` | `app-route-handler` | App Router route handlers (GET / POST / …): `export async function GET`, `export const GET =`, `export { handler as GET }` and `export const { GET, POST } = handlers` (Auth.js v5) |
 | `pages/api/**/*.{ts,tsx,js,jsx}` | `pages-api` | Pages Router API routes |
 | `middleware.{ts,tsx,js,jsx}` (root + `src/`) | `middleware` | Your `middleware.ts` (correlation seeding) |
 | `actions/**/*`, `app/**/actions.{ts,tsx}`, `app/**/actions/**/*` | `server-action` | File-level `"use server"` modules |

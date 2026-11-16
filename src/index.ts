@@ -79,6 +79,39 @@ function markBeforeExitInstalled(): void {
   (globalThis as GlobalWithBeforeExitFlag)[BEFORE_EXIT_INSTALLED_KEY] = true;
 }
 
+const STARTUP_ANNOUNCED_KEY = Symbol.for("ezlogs-nextjs:startupAnnounced");
+
+/**
+ * One line per process at the default log level, so "is it on?" is
+ * answerable from the terminal: where events go and which project
+ * (last 4 token characters only). Missing config says so instead.
+ */
+function announceStartup(serverUrl: string | null, projectToken: string | null): void {
+  const g = globalThis as Record<symbol, unknown>;
+  if (g[STARTUP_ANNOUNCED_KEY]) return;
+  g[STARTUP_ANNOUNCED_KEY] = true;
+  if (!serverUrl || !projectToken) {
+    const missing = [!serverUrl && "serverUrl", !projectToken && "projectToken"].filter(Boolean).join(" and ");
+    logger.warn(`not capturing: ${missing} missing in ezlogs.init() (check EZLOGS_SERVER_URL / EZLOGS_PROJECT_TOKEN)`);
+    return;
+  }
+  let host = serverUrl;
+  try {
+    host = new URL(serverUrl).host;
+  } catch {
+    // keep the raw value; warnIfInsecureServerUrl covers malformed URLs
+  }
+  // The suffix only identifies the project when the token is long
+  // enough that 4 characters reveal next to nothing of it.
+  const project = projectToken.length >= 12 ? ` (project …${projectToken.slice(-4)})` : "";
+  logger.notice(`capturing → ${host}${project}`);
+}
+
+/** @internal test-only */
+export function _resetStartupAnnouncementForTests(): void {
+  delete (globalThis as Record<symbol, unknown>)[STARTUP_ANNOUNCED_KEY];
+}
+
 export const ezlogs = {
   init(options: InitOptions): void {
     const config = configuration();
@@ -86,6 +119,7 @@ export const ezlogs = {
     if (options.logLevel) setLogLevel(options.logLevel);
 
     warnIfInsecureServerUrl(config.serverUrl, config.allowInsecureTransport);
+    announceStartup(config.serverUrl, config.projectToken);
 
     flushScheduler.start();
     if (config.patchGlobalFetch) patchGlobalFetch();

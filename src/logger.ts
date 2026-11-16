@@ -61,6 +61,15 @@ function safeWrite(level: LogLevel, message: string): void {
 export const logger = {
   debug: (message: string) => safeWrite("debug", message),
   info: (message: string) => safeWrite("info", message),
+  /** An info line that also shows at the default `warn` level (startup confirmation). */
+  notice: (message: string) => {
+    try {
+      // eslint-disable-next-line no-console
+      if (shouldLog("warn")) console.log(`[ezlogs] ${message}`);
+    } catch {
+      // logging must never crash
+    }
+  },
   warn: (message: string) => safeWrite("warn", message),
   error: (message: string) => safeWrite("error", message),
 };

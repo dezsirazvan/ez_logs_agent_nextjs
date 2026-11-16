@@ -20,7 +20,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "../logger.js";
-import { DEFAULT_EXCLUDED_TABLES } from "../configuration.js";
+import { AUTH_SESSION_TABLE_NAMES } from "../configuration.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -31,7 +31,7 @@ interface ParsedArgs {
    * Auto-detect mode. True when the user passes no `--tables=` flag or
    * explicitly passes `--tables=auto`. The CLI then introspects
    * `information_schema` and tracks every business table in the public
-   * schema, minus a built-in infrastructure skip list.
+   * schema, minus the skip rules in `skipReason`.
    */
   autoTables: boolean;
   print: boolean;
@@ -86,12 +86,14 @@ Usage:
 
 Options:
   --connection=<url>   Database connection string. Defaults to DATABASE_URL
-                       or POSTGRES_URL from the environment.
+                       or POSTGRES_URL from the environment (.env, .env.local
+                       and .env.[mode] are loaded the way Next.js loads them).
   --tables=<a,b,c>     Comma-separated list of tables to attach the audit
                        trigger to. Idempotent — re-runnable.
   --tables=auto        DEFAULT. Introspect information_schema and track every
-                       business table in the public schema, minus a built-in
-                       infrastructure skip list (migrations, sessions, etc.).
+                       business table in the public schema, minus migrations,
+                       internals and auth-session tables (each skipped table
+                       is listed with the reason).
   --tables=none        Install infrastructure only; track no tables.
                        Use this when you want full manual control.
   --print              Print the SQL that would be applied; do not run it.
@@ -164,71 +166,84 @@ function escapeSqlIdentifier(name: string): string {
 }
 
 /**
- * Skip list applied to the `--tables=auto` introspection result.
- *
- * Composed from `DEFAULT_EXCLUDED_TABLES` (the runtime skip list — same
- * one the agent already uses to filter trigger emits) plus a small
- * extension of trigger-install-specific tables: things that should
- * never have a trigger attached even though the runtime filter would
- * also skip them (the install itself errors if we try to attach to a
- * non-existent or view-style row).
+ * Skip rules applied to the `--tables=auto` introspection result, each
+ * with the reason the CLI prints. Infrastructure is skipped by name;
+ * auth-session / session-store / verification-token tables only when
+ * their columns say so (token, expiry, `sess`, `data`, `payload`,
+ * `last_activity`: Auth.js, Lucia, Rails, Laravel, connect-pg-simple),
+ * because the same names also hold business data (Umami's `session`).
  *
  * Customers can still attach skipped tables manually with
  * `SELECT ezlogs_track('foo')` after the install.
  */
-const TRIGGER_INSTALL_SKIP_PATTERNS: ReadonlyArray<string | RegExp> = [
-  ...DEFAULT_EXCLUDED_TABLES,
+const NAMED_SKIPS: ReadonlyArray<readonly [string | RegExp, string]> = [
   // Our own audit table — trigger on the audit table would be a loop.
-  "ezlogs_audit_log",
+  ["ezlogs_audit_log", "EZLogs audit log"],
+  ["_prisma_migrations", "migration history"],
+  ["schema_migrations", "migration history"],
+  ["ar_internal_metadata", "Rails internals"],
   // Postgres internals (won't be in public schema, but defensive).
-  /^pg_/,
-  /^_litestream/,
-  // Solid Queue / Solid Cache / Solid Cable (Rails 8 default infra
-  // tables — show up in apps that share a database with Rails).
-  /^solid_(queue|cache|cable)/,
-  // ActiveStorage (same).
-  /^active_storage_/,
-  // ActiveRecord internals.
-  "ar_internal_metadata",
-  "schema_migrations",
+  [/^pg_/, "database internals"],
+  [/^_litestream/, "database internals"],
+  // Rails 8 infra tables, in apps that share a database with Rails.
+  [/^solid_(queue|cache|cable)/, "Rails infrastructure"],
+  [/^active_storage_/, "Rails infrastructure"],
 ];
 
-function shouldSkipTable(tableName: string): boolean {
-  for (const pattern of TRIGGER_INSTALL_SKIP_PATTERNS) {
-    if (typeof pattern === "string") {
-      if (tableName === pattern) return true;
-    } else if (pattern.test(tableName)) {
-      return true;
-    }
+
+/**
+ * Why a discovered table is skipped, or null to track it.
+ * `hasAuthColumns`: the table has a session-store column (token,
+ * expiry, `sess`, `data`, `payload`, `last_activity`; see
+ * DISCOVER_TABLES_SQL and `isSessionStoreColumn`); `undefined`
+ * (unknown) keeps the name rule.
+ */
+export function skipReason(tableName: string, hasAuthColumns?: boolean): string | null {
+  for (const [pattern, reason] of NAMED_SKIPS) {
+    if (typeof pattern === "string" ? tableName === pattern : pattern.test(tableName)) return reason;
   }
-  return false;
+  if (AUTH_SESSION_TABLE_NAMES.test(tableName) && (hasAuthColumns !== false || /verif/i.test(tableName))) {
+    return "auth / session store (has token, expiry or session-data columns)";
+  }
+  return null;
 }
 
 /**
- * SQL that lists every regular table in the `public` schema. Only
- * base tables (`BASE TABLE`) — excludes views, materialized views,
- * foreign tables. Sorted for deterministic output.
+ * SQL that lists every regular table in the `public` schema, flagging
+ * the ones with a session-store column (`isSessionStoreColumn`). Only base tables (`BASE
+ * TABLE`) — excludes views, materialized views, foreign tables.
+ * Sorted for deterministic output.
  */
 export const DISCOVER_TABLES_SQL = `
-SELECT table_name
-FROM information_schema.tables
-WHERE table_schema = 'public'
-  AND table_type = 'BASE TABLE'
-ORDER BY table_name
+SELECT t.table_name,
+  EXISTS (
+    SELECT 1 FROM information_schema.columns c
+    WHERE c.table_schema = t.table_schema
+      AND c.table_name = t.table_name
+      AND (
+        c.column_name ILIKE '%token%'
+        OR c.column_name ILIKE '%expir%'
+        OR lower(replace(c.column_name, '_', '')) IN ('sess', 'data', 'payload', 'lastactivity')
+      )
+  ) AS has_auth_columns
+FROM information_schema.tables t
+WHERE t.table_schema = 'public'
+  AND t.table_type = 'BASE TABLE'
+ORDER BY t.table_name
 `.trim();
+
+type DiscoveredRow = { table_name: string; has_auth_columns?: boolean };
 
 /**
  * Discover business tables for `--tables=auto`. Returns the list of
- * table names that pass the skip filter. The query function must
- * return an object exposing `{ rows: Array<{ table_name: string }> }`
- * — matches `pg`'s default result shape.
+ * table names that pass the skip rules. The query function must
+ * return an object exposing `{ rows: [...] }` — `pg`'s result shape.
  */
 export async function discoverTables(
-  query: (sql: string) => Promise<{ rows: Array<{ table_name: string }> }>,
+  query: (sql: string) => Promise<{ rows: DiscoveredRow[] }>,
 ): Promise<string[]> {
   const result = await query(DISCOVER_TABLES_SQL);
-  const all = result.rows.map((r) => r.table_name);
-  return all.filter((name) => !shouldSkipTable(name));
+  return result.rows.filter((r) => skipReason(r.table_name, r.has_auth_columns) === null).map((r) => r.table_name);
 }
 
 interface RunOptions {
@@ -240,7 +255,7 @@ interface RunOptions {
    * building the tracking SQL. Tests inject. The CLI shim wires this
    * with `pg.Client.prototype.query`.
    */
-  query?: (sql: string) => Promise<{ rows: Array<{ table_name: string }> }>;
+  query?: (sql: string) => Promise<{ rows: DiscoveredRow[] }>;
   /** Output sink. Defaults to console.log. Tests inject. */
   out?: (line: string) => void;
 }
@@ -328,16 +343,17 @@ export async function runInstall(
   // infrastructure SQL alone and surface a notice — the customer can
   // run `SELECT ezlogs_track('foo')` manually afterwards.
   let tablesToTrack: string[];
-  let skippedTables: string[] = [];
+  const skippedTables: Array<{ table: string; reason: string }> = [];
   if (args.autoTables) {
-    if (!options.query) {
-      tablesToTrack = [];
-    } else {
+    tablesToTrack = [];
+    if (options.query) {
       try {
         const result = await options.query(DISCOVER_TABLES_SQL);
-        const all = result.rows.map((r) => r.table_name);
-        tablesToTrack = all.filter((name) => !shouldSkipTable(name));
-        skippedTables = all.filter((name) => shouldSkipTable(name));
+        for (const row of result.rows) {
+          const reason = skipReason(row.table_name, row.has_auth_columns);
+          if (reason) skippedTables.push({ table: row.table_name, reason });
+          else tablesToTrack.push(row.table_name);
+        }
       } catch (error) {
         out(
           `[ezlogs] Could not introspect tables: ${
@@ -385,13 +401,17 @@ export async function runInstall(
       out(
         `[ezlogs] Postgres triggers installed. Tracking ${tablesToTrack.length} table(s): ${tablesToTrack.join(", ")}.`,
       );
-      if (skippedTables.length > 0) {
-        out(
-          `[ezlogs] Skipped ${skippedTables.length} infrastructure table(s) ` +
-            `(migrations, sessions, etc.): ${skippedTables.join(", ")}. ` +
-            `Track any of them manually with \`SELECT ezlogs_track('foo')\`.`,
-        );
-      }
+      out(
+        "[ezlogs] Records are named by their name / title / number / label column. " +
+          "To name people's records (users, members), set `displayNameFor` in ezlogs.init (README: Name your records).",
+      );
+    }
+    if (skippedTables.length > 0) {
+      out(
+        `[ezlogs] Skipped ${skippedTables.length} table(s):\n` +
+          skippedTables.map((s) => `  - ${s.table}: ${s.reason}`).join("\n") +
+          "\n  Track any of them with `SELECT ezlogs_track('table_name')`.",
+      );
     }
     return 0;
   } catch (error) {

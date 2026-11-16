@@ -10,7 +10,12 @@
 // IGNORED_ATTRIBUTES, SENSITIVE_PATTERNS, scalar() and the format-for-
 // JSON rules are direct ports of database_capturer.rb.
 
-import { configuration } from "../configuration.js";
+import {
+  AUTH_SESSION_TABLE_NAMES,
+  DEFAULT_EXCLUDED_TABLES,
+  configuration,
+  isSessionStoreColumn,
+} from "../configuration.js";
 import { logger } from "../logger.js";
 import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
@@ -145,7 +150,18 @@ export function emitDbEvent(input: DbEmitInput): void {
   try {
     const config = configuration();
     if (!config.captureDb) return;
-    if (config.allExcludedTables().includes(input.modelClass)) return;
+    if (config.excludedTables.includes(input.modelClass)) return;
+    // Default name list (`_prisma_migrations`, `session`, `Session`, …).
+    // Exception: a trigger row from a session-named table whose row has
+    // no session-store column (token, expiry, `sess`, `data`, `payload`,
+    // `last_activity`) is business data (Umami's visitor `session`).
+    // Session stores tracked by an older install stay dropped.
+    if (
+      DEFAULT_EXCLUDED_TABLES.includes(input.modelClass) &&
+      !(input._fromTrigger && isBusinessSessionRow(input.modelClass, input.modelInstance))
+    ) {
+      return;
+    }
 
     // When the customer wired the trigger reader (`databaseReader`
     // config), the Phase 5 path is authoritative for DB capture on
@@ -493,6 +509,13 @@ function isPrismaDecimal(
     "e" in obj &&
     "s" in obj
   );
+}
+
+function isBusinessSessionRow(table: string, row: Record<string, unknown> | null | undefined): boolean {
+  // Verification tokens are never business data.
+  if (!AUTH_SESSION_TABLE_NAMES.test(table) || /verif/i.test(table) || !row) return false;
+  const columns = Object.keys(row);
+  return columns.length > 0 && !columns.some(isSessionStoreColumn);
 }
 
 // Display-name fallback chain — port of resolve_display_name,

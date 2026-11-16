@@ -47,6 +47,44 @@ No opt-in needed. The agent resolves the current user via `auth.getUser()`
 automatically once any Supabase client is wrapped. Disable via
 `actorFromSupabase: false` if you'd rather supply your own resolution.
 
+## Custom JWT / bearer token
+
+For your own session cookie or `Authorization: Bearer …` header,
+verify the token in the hook and return the user. The hook receives a
+`Request` (route handlers) or a request-like object with `headers`
+(Server Actions), so read headers only:
+
+```ts
+import { jwtVerify } from "jose";
+
+const secret = new TextEncoder().encode(process.env.AUTH_SECRET);
+
+ezlogs.init({
+  // ...
+  actorFromRequest: async (request) => {
+    const cookie = request.headers.get("cookie") ?? "";
+    const token =
+      request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ??
+      /(?:^|;\s*)session=([^;]+)/.exec(cookie)?.[1];
+    if (!token) return null;
+    try {
+      const { payload } = await jwtVerify(token, secret);
+      return { id: String(payload.sub), label: payload.email as string | undefined };
+    } catch {
+      return null; // expired / invalid: no actor rather than a wrong one
+    }
+  },
+});
+```
+
+- **`id`** (required) is the stable key the dashboard groups an
+  actor's activity by: your user id, never something that changes.
+- **`label`** (optional) is what people read: "Ivy Tran" or an email.
+  Leave it out and the dashboard shows the id. The label is masked on
+  default (redacted) share links and embeds.
+- Return `null` when there is no valid session. Never decode a token
+  without verifying it.
+
 ## Custom / composing
 
 ```ts

@@ -75,7 +75,8 @@ export type ActorFromRequest = (
  */
 export type DisplayNameResolver =
   | string
-  | ((row: Record<string, unknown>) => string | null | undefined);
+  // `unknown`: a non-string result is stringified, null / undefined / "" falls through.
+  | ((row: Record<string, unknown>) => unknown);
 
 /**
  * Maps a model class name → resolver used to derive the human-readable
@@ -261,14 +262,21 @@ export const DEFAULT_EXCLUDED_PATHS: readonly ExcludedPathPattern[] = Object.fre
   "/robots.txt",
   "/sitemap.xml",
   "/*.hot-update.*",
-  // Auth routes (common patterns across Clerk, NextAuth, custom auth)
-  "*/login*",
-  "*/logout*",
-  "*/sign-in*",
-  "*/sign-out*",
-  "*/signin*",
-  "*/signout*",
-  "/session*",
+  // Auth.js / NextAuth plumbing that is never a user action, any method:
+  // session refresh (`update()` POSTs too), CSRF token, provider list,
+  // client log relay.
+  "/api/auth/session",
+  "/api/auth/csrf",
+  "/api/auth/providers",
+  "/api/auth/_log",
+  // Auth routes (common patterns across Clerk, NextAuth, custom auth):
+  // the GETs are page loads, probes and OAuth / email-link callbacks;
+  // the POSTs are sign-in / sign-up / sign-out attempts (succeeded or
+  // failed) and ARE captured. Passwords and tokens in the body are
+  // filtered by the usual param sanitization.
+  ...["*/login*", "*/logout*", "*/sign-in*", "*/sign-out*", "*/signin*", "*/signout*", "/session*"].map(
+    (path) => Object.freeze({ path, methods: ["GET", "HEAD"] }),
+  ),
 ]);
 
 export const DEFAULT_EXCLUDED_EXTENSIONS: readonly string[] = Object.freeze([
@@ -301,6 +309,22 @@ export const DEFAULT_EXCLUDED_TABLES: readonly string[] = Object.freeze([
   "session",
   "verification_tokens",
 ]);
+
+/**
+ * Auth-session / verification-token / session-store table names
+ * (Auth.js, Lucia, better-auth, Rails / Laravel / connect-pg-simple
+ * session stores). Such a table is treated as auth plumbing when it
+ * also has a session-store column (see `isSessionStoreColumn`); the
+ * same name also holds business data (Umami's visitor `session`).
+ */
+export const AUTH_SESSION_TABLE_NAMES =
+  /^(sessions?|user_?sessions?|auth_?sessions?|verification_?tokens?|verifications?)$/i;
+
+/** Token / expiry / serialized-session columns: `sessionToken`, `expires_at`, `sess`, `data`, `payload`, `last_activity`. */
+export function isSessionStoreColumn(column: string): boolean {
+  if (/token|expir/i.test(column)) return true;
+  return ["sess", "data", "payload", "lastactivity"].includes(column.toLowerCase().replace(/_/g, ""));
+}
 
 // No Next.js infrastructure jobs reliably emit noise across all three
 // runners (BullMQ / Inngest / Trigger.dev). Customers add their own

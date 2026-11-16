@@ -25,8 +25,13 @@ function installedFromProject() {
 }
 
 (async () => {
-  const { runInstall, parseArgs } = require("../dist/triggers/index.cjs");
+  const { runInstall, parseArgs, loadEnvFiles } = require("../dist/triggers/index.cjs");
   const { version } = require("../package.json");
+
+  // DATABASE_URL usually lives in .env / .env.local: load them the way
+  // Next.js does (already-set variables win).
+  const envFiles = loadEnvFiles(process.cwd());
+  if (envFiles.length > 0) console.log(`[ezlogs] Loaded env from ${envFiles.join(", ")}`);
 
   const argv = process.argv.slice(2);
   const command = argv.find((a) => !a.startsWith("-"));
@@ -111,7 +116,7 @@ function installedFromProject() {
     await client.connect();
   } catch (err) {
     console.error(
-      `[ezlogs] Could not connect to ${args.connection}: ${err.message}`,
+      `[ezlogs] Could not connect to ${args.connection.replace(/\/\/([^:/@]*):[^@]*@/, "//$1:***@")}: ${err.message}`,
     );
     process.exit(1);
   }

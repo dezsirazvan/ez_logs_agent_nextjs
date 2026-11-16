@@ -107,9 +107,25 @@ interface TaggingClient {
  * writes inside a user `$transaction` (batch or interactive) — Prisma
  * can't nest a transaction there.
  */
-export function ezlogsPrisma(): unknown {
-  return (client: TaggingClient) => client.$extends(buildPrismaExtension(client));
+export function ezlogsPrisma(): EzlogsPrismaExtension {
+  return ((client: TaggingClient) =>
+    client.$extends(buildPrismaExtension(client))) as EzlogsPrismaExtension;
 }
+
+/**
+ * The type `Prisma.defineExtension((client) => …)` gives a query-only
+ * extension (no added result / model / client members), spelled out so
+ * `$extends(ezlogsPrisma())` type-checks on Prisma 5, 6 and 7 without
+ * importing `@prisma/client` types, and the extended client keeps
+ * every model type unchanged.
+ */
+export type EzlogsPrismaExtension = (
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: any,
+) => {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  $extends: { extArgs: { result: {}; model: {}; query: {}; client: {} } };
+};
 
 /**
  * The extension descriptor. `client` null = capture only, no tagging

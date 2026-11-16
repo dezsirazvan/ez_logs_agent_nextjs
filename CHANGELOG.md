@@ -3,6 +3,103 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.0] — 2026-11-16
+
+Wire format unchanged; one new optional `source_data` field
+(`redirect_to`). **Upgrade steps:** none required. Optional: re-run
+`npx ezlogs-nextjs install-triggers` to start tracking session-named
+business tables the old name rule skipped. Behavior change: auth POSTs
+(sign-in, sign-up, sign-out, login, logout) are now captured; add them
+to `excludedPaths` if you don't want them.
+
+### Fixed
+- **Server Action failures recorded as success.** A returned
+  `{ error: "Invalid email or password" }` (no truthy `success` / `ok`,
+  no `data`) and the Next.js docs' form state `{ errors: { field: [...] },
+  message }` / `{ errors: [...] }` are now failures. The message is the
+  first safe field error, else the state's `message`, with the 0.3.3
+  masking (emails and secrets masked, sensitive fields skipped).
+  `{ message: "Saved" }`, empty `errors`, `error` beside
+  `success: true` / `ok: true` / `data`, a database row (an `id` /
+  `created_at` / `updatedAt` key) with an `error` column, and a
+  partial success (`{ imported: 97, errors: [...] }`: `errors` counts
+  only in a pure form state) stay successes. A returned
+  `{ success: false, error }` message is now masked the same way.
+- **`next build` failed with the documented install on strict
+  TypeScript** (create-t3-app). `ezlogsPrisma()` returned `unknown`
+  (TS2345 at `$extends`); it now returns a Prisma extension type that
+  works on Prisma 5, 6 and 7 without importing `@prisma/client` types,
+  and the extended client keeps its model types. `withEzlogsConfig` is
+  generic over the config you pass and returns the same type, so a
+  `checkJs` ESM `next.config.js` (`webpack: null` in Next's type) and
+  other config wrappers type-check. Type-level regression fixtures run
+  in CI (`strict`, `checkJs`; Prisma per major).
+- **tRPC errors said only "HTTP 400".** Batch and single tRPC error
+  bodies (superjson or plain) now give the zod field error
+  (`name: String must contain at least 1 character(s)`) or the error
+  message, never the raw zod JSON. "What was sent" no longer shows the
+  superjson envelope (`Json name: …`): the input is unwrapped from
+  `{ json, meta }`, `{"0":{json}}` and `?input=` (on tRPC routes
+  only; a plain JSON `?input=` is parsed too, so its `password` is
+  filtered); the `trpc` procedure param is kept. The reason names the
+  failing procedure (`post.delete: Not allowed`), and a batch where
+  some calls failed (HTTP 207 with a tRPC body) is now a failure; any
+  other 207 stays a success. **Known gap:** `httpBatchStreamLink`
+  answers 200 with a JSONL stream, so a failed call inside it is still
+  recorded as success (reading it would hold the stream until every
+  call finished).
+- **`install-triggers` ignored `.env`.** It now loads `.env`,
+  `.env.local` and `.env.[mode]` like Next.js: the app's `@next/env`
+  when present, else dotenv's grammar (quoted values with trailing
+  comments, multiline quoted values) with dotenv-expand style
+  `${VAR}` expansion. Variables already set win. The connection error
+  no longer prints the database password.
+- **Sign-in, sign-out and failed logins were invisible.** Login /
+  logout / sign-in / sign-out / `/session*` paths are now excluded for
+  GET / HEAD only, so the POSTs are captured with params sanitized;
+  `/api/auth/session`, `/csrf`, `/providers`, `/_log` stay excluded.
+  On auth routes and auth Server Actions, `code`, `state`,
+  `verification_code`, `otp*`, `pin`, `token*` are filtered (`code` is
+  not globally sensitive); secret query params inside `callbackUrl` /
+  `redirect` / `from_page` values are masked everywhere. The Auth.js
+  v5 route shape `export const { GET, POST } = handlers` is now
+  auto-wrapped, also several such statements or one beside
+  `export async function POST`.
+- **The installer skipped business tables by name.** A `session(s)`-
+  style table is skipped only when it also has a session-store column
+  (token, expiry, `sess`, `data`, `payload`, `last_activity`: Auth.js,
+  Lucia, Rails, Laravel, connect-pg-simple); verification-token tables
+  are always skipped. Every skipped table is printed with the reason.
+  At runtime, trigger rows from a session-named table ship only when
+  the row has none of those columns, so session stores tracked by an
+  older install stay dropped.
+
+### Added
+- **Startup line** at the default log level, once per process:
+  `[ezlogs] capturing → <host> (project …last4)` (the suffix only for
+  tokens of 12+ characters), or `[ezlogs] not capturing: … missing`.
+  The README verify step uses it.
+- **`redirect_to`** on Server Action events: the same-origin path a
+  `redirect()` sent the user to (no query; token-like segments,
+  emails and secrets masked). External redirects are not recorded.
+  Not used to reclassify.
+- **"Name your records"** README step: person names come only from
+  `displayNameFor` (e.g. `users: (row) => row.full_name ?? row.username`);
+  its function form may now return any value (stringified). The
+  installer points at it.
+
+### Docs
+- `$extends(ezlogsPrisma())` is the recommended Prisma path, with or
+  without a driver adapter; `patchPrismaPgAdapter` is marked legacy.
+- `next.config` type fixture: CI checks a typedef mirroring Next's
+  `NextConfig` (`next` is not a devDependency); the real-type fixture
+  runs where `next` is installed (checked locally against Next 15.5).
+- Custom JWT / bearer actor hook recipe (what `id` and `label` mean).
+- Merging into an existing `instrumentation.ts` and an already-wrapped
+  `next.config` (next-intl, Sentry).
+- Supabase `auth.*` / `storage.*` are not tracked; browser-side
+  Supabase writes can't be linked to a server request.
+
 ## [0.3.4] — 2026-11-16
 
 Wire format unchanged. **Upgrade steps:** none.

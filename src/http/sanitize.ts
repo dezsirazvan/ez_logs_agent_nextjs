@@ -300,3 +300,71 @@ function isPlainObject(value: unknown): boolean {
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
 }
+
+// Auth routes: sign-in / sign-up / sign-out / login / logout /
+// register / session paths, Auth.js `/api/auth/*` (incl. callbacks) and
+// Supabase's PKCE / email-confirm routes (`/auth/callback?code=`, `/auth/confirm`).
+const AUTH_PATH =
+  /(^|\/)(api\/auth\/|auth\/(callback|confirm)|log-?in|log-?out|sign-?in|sign-?out|sign-?up|register|sessions?(\/|$))/i;
+// Server Action names doing the same (`signIn`, `verifyOtp`, `login`).
+const AUTH_ACTION = /^(sign_?(in|up|out)|log_?(in|out)|register|verify|reset|magic|otp|auth)/i;
+// One-time codes and OAuth state: only secret on auth routes (`code`
+// is a product code anywhere else, so it is NOT globally sensitive).
+const AUTH_ONLY_KEY = /^(code|state|verificationcode|onetimecode|otp.*|pin|token.*)$/;
+// Params holding a URL the user is sent to next.
+const REDIRECT_KEY = /^(callbackurl|redirect(url|uri|to)?|returnto|returnurl|next|continue|frompage)$/;
+// Query params inside such a URL that carry a secret.
+const SECRET_QUERY_PARAM = /token|code|state|otp|secret|password|key|sig|auth/i;
+
+const normKey = (key: string) => key.toLowerCase().replace(/[_-]/g, "");
+
+export function isAuthPath(pathname: string): boolean {
+  return AUTH_PATH.test(pathname);
+}
+
+export function isAuthActionName(name: string): boolean {
+  return AUTH_ACTION.test(name);
+}
+
+/**
+ * Pre-pass before `sanitizeRequestParams`: on auth routes, one-time
+ * codes / OAuth state / OTPs become "[FILTERED]"; everywhere,
+ * secret-looking query params inside redirect-target params
+ * (`callbackUrl`, `redirect`, `from_page`, …) are masked.
+ */
+export function maskAuthParams(params: unknown, onAuthRoute: boolean, depth = 0): unknown {
+  if (depth > 4 || params === null || typeof params !== "object") return params;
+  if (Array.isArray(params)) return params.map((v) => maskAuthParams(v, onAuthRoute, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params as Record<string, unknown>)) {
+    const k = normKey(key);
+    if (onAuthRoute && AUTH_ONLY_KEY.test(k) && value !== null && value !== undefined && value !== "") {
+      out[key] = "[FILTERED]";
+    } else if (REDIRECT_KEY.test(k) && typeof value === "string") {
+      out[key] = maskUrlSecrets(value);
+    } else {
+      out[key] = maskAuthParams(value, onAuthRoute, depth + 1);
+    }
+  }
+  return out;
+}
+
+/** `/reset?token=abc&step=2` → `/reset?token=[FILTERED]&step=2`; non-URLs unchanged. */
+export function maskUrlSecrets(value: string): string {
+  if (!value.includes("?")) return value;
+  try {
+    const absolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+    const url = new URL(value, "http://localhost");
+    let changed = false;
+    for (const name of [...url.searchParams.keys()]) {
+      if (SECRET_QUERY_PARAM.test(name)) {
+        url.searchParams.set(name, "[FILTERED]");
+        changed = true;
+      }
+    }
+    if (!changed) return value;
+    return absolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return value;
+  }
+}

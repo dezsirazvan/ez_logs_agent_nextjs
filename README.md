@@ -73,15 +73,16 @@ const nextConfig: NextConfig = {
   // ⬇ Your existing options (or leave empty {} on a fresh project).
 };
 
-export default withEzlogsConfig(
-  nextConfig as unknown as Parameters<typeof withEzlogsConfig>[0],
-) as NextConfig;
+export default withEzlogsConfig(nextConfig);
 ```
 
-**`next.config.mjs`** (ESM):
+**`next.config.mjs`** / ESM **`next.config.js`** (also type-checks
+under `checkJs`, e.g. create-t3-app):
 
 ```js
 import { withEzlogsConfig } from "ezlogs-nextjs/plugin";
+
+/** @type {import("next").NextConfig} */
 const nextConfig = { /* your options */ };
 export default withEzlogsConfig(nextConfig);
 ```
@@ -93,6 +94,18 @@ const { withEzlogsConfig } = require("ezlogs-nextjs/plugin");
 module.exports = withEzlogsConfig({ /* your options */ });
 ```
 
+**Already have an `instrumentation.ts` or a wrapped config?** Keep
+yours and add to it:
+
+- `instrumentation.ts`: put the `ezlogs.init({...})` call inside your
+  existing `register()`, in the `NEXT_RUNTIME === "nodejs"` branch
+  (next to Sentry / OpenTelemetry setup; the order doesn't matter).
+  Export only one `register`.
+- `next.config`: `withEzlogsConfig` returns the config it was given
+  (same type), so it composes with other wrappers in either order:
+  `export default withNextIntl(withEzlogsConfig(nextConfig))` or
+  `withSentryConfig(withEzlogsConfig(nextConfig), { ... })`.
+
 ### 3. Set env vars, restart, verify
 
 ```bash
@@ -101,9 +114,16 @@ EZLOGS_SERVER_URL=https://app.ezlogs.io
 EZLOGS_PROJECT_TOKEN=ezl_your_api_key_here
 ```
 
-Restart your dev server, hit any route, and watch for
-`[ezlogs] FlushScheduler started` in the terminal. Events appear in
-your EZLogs dashboard within a few seconds.
+Restart your dev server and look for this line in the terminal (one
+per server process, at the default log level):
+
+```
+[ezlogs] capturing → app.ezlogs.io (project …1a2b)
+```
+
+If `serverUrl` or `projectToken` is missing you get
+`[ezlogs] not capturing: … missing` instead. Hit any route; events
+appear in your EZLogs dashboard within a few seconds.
 
 Sending to a local EZLogs server over plain `http://` (development)?
 Events are still sent, but the agent warns on every start; pass
@@ -135,14 +155,25 @@ isn't installed locally, npx / bunx download whatever version is
 published, and the CLI warns. They also download it when your
 lockfile's bin entries predate 0.3.0 (seen with bun and a `file:`
 dependency); the CLI then prints the command that runs your project's
-copy: `node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`. Migration tables, sessions, and the
-agent's own audit table are skipped automatically. If `pg` or the
+copy: `node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`.
+The CLI reads `DATABASE_URL` / `POSTGRES_URL` from your shell or from
+`.env`, `.env.local` and `.env.[mode]` (loaded the way Next.js loads
+them, incl. `${VAR}` expansion; a variable already set in the shell
+wins). Migration tables, database internals, the agent's own audit
+table, verification-token tables and session stores (a
+`session(s)`-style name **and** a token, expiry, `sess`, `data`,
+`payload` or `last_activity` column: Auth.js, Lucia, Rails, Laravel,
+connect-pg-simple) are skipped; the output lists each skipped table
+with the reason. A `session` table without such columns (analytics
+visits, bookings) is tracked. If `pg` or the
 audit table is missing at runtime, the agent logs one warning at
 startup and leaves the trigger path off.
 
-**Recommended setup for Prisma** (plain `new PrismaClient()`, no driver
-adapter): triggers **plus** the extension, which tags each write with
-the request so DB changes join the right action and actor.
+**Recommended setup for Prisma** (plain `new PrismaClient()`, or with
+a driver adapter such as `@prisma/adapter-pg`): triggers **plus** the
+extension, which tags each write with the request so DB changes join
+the right action and actor. (`patchPrismaPgAdapter` /
+`patchPrismaClient` are legacy; see [docs/database.md](./docs/database.md).)
 
 ```ts
 // lib/prisma.ts
@@ -180,14 +211,34 @@ changes). From 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
 deploy right after, and later re-run `npx ezlogs-nextjs install-triggers`
 at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
 
+### 5. Name your records
+
+Database changes are titled with the record's `name`, `title`,
+`number` or `label` column. Records of people (users, members,
+customers) are never named automatically: an email or a person's name
+would show up on shared links. To name them, say how in `ezlogs.init`:
+
+```ts
+ezlogs.init({
+  // ...
+  displayNameFor: {
+    users: (row) => row.full_name ?? row.username, // a column name also works: users: "username"
+  },
+});
+```
+
+The key is the table name for trigger-captured changes (`users`) and
+the model name for the per-ORM adapters (`User`). Without it, the
+record shows by its id.
+
 ---
 
 ## What gets captured
 
 | Source | What | Where it comes from |
 |---|---|---|
-| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response | App Router + Pages Router (auto-wrapped) |
-| Server Actions | Action name, args, caller IP, outcome (a returned `{ success: false, error }` is a failure with that message), redirect/notFound handled as success | File-level + inline `"use server"` (auto-wrapped) |
+| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207) is a failure. Known gap: with `httpBatchStreamLink` (create-t3-app's default) the response is a 200 stream, so a failed call inside it is recorded as success | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
+| Server Actions | Action name, args, caller IP, outcome, and where a `redirect()` sent the user (`redirect_to`: same-origin path only, no query, token-like segments masked; external redirects are not recorded). A returned failure is a failure with its message: `{ success: false, error }`, `{ error: "…" }` (no truthy `success` / `ok`, no `data`), and a pure form state `{ errors: { field: [...] } \| [...], message? }` (Next.js `useActionState`), next-safe-action, zsa, Conform, zod `safeParse`. Stay successes: `{ message: "Saved" }`, a database row (`id` / `created_at` / `updatedAt` key) with an `error` column, a partial success like `{ imported: 97, errors: [...] }`. `redirect()` / `notFound()` are not failures | File-level + inline `"use server"` (auto-wrapped) |
 | Database | `model_class`, `operation`, full from→to diffs incl. json leaves (trigger path), record name | Postgres triggers, Prisma, Drizzle, supabase-js |
 | Background jobs | `job_class`, `job_id`, `queue`, `retry_count`, sanitized `arguments`, plus the DB writes the job made | BullMQ, Inngest, Trigger.dev, pgmq, Upstash Workflow |
 
@@ -195,9 +246,23 @@ Every event in one inbound request shares a `correlation_id` so the
 server stitches them into a single Action card.
 
 **Automatic exclusions** (no config needed):
-`_next`, `_vercel`, `__nextjs_*`, `GET /api/auth/*` (NextAuth session
-polls), health-checks, login / logout / session paths, static assets.
-POSTs on `/api/auth/*` are captured (sign-in, sign-out, register).
+`_next`, `_vercel`, `__nextjs_*`, health-checks, static assets, and
+auth plumbing: `GET` / `HEAD` on `/api/auth/*` and on any login /
+logout / sign-in / sign-out / signin / signout / `/session*` path
+(page loads, session polls, OAuth and email-link callbacks), plus
+`/api/auth/session`, `/api/auth/csrf`, `/api/auth/providers` and
+`/api/auth/_log` on every method.
+
+**Auth events are captured:** `POST`s to sign-in, sign-up, sign-out,
+login and logout routes (NextAuth / Auth.js `/api/auth/*`, custom
+`/api/login`, …) and auth Server Actions, including failed attempts
+(a 4xx response or a returned error). Passwords, tokens and other
+sensitive params are sent as `"[FILTERED]"`; on auth routes and auth
+Server Actions (`signIn`, `verifyOtp`, …) one-time codes and OAuth
+state are too (`code`, `state`, `verification_code`, `otp*`, `pin`,
+`token*`; `code` stays visible on other routes). Secret query params
+inside `callbackUrl` / `redirect` / `from_page` values are masked
+everywhere.
 
 ## Per-area docs
 

@@ -104,7 +104,15 @@ const INLINE_ROUTE_FILENAMES = [
   "not-found",
 ] as const;
 
-export function withEzlogsConfig(nextConfig: NextConfig = {}): NextConfig {
+/**
+ * Generic over the caller's own config type, so the result is exactly
+ * what Next.js expects back (`import("next").NextConfig` in a typed
+ * `next.config.ts`, or a `checkJs` ESM `next.config.js`) — Next's own
+ * `webpack` is `NextJsWebpackConfig | null`, which the narrow shape
+ * below must not be asked to accept.
+ */
+export function withEzlogsConfig<T extends object = NextConfig>(userConfig?: T): T {
+  const nextConfig = (userConfig ?? {}) as NextConfig;
   const userWebpack = nextConfig.webpack;
   const loaderPath = resolveLoaderPath();
 
@@ -130,7 +138,7 @@ export function withEzlogsConfig(nextConfig: NextConfig = {}): NextConfig {
       return installLoaders(merged, options);
     },
     turbopack: mergeTurbopackConfig(nextConfig.turbopack, loaderPath),
-  } as NextConfig;
+  } as NextConfig as T;
 }
 
 function mergeServerExternalPackages(

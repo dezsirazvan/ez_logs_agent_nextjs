@@ -6,10 +6,12 @@
    logs:
 
    ```
-   [ezlogs] FlushScheduler started (interval 3000ms)
+   [ezlogs] capturing → app.ezlogs.io (project …1a2b)
    ```
 
-   If absent, `ezlogs.init` didn't run — check `instrumentation.ts`
+   `[ezlogs] not capturing: projectToken missing …` means the env
+   vars didn't reach `ezlogs.init`. If neither line appears,
+   `ezlogs.init` didn't run — check `instrumentation.ts`
    is at the project root (or `src/`) and that `process.env.NEXT_RUNTIME
    === "nodejs"` is true.
 
@@ -39,10 +41,14 @@ own rules; if you've customized `next.config.js` with your own
 
 ## Auth events not captured
 
-`/api/auth/*` is excluded by default for **GET / HEAD only** — NextAuth's
-session-refresh polls would otherwise flood the dashboard. POST callbacks
-(sign-in, sign-out, register) ARE captured. If you've added your own
-exclusion that covers `POST`, remove it.
+Auth routes (`/api/auth/*`, `*/login*`, `*/logout*`, `*/sign-in*`,
+`*/sign-out*`, `*/signin*`, `*/signout*`, `/session*`) are excluded
+for **GET / HEAD only**: page loads, session polls and OAuth callbacks
+would otherwise flood the dashboard. POSTs (sign-in, sign-up,
+sign-out, failed logins) ARE captured, with passwords and tokens
+filtered. `/api/auth/session`, `/csrf`, `/providers` and `/_log` are
+skipped on every method. If you've added your own exclusion that
+covers `POST`, remove it.
 
 ## Inline `"use server"` action not captured
 

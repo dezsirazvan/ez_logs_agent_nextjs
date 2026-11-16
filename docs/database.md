@@ -17,10 +17,18 @@ npx ezlogs-nextjs install-triggers
 ```
 
 That command introspects your schema and tracks every business table
-automatically. Migration tables (`_prisma_migrations`,
-`schema_migrations`), session tables (`Session`, `sessions`), and the
-agent's own audit table are skipped — the output lists exactly what
-got tracked. Flags:
+automatically. It reads `DATABASE_URL` / `POSTGRES_URL` from the shell
+or from `.env`, `.env.local` and `.env.[mode]` (the way Next.js loads
+them; shell values win). Skipped, each listed with the reason:
+migration tables (`_prisma_migrations`, `schema_migrations`), database
+and Rails internals, the agent's own audit table, verification-token
+tables, and session stores: a `session(s)`-style name **and** a token,
+expiry, `sess`, `data`, `payload` or `last_activity` column (Auth.js
+`Session`, Lucia, better-auth, Rails activerecord-session_store,
+Laravel, connect-pg-simple). Rows from such tables tracked by an
+older install are still dropped by the agent. A
+`session` table without such columns (Umami's visitor sessions, a
+booking app's `sessions`) is business data and is tracked. Flags:
 
 - `--tables=<a,b,c>` — explicit allowlist.
 - `--tables=none` — install infrastructure only, opt rows in later.
@@ -99,7 +107,13 @@ With triggers installed and a `databaseReader` wired, the extension's
 own event emits are suppressed for tracked tables; the trigger rows
 (with real before/after values) are the single source.
 
-## Prisma (`@prisma/adapter-pg`)
+## Legacy: `patchPrismaPgAdapter` / `patchPrismaClient`
+
+**Use `$extends(ezlogsPrisma())` instead** (section above), with or
+without a driver adapter: it tags each write inside a Prisma
+transaction, so it doesn't depend on AsyncLocalStorage crossing the
+engine, and it doesn't serialize your queries. The wrappers below
+predate it and are kept only so existing setups keep working.
 
 Prisma's driver-adapter mode runs queries through a NAPI engine
 boundary that breaks AsyncLocalStorage propagation. Without an extra
@@ -158,6 +172,22 @@ requests.` in dev.
 Drizzle and raw `pg` users do NOT need any wrappers: the agent's
 existing `patchPgClient` already handles those paths because there's
 no engine boundary between the caller and `pg.Client.prototype.query`.
+
+## Supabase: what is not tracked
+
+- **`auth.*` and `storage.*`** (Supabase Auth users / sessions /
+  identities, Storage objects) live outside the `public` schema, so
+  `install-triggers` doesn't attach to them. Sign-ups and sign-ins
+  still show up as the request or Server Action that made them; the
+  rows Supabase writes behind the scenes don't. (Your own `public`
+  tables, e.g. a `profiles` row created by an `auth.users` trigger,
+  are tracked.)
+- **Browser-side writes** (`createBrowserClient(...).from(...)` called
+  from a client component) go straight from the browser to PostgREST.
+  There is no server request for them to join, so the trigger records
+  them as their own actions, without an actor or a linked request.
+  Move a write to a Server Action or route handler to see it under
+  the user's action.
 
 ## What a DB event carries
 

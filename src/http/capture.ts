@@ -41,7 +41,13 @@ import {
   runWithCorrelation,
 } from "../correlation.js";
 import { flushAuditLog } from "../triggers/reader.js";
-import { passesLuhn, scrubSecretsInText } from "./sanitize.js";
+import {
+  isAuthActionName,
+  isAuthPath,
+  maskAuthParams,
+  passesLuhn,
+  scrubSecretsInText,
+} from "./sanitize.js";
 import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
 import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
@@ -54,6 +60,7 @@ import {
   specificErrorMessage,
   type GraphqlMetadata,
 } from "./source-data.js";
+import { trpcErrorMessage, unwrapTrpcParams } from "./trpc.js";
 import {
   extractGraphqlErrorsFromBody,
   isGraphqlPath,
@@ -663,6 +670,7 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
                 durationMs: Date.now() - startMs,
                 startedAt,
                 args,
+                redirectTo: redirectTarget(e),
               });
               throw e;
             }
@@ -866,9 +874,82 @@ function classifyServerActionResult(
     if (r.success === false && typeof r.error === "string" && r.error.length > 0) {
       return { errorMessage: specificOrOwn(r, r.error) };
     }
+
+    // (8) `useActionState` state with a bare error string
+    // (`{ error: "Invalid email or password" }`, next-saas-starter).
+    // Only when nothing in the object claims success: no truthy
+    // `success` / `ok`, and no `data` payload.
+    // A database row (`id`, `created_at` / `updatedAt`) carrying an
+    // `error` column is data, not a failed action: rules 8-9 skip it.
+    const rowShaped = isRowShaped(r);
+    if (
+      !rowShaped &&
+      typeof r.error === "string" &&
+      r.error.trim().length > 0 &&
+      !r.success &&
+      !r.ok &&
+      r.data == null
+    ) {
+      return { errorMessage: specificOrOwn(r, r.error.trim()) };
+    }
+
+    // (9) Next.js docs' form-state pattern: `{ errors: fieldErrors,
+    // message }` (zod `flatten().fieldErrors`) or an `errors` list.
+    // Only a pure form state: any other key (`imported: 97` next to
+    // per-row errors) means a counted partial success. A bare
+    // `{ message }` stays a success ("Saved").
+    if (
+      !rowShaped &&
+      !r.success &&
+      !r.ok &&
+      Object.keys(r).every((k) => FORM_STATE_KEYS.has(k)) &&
+      hasErrorEntries(r.errors)
+    ) {
+      return { errorMessage: formStateErrorMessage(r) };
+    }
   }
 
   return null;
+}
+
+const FORM_STATE_KEYS = new Set([
+  "errors",
+  "message",
+  "success",
+  "ok",
+  "status",
+  "fields",
+  "fieldErrors",
+  "formErrors",
+]);
+
+function isRowShaped(r: Record<string, unknown>): boolean {
+  return Object.keys(r).some((k) => k === "id" || /(^|_)(created|updated)_?at$/i.test(k));
+}
+
+/** `errors` holds at least one non-empty string message (any depth ≤ 3). */
+function hasErrorEntries(errors: unknown, depth = 0): boolean {
+  if (typeof errors === "string") return errors.trim().length > 0;
+  if (depth > 3 || errors === null || typeof errors !== "object") return false;
+  return Object.values(errors).some((v) => hasErrorEntries(v, depth + 1));
+}
+
+/**
+ * The reason for an `{ errors, message? }` form state: the first safe
+ * field error ("customerId: Please select a customer."), else the
+ * state's own `message`, else a fixed text. Same masking as 0.3.3.
+ */
+function formStateErrorMessage(r: Record<string, unknown>): string {
+  const patterns = configuration().excludedGraphqlVariableKeys;
+  const specific = Array.isArray(r.errors)
+    ? specificErrorMessage({ errors: r.errors }, patterns) ??
+      specificErrorMessage({ formErrors: r.errors }, patterns)
+    : specificErrorMessage({ fieldErrors: r.errors }, patterns);
+  if (specific) return capErrorText(specific);
+  if (typeof r.message === "string" && r.message.trim().length > 0) {
+    return capErrorText(r.message.trim());
+  }
+  return "Validation failed";
 }
 
 function defaultErrorMessage(result: unknown): string {
@@ -904,7 +985,7 @@ function specificOrOwn(result: Record<string, unknown>, error: string): string {
   const specific = isGenericErrorText(error)
     ? specificErrorMessage(result, configuration().excludedGraphqlVariableKeys)
     : null;
-  return specific ? capErrorText(specific) : truncate(error);
+  return capErrorText(specific ?? error);
 }
 
 function truncate(value: string): string {
@@ -1019,6 +1100,52 @@ function nextControlFlowStatus(error: unknown): number | null {
   return null;
 }
 
+function pathOf(url: string | null): string {
+  if (!url) return "";
+  try {
+    return new URL(url, "http://localhost").pathname;
+  } catch {
+    return "";
+  }
+}
+
+/** The raw target of a `redirect()` throw (`NEXT_REDIRECT;<type>;<url>;<status>;`), or null. */
+function redirectTarget(error: unknown): string | null {
+  const digest = (error as { digest?: unknown } | null)?.digest;
+  if (typeof digest !== "string" || !digest.startsWith("NEXT_REDIRECT;")) return null;
+  // The url may itself hold `;`.
+  const parts = digest.split(";").slice(2);
+  while (parts.length > 0 && (parts[parts.length - 1] === "" || /^\d{3}$/.test(parts[parts.length - 1]!))) {
+    parts.pop();
+  }
+  return parts.length > 0 ? parts.join(";") : null;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * `source_data.redirect_to`: the redirect target as a bare path
+ * ("/error"), no query or fragment. Null for another origin: an
+ * external redirect (OAuth, Stripe) is never recorded as an internal
+ * path. Token-like segments (20+ url-safe chars, not a UUID: invite /
+ * reset tokens) and emails / secrets are masked. The agent never
+ * reclassifies on it (a redirect to "/error" is the server's call).
+ */
+function redirectPath(target: string, requestHost: string | null): string | null {
+  try {
+    const absolute = /^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith("//");
+    const url = new URL(target, "http://ezlogs.internal");
+    if (absolute && (!requestHost || url.host.toLowerCase() !== requestHost.toLowerCase())) return null;
+    const path = url.pathname
+      .split("/")
+      .map((seg) => (/^[A-Za-z0-9_-]{20,}$/.test(seg) && !UUID.test(seg) ? "[FILTERED]" : seg))
+      .join("/");
+    return path ? scrubSecretsInText(path, { emails: true }) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function emitServerActionEvent(input: {
   actionName: string;
   statusCode: number | null;
@@ -1026,6 +1153,8 @@ async function emitServerActionEvent(input: {
   durationMs: number;
   startedAt: Date;
   args?: unknown[];
+  /** Raw `redirect()` target; becomes the optional `redirect_to` path. */
+  redirectTo?: string | null;
 }): Promise<void> {
   try {
     // Drain trigger audit rows tagged with this request's correlation
@@ -1049,10 +1178,14 @@ async function emitServerActionEvent(input: {
     // buildHttpSourceData (sensitive-field redaction, sanitize.ts)
     // applies to whatever we pass through.
     const argParams = extractServerActionArgs(input.args, input.actionName);
-    const requestParams: Record<string, unknown> | null =
+    const combined: Record<string, unknown> | null =
       argParams !== null || fromPage !== null
         ? { ...(argParams ?? {}), ...(fromPage !== null ? { from_page: fromPage } : {}) }
         : null;
+    const requestParams = maskAuthParams(
+      combined,
+      isAuthActionName(input.actionName) || isAuthPath(pathOf(fromPage)),
+    ) as Record<string, unknown> | null;
 
     // Synthesize a URL with a real pathname so the dashboard can render
     // a useful label. `__server-action/<name>` is conventionally a
@@ -1072,6 +1205,11 @@ async function emitServerActionEvent(input: {
       contentType: null,
       excludedVariableKeys: configuration().excludedGraphqlVariableKeys,
     });
+    if (input.redirectTo) {
+      const host = (await readNextHeader("x-forwarded-host")) ?? (await readNextHeader("host"));
+      const redirectTo = redirectPath(input.redirectTo, host?.split(",")[0]?.trim() ?? null);
+      if (redirectTo) sourceData.redirect_to = redirectTo;
+    }
 
     const { outcome, error_message } = determineOutcome(
       input.statusCode,
@@ -1774,7 +1912,10 @@ async function emitEvent(input: EmitInput): Promise<void> {
       method: input.snapshot.method,
       url: input.snapshot.url,
       statusCode: input.statusCode,
-      rawParams: input.snapshot.rawParams,
+      rawParams: maskAuthParams(
+        unwrapTrpcParams(input.snapshot.rawParams, input.snapshot.url, input.context.routeModulePath ?? null),
+        isAuthPath(input.snapshot.url.pathname),
+      ),
       routeModulePath: input.context.routeModulePath ?? null,
       serverActionName,
       userAgent: input.snapshot.userAgent,
@@ -1939,12 +2080,18 @@ const MAX_ERROR_BODY_LENGTH = 16_384;
  */
 async function readResponseErrorMessage(response: Response): Promise<string | null> {
   try {
-    if (response.status < 400) return null;
+    // 207 Multi-Status: a tRPC batch where some calls failed. Read only
+    // as a tRPC body; any other 207 (WebDAV) stays a success.
+    if (response.status < 400 && response.status !== 207) return null;
     if (!(response.headers.get("content-type") ?? "").includes("json")) return null;
     if (Number(response.headers.get("content-length") ?? 0) > MAX_ERROR_BODY_LENGTH) return null;
     const text = await response.clone().text();
     if (!text || text.length > MAX_ERROR_BODY_LENGTH) return null;
-    const body = safeJsonParse(text) as Record<string, unknown> | null;
+    const parsed = safeJsonParse(text);
+    const trpc = trpcErrorMessage(parsed, configuration().excludedGraphqlVariableKeys);
+    if (trpc) return trpc;
+    if (response.status === 207) return null;
+    const body = parsed as Record<string, unknown> | null;
     if (!body || typeof body !== "object") return null;
     const nested = body.error as { message?: unknown } | null | undefined;
     const raw = [body.error, body.message, nested?.message].find(
