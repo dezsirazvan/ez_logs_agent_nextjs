@@ -5,3 +5,4 @@ coverage/
 *.tsbuildinfo
 .vitest-cache/
 .DS_Store
+tests/fixtures/prisma/generated/

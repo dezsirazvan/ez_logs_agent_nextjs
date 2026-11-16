@@ -54,6 +54,51 @@ the `databaseReader` / `patchDatabaseClient` options at all. Pass them
 explicitly only when you need a non-default pool or when you're not on
 a conventional connection-string env var.
 
+## Prisma (plain `PrismaClient`, the default) — recommended
+
+Prisma's default engine opens its own connections, so the agent can't
+`SET LOCAL` on them. Add the extension next to the triggers:
+
+```ts
+import { PrismaClient } from "@prisma/client";
+import { ezlogsPrisma } from "ezlogs-nextjs/prisma";
+
+export const prisma = new PrismaClient().$extends(ezlogsPrisma());
+```
+
+Inside a captured request, every write (`create`, `createMany`,
+`createManyAndReturn`, `update`, `updateMany`, `upsert`, `delete`,
+`deleteMany`, `$executeRaw`, `$executeRawUnsafe`) runs as
+
+```ts
+client.$transaction([
+  client.$executeRawUnsafe("SELECT set_config('ezlogs.correlation_id', $1, TRUE)", id),
+  query(args),
+]);
+```
+
+— Prisma's documented RLS client-extension pattern. The trigger reads
+the setting, so the row joins the request's action with its actor.
+Reads (`find*`, `count`, `aggregate`, `$queryRaw`) are untouched. Cost:
+one extra round trip per write.
+
+**Not tagged:** writes inside your own `prisma.$transaction(...)`
+(interactive or batch). Prisma can't nest a transaction there, so the
+extension runs the query as-is (detected via Prisma's internal
+`__internalParams.transaction`). Those rows still appear, as their own
+actions without an actor — never attributed to another request. If a
+future Prisma stops exposing `__internalParams`, the extension stops
+tagging altogether rather than risk a nested transaction.
+
+Verified against real Postgres on Prisma 5.22, 6.19 and 7.10 (CI runs
+all three). Prisma 7 has no Rust engine, so the client needs a driver
+adapter (`new PrismaClient({ adapter: new PrismaPg({ connectionString }) })`);
+the same `$extends(ezlogsPrisma())` line tags its writes.
+
+With triggers installed and a `databaseReader` wired, the extension's
+own event emits are suppressed for tracked tables; the trigger rows
+(with real before/after values) are the single source.
+
 ## Prisma (`@prisma/adapter-pg`)
 
 Prisma's driver-adapter mode runs queries through a NAPI engine
@@ -133,13 +178,67 @@ Trade-offs and known limitations are documented in
 
 ## Sensitive-column filter
 
-Any DB event shipped by the agent runs through a substring filter
-against 18 patterns: `password`, `token`, `secret`, `api_key`,
-`credit_card`, `ssn`, `social_security`, `encrypted`, `private_key`,
-`public_key`, `signing_key`, `pem`, `cipher`, `nonce`, `salt`,
-`digest`, `signature`, `hmac`. Columns matching any pattern (case-
-insensitive substring) ship as `"[FILTERED]"`. The server applies the
-same 18 patterns at ingest as a backstop.
+Sensitive columns are dropped (not sent at all). Patterns, matched
+case-insensitively against the column name and its snake_case form
+(`apiKey` → `api_key`):
+
+- substring: `password`, `token`, `secret`, `api_key`, `credit_card`,
+  `ssn`, `social_security`, `encrypted`, `private_key`, `public_key`,
+  `signing_key`, `pem`, `cipher`, `nonce`, `salt`, `digest`,
+  `signature`, `hmac`, `credential`, `passwd`, `passcode`, `apikey`,
+  `card_number`, `cardnumber`, `cvv`, `cvc`
+- whole word: `pin`, `otp`, `totp`, `iban`, `mfa`, `passphrase`
+  (`mdm_unlock_pin` matches, `shipping` does not)
+
+On the trigger path the filter runs **inside the trigger**
+(`ezlogs_is_sensitive_key()` in `00_install.sql`), so these values are
+never stored in `ezlogs_audit_log`. The agent applies the same list
+again before sending (for the per-ORM adapters too), and the server
+redacts at ingest as a backstop.
+
+## Correlation and retention (trigger path)
+
+- A row is grouped with a request only when it carries that request's
+  correlation id: set via `SET LOCAL` on `pg` connections, or read from
+  PostgREST's `request.headers` (`x-correlation-id`, injected by the
+  agent into every outgoing fetch) for supabase-js. Only the agent's
+  own id format is trusted.
+- Untagged rows (Prisma without `ezlogsPrisma()` or inside your own `$transaction`, postgres.js, scripts) are
+  never attributed to an unrelated request. They are sent as their own
+  actions, one per database transaction, without an actor. 0.1.x's
+  `databaseSnapshotMode` guessed instead and was removed (the option is
+  ignored).
+- Rows are deleted when sent. A sweep (≤ once per 10 s per process)
+  sends untagged rows and tagged rows older than 5 minutes, but only
+  rows under 24 hours old, timestamped with when the write happened;
+  rows older than 24 hours are deleted unsent.
+- **Upgrading:** run `npx ezlogs-nextjs install-triggers --tables=none`
+  before deploying a new agent version (functions + `ezlogs_audit_log`
+  only; a brief lock on that table, none on yours). A plain re-run also
+  re-attaches outdated triggers, one table per transaction with a 5s
+  lock timeout — do that at a quiet moment. See CHANGELOG.md for the
+  0.1.x → 0.2.0 steps.
+- **Schema changes after `ezlogs_track`** (a column added, dropped or
+  renamed — e.g. `notes` renamed to `password_hash`): the trigger sees
+  the column names no longer match what it was attached with and checks
+  every key by name (~60µs per row image instead of a few µs), so a new
+  secret column is still dropped. Re-running `install-triggers` (or
+  `SELECT ezlogs_track('t')`) re-attaches it and restores the fast path.
+  The same happens when a new agent version changes the pattern lists
+  (`ezlogs_patterns_version()`).
+
+## Access to `ezlogs_audit_log`
+
+The install enables row-level security and revokes everything from
+`PUBLIC` and Supabase's `anon` / `authenticated`, so the table is not
+reachable through PostgREST. The role that ran the install owns the
+table; the trigger (SECURITY DEFINER) and a reader connecting as that
+role bypass RLS. If the agent's `DATABASE_URL` uses a different role:
+
+```sql
+GRANT SELECT, DELETE ON ezlogs_audit_log TO app_reader;
+CREATE POLICY ezlogs_reader ON ezlogs_audit_log TO app_reader USING (true);
+```
 
 Customers add their own column-name fragments via `excludedTables`
 (coarse-grained) or a future column-level filter (planned).

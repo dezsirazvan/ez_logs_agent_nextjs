@@ -44,14 +44,10 @@ export {
   readAuditRows,
   emitAuditRows,
   flushAuditLog,
-  takeAuditSnapshot,
+  sweepAuditLog,
+  pruneAuditLog,
   detectTriggerTrackedTables,
 } from "./reader.js";
 export type { AuditRow } from "./reader.js";
-
-export {
-  runWithAuditSnapshotScope,
-  currentAuditSnapshot,
-} from "./audit-snapshot.js";
 
 export { patchPgClient } from "./patch-pg.js";

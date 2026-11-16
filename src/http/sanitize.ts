@@ -61,7 +61,55 @@ export const SENSITIVE_VARIABLE_PATTERNS: readonly string[] = Object.freeze([
   "digest",
   "signature",
   "hmac",
+  // 0.2.0 additions (not yet in the Rails gem's list).
+  "passcode",
+  "cardnumber",
 ]);
+
+/**
+ * Short secret names that are only safe to match as a WHOLE word:
+ * substring `pin` would hit `shipping`, `otp` would hit `footprint`,
+ * `iban` would hit `caribbean`. Keys are split into words after
+ * camelCase → snake_case, so `pin`, `pinCode`, `mdm_unlock_pin`
+ * match while `pinned` and `shipping_address` do not.
+ *
+ * Mirrored by `ezlogs_is_sensitive_key()` in sql/postgres/00_install.sql
+ * (tests/unit/sensitive-sql-parity.test.ts keeps them in sync). When a
+ * DB-relevant list changes, also bump `ezlogs_patterns_version()` there
+ * so already-attached triggers re-attach.
+ */
+export const SENSITIVE_WORD_PATTERNS: readonly string[] = Object.freeze([
+  "pin",
+  "otp",
+  "totp",
+  "iban",
+  "mfa",
+  "passphrase",
+]);
+
+/** `mdmUnlockPin` → `mdm_unlock_pin`, `apiKey` → `api_key`. */
+function snakeLower(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/**
+ * Shared key matcher for HTTP params and DB columns. Substring
+ * patterns are tested against the lowercased key and its snake_case
+ * form (so `apiKey` matches `api_key`); word patterns only against
+ * whole words of the snake_case form.
+ */
+export function matchesSensitiveKey(
+  key: string,
+  substringPatterns: readonly string[],
+): boolean {
+  const lower = key.toLowerCase();
+  const snake = snakeLower(key);
+  if (substringPatterns.some((p) => lower.includes(p) || snake.includes(p))) {
+    return true;
+  }
+  const words = snake.split(/[^a-z0-9]+/);
+  return SENSITIVE_WORD_PATTERNS.some((w) => words.includes(w));
+}
 
 const MAX_NESTING_DEPTH = 3;
 const MAX_ARRAY_DISPLAY_SIZE = 5;
@@ -178,8 +226,8 @@ function sanitizeArrayItem(
 }
 
 function isSensitiveKey(key: string, userPatterns: readonly string[]): boolean {
+  if (matchesSensitiveKey(key, SENSITIVE_VARIABLE_PATTERNS)) return true;
   const lower = key.toLowerCase();
-  if (SENSITIVE_VARIABLE_PATTERNS.some((p) => lower.includes(p))) return true;
   return userPatterns.some((p) => lower.includes(p.toLowerCase()));
 }
 

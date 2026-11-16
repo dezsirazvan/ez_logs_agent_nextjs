@@ -119,7 +119,7 @@ export function resolveCorrelation(headers: HeadersLike | null | undefined): str
   if (!headers) return generate();
 
   const ezlogs = safeRead(headers, CORRELATION_HEADER);
-  if (ezlogs) return ezlogs;
+  if (ezlogs && isTrustedInboundId(ezlogs)) return ezlogs;
 
   for (const name of PLATFORM_REQUEST_ID_HEADERS) {
     const platformId = safeRead(headers, name);
@@ -127,6 +127,22 @@ export function resolveCorrelation(headers: HeadersLike | null | undefined): str
   }
 
   return generate();
+}
+
+// The inbound header can come from a browser, so it is only honored in
+// the agent's own format and only if recent: arbitrary strings can't
+// collide with real ids, and joining someone else's action would need
+// their exact id (32 random bits) within the window. Anything else gets
+// a fresh id.
+const INBOUND_ID = /^ezl_(\d{13})_[0-9a-f]{8}$/;
+const INBOUND_MAX_AGE_MS = 60 * 60_000;
+const INBOUND_MAX_SKEW_MS = 5 * 60_000;
+
+function isTrustedInboundId(id: string): boolean {
+  const match = INBOUND_ID.exec(id);
+  if (!match) return false;
+  const age = Date.now() - Number(match[1]);
+  return age <= INBOUND_MAX_AGE_MS && age >= -INBOUND_MAX_SKEW_MS;
 }
 
 function safeRead(headers: HeadersLike, name: string): string | null {

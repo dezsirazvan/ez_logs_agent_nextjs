@@ -367,11 +367,14 @@ export async function runInstall(
     }
   }
 
-  const trackingSql = buildTrackingSql(tablesToTrack, "postgres");
-  const fullSql = trackingSql ? `${installSql}\n${trackingSql}\n` : installSql;
-
   try {
-    await options.exec(fullSql);
+    // Functions + table first, then one statement per table. Separate
+    // execs = separate transactions, so attaching a trigger locks only
+    // that one table, briefly — never every tracked table at once.
+    await options.exec(installSql);
+    for (const table of tablesToTrack) {
+      await options.exec(buildTrackingSql([table], "postgres"));
+    }
     if (tablesToTrack.length === 0) {
       out(
         "[ezlogs] Postgres triggers installed. No tables tracked yet — " +

@@ -187,39 +187,30 @@ export interface InitOptions {
    */
   patchDatabaseClient?: unknown;
   /**
-   * Time-window fallback for stacks where SET LOCAL can't propagate
-   * (supabase-js, PostgREST, anything that auto-commits per request
-   * and doesn't expose explicit transactions). When true, the agent
-   * runs `SELECT MAX(id) FROM ezlogs_audit_log` at the start of every
-   * request and remembers the value. At end of request the reader
-   * drains rows whose `correlation_id` matches OR (`correlation_id`
-   * is NULL and `id` is greater than the snapshot) — i.e. rows the
-   * trigger fired during this request even though the customer's
-   * client couldn't tag them.
-   *
-   * Default false. Enable for supabase-js apps. Adds one cheap
-   * `SELECT MAX(id)` per request. See AGENT_PARITY_NOTES.md for the
-   * concurrency caveat (concurrent same-actor mutations may blur).
+   * @deprecated Since 0.2.0 this option is ignored. The old time-window
+   * fallback attributed untagged audit rows to whichever request was
+   * open, which under concurrency stamped other users' writes with the
+   * wrong actor. Untagged rows are now reported as their own actions.
+   * supabase-js writes are tagged exactly via the request header (re-run
+   * `install-triggers` after upgrading).
    */
   databaseSnapshotMode?: boolean;
   /**
    * One-line install for the trigger-based capture. Pass your Postgres
    * connection string; the agent does the rest:
    *   1. Lazy-imports `pg` and constructs a Pool (4 connections, max).
-   *      `pg` must be in your project's dependencies — the agent will
-   *      log a debug message and skip the trigger path if it's missing.
+   *      `pg` must be in your project's dependencies — the agent logs
+   *      one warning at startup and skips the trigger path if it's
+   *      missing, or if `ezlogs_audit_log` is not installed.
    *   2. Wires that Pool as `databaseReader` for the audit-log drain.
    *   3. Patches `pg.Client.prototype.query` so every customer query
    *      auto-injects SET LOCAL. Drizzle (node-postgres) and Prisma
    *      (`@prisma/adapter-pg`) both run on `pg` and inherit zero-touch
    *      capture without any extra wiring on the customer's side.
-   *   4. Enables `databaseSnapshotMode` — the time-window fallback
-   *      that catches supabase-js / PostgREST writes whose audit row
-   *      didn't get our SET LOCAL.
    *
    * Customers who want to override individual pieces can still pass
-   * `databaseReader` / `patchDatabaseClient` / `databaseSnapshotMode`
-   * directly; explicit values win over the auto-wired pieces.
+   * `databaseReader` / `patchDatabaseClient` directly; explicit values
+   * win over the auto-wired pieces.
    */
   databaseUrl?: string;
   logLevel?: LogLevel;
@@ -344,7 +335,6 @@ export class Configuration {
   displayNameFor: DisplayNameMap = {};
   isServerActionError: ServerActionErrorClassifier | null = null;
   databaseReader: DatabaseReader | null = null;
-  databaseSnapshotMode = false;
   databaseUrl: string | null = null;
 
   /**
@@ -397,9 +387,6 @@ export class Configuration {
     }
     if (options.databaseReader !== undefined) {
       this.databaseReader = options.databaseReader;
-    }
-    if (options.databaseSnapshotMode !== undefined) {
-      this.databaseSnapshotMode = options.databaseSnapshotMode;
     }
     if (options.databaseUrl !== undefined) {
       this.databaseUrl = options.databaseUrl;

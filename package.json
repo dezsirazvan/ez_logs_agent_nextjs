@@ -1,6 +1,6 @@
 {
   "name": "ezlogs-nextjs",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "EZLogs agent for Next.js — capture HTTP, database, and background-job events as plain-English Action cards.",
   "license": "MIT",
   "author": "EZLogs",
@@ -138,9 +138,11 @@
     }
   },
   "devDependencies": {
+    "@prisma/client": "^5.22.0",
     "@types/node": "^20.11.0",
     "@types/pg": "^8.20.0",
     "pg": "^8.20.0",
+    "prisma": "^5.22.0",
     "sucrase": "^3.35.0",
     "tsup": "^8.0.2",
     "typescript": "^5.4.0",

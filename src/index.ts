@@ -10,7 +10,11 @@
  * runs the pipeline.
  */
 
-import { configuration, type InitOptions } from "./configuration.js";
+import {
+  configuration,
+  type DatabaseReader,
+  type InitOptions,
+} from "./configuration.js";
 import { setLogLevel } from "./logger.js";
 import * as bufferOps from "./pipeline/buffer.js";
 import { flushScheduler } from "./pipeline/flush-scheduler.js";
@@ -19,7 +23,11 @@ import {
   unpatchGlobalFetch,
 } from "./http/outgoing-fetch.js";
 import { patchPgClient } from "./triggers/patch-pg.js";
-import { detectTriggerTrackedTables } from "./triggers/reader.js";
+import {
+  auditLogInstalled,
+  checkAuditLogAccess,
+  detectTriggerTrackedTables,
+} from "./triggers/reader.js";
 import { logger } from "./logger.js";
 
 export type {
@@ -88,7 +96,7 @@ export const ezlogs = {
     //      `POSTGRES_URL`, `SUPABASE_DB_URL`, etc.)
     //   3. Nothing — Phase 4 adapters remain the active capture path.
     // Each step also respects explicit `databaseReader` /
-    // `patchDatabaseClient` / `databaseSnapshotMode` overrides.
+    // `patchDatabaseClient` overrides.
     const resolvedDbUrl =
       options.databaseUrl ?? detectDatabaseUrlFromEnv();
     if (resolvedDbUrl && !options.databaseReader) {
@@ -115,12 +123,10 @@ export const ezlogs = {
       );
     }
 
-    // Apply post-`databaseReader` defaults for the synchronous path
-    // (manual `databaseReader: …` users). The async auto-wire path
-    // calls `applyDatabaseReaderDefaults` itself once it has the pool
-    // wired, since at this point `config.databaseReader` is still null
-    // for those users.
-    applyDatabaseReaderDefaults(options);
+    // Self-check + detection for the synchronous path (manual
+    // `databaseReader: …` users). The async auto-wire path does its
+    // own; `config.databaseReader` is still null here for those users.
+    applyDatabaseReaderDefaults();
 
     installBeforeExitHook();
     initialized = true;
@@ -199,8 +205,7 @@ function detectDatabaseUrlFromEnv(): string | null {
 
 /**
  * Lazy-import `pg`, construct a Pool, wire it as the audit reader,
- * patch `pg.Client.prototype.query`, and enable snapshot mode — all
- * from a single `databaseUrl`. Customer's instrumentation.ts becomes:
+ * patch `pg.Client.prototype.query` — all from a single `databaseUrl`. Customer's instrumentation.ts becomes:
  *
  *     ezlogs.init({ serverUrl, projectToken, databaseUrl });
  *
@@ -230,9 +235,12 @@ async function autoWireTriggerPathFromDatabaseUrl(
       "return import(s)",
     ) as (s: string) => Promise<unknown>;
     pg = (await dynImport("pg")) as unknown as typeof pg;
-  } catch (err) {
-    // No pg installed (or import failed) — nothing to wire.
-    // Per-ORM adapters remain the active capture path.
+  } catch {
+    logger.warn(
+      "a Postgres URL is configured but the `pg` package is not installed, so " +
+        "trigger-based DB capture is off. Run `npm i pg` and " +
+        "`npx ezlogs-nextjs install-triggers`, or use a per-ORM adapter (docs/database.md).",
+    );
     return;
   }
 
@@ -241,53 +249,63 @@ async function autoWireTriggerPathFromDatabaseUrl(
   const pool = new pg.Pool({
     connectionString: options.databaseUrl as string,
     max: 4,
-  }) as { query: (sql: string, params: unknown[]) => Promise<unknown> };
+  }) as {
+    query: (sql: string, params: unknown[]) => Promise<unknown>;
+    end?: () => Promise<void>;
+  };
+  const reader: DatabaseReader = (sql, params) =>
+    pool.query(sql, params as unknown[]);
+
+  // Startup self-check: no audit table → one warning, nothing wired,
+  // so no request issues queries that can only fail. A probe that
+  // errors (DB unreachable at boot) wires anyway — that's transient.
+  if ((await auditLogInstalled(reader)) === false) {
+    warnAuditLogMissing();
+    void pool.end?.().catch(() => {});
+    return;
+  }
 
   // Wire the reader unless the customer explicitly opted out / overrode.
   if (config.databaseReader === null) {
-    config.databaseReader = (sql, params) => pool.query(sql, params as unknown[]);
+    config.databaseReader = reader;
   }
 
   // Patch the same `pg` module the customer's app uses (Node CJS
   // module cache resolves both to the same instance via require).
   patchPgClient(pg as unknown as Parameters<typeof patchPgClient>[0]);
 
-  // Now that `databaseReader` is set, apply the same defaults the
-  // synchronous (manual-reader) path applies in `init()`.
-  applyDatabaseReaderDefaults(options);
+  void checkAuditLogAccess(reader);
+  runTriggerTrackedTablesDetection();
 }
 
 /**
- * Defaults that depend on `databaseReader` being set. Called from
- * both the synchronous manual-reader path (in `init()`) and the
- * async auto-wire path (`autoWireTriggerPathFromDatabaseUrl`) once
- * each respectively has populated `config.databaseReader`.
- *
- * Two rules:
- *
- *   1. Snapshot mode (default `true` when `databaseReader` is wired).
- *      Catches audit rows with NULL `correlation_id` — i.e. writes
- *      from drivers we can't `SET LOCAL`-patch (postgres.js, neon
- *      serverless, planetscale-serverless, supabase-js / PostgREST).
- *      Without it, those rows sit in `ezlogs_audit_log` forever
- *      because the reader's WHERE clause is `correlation_id = $1`.
- *      Cost: one cheap `SELECT MAX(id)` per request. Customers on
- *      pure `pg` can opt out with `databaseSnapshotMode: false`.
- *
- *   2. Trigger-tracked-table detection. Populates the Set the per-ORM
- *      adapter gate consults to decide if its emit is redundant
- *      (trigger reader will surface it) or needed (table not tracked
- *      → adapter is the only path).
- *
- * Idempotent: re-callable, defaults only applied when not already set.
+ * Manual `databaseReader` path: same self-check as the auto-wire
+ * (missing audit table → one warning, reader unset), then
+ * trigger-tracked-table detection. Async; requests that arrive before
+ * the probe answers just run the normal reader.
  */
-function applyDatabaseReaderDefaults(options: InitOptions): void {
+function applyDatabaseReaderDefaults(): void {
   const config = configuration();
-  if (!config.databaseReader) return;
-  if (options.databaseSnapshotMode === undefined) {
-    config.databaseSnapshotMode = true;
-  }
-  runTriggerTrackedTablesDetection();
+  const reader = config.databaseReader;
+  if (!reader) return;
+  auditLogInstalled(reader)
+    .then((installed) => {
+      if (installed === false && config.databaseReader === reader) {
+        config.databaseReader = null;
+        warnAuditLogMissing();
+        return;
+      }
+      if (installed === true) void checkAuditLogAccess(reader);
+      runTriggerTrackedTablesDetection();
+    })
+    .catch(() => {});
+}
+
+function warnAuditLogMissing(): void {
+  logger.warn(
+    "table `ezlogs_audit_log` was not found, so trigger-based DB capture is off. " +
+      "Run `npx ezlogs-nextjs install-triggers` against this database and restart.",
+  );
 }
 
 /**

@@ -16,6 +16,7 @@ import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
 import { current as currentCorrelation } from "../correlation.js";
 import { getCurrentActor } from "../actor.js";
+import { matchesSensitiveKey } from "../http/sanitize.js";
 
 export type DbOperation = "create" | "update" | "destroy";
 
@@ -47,17 +48,17 @@ export const IGNORED_ATTRIBUTES: readonly string[] = Object.freeze([
 
 // DB-specific sensitive patterns. NOTE: this list intentionally differs
 // from EventBuilder's SENSITIVE_KEYS (5 entries) AND from the HTTP
-// middleware's SENSITIVE_VARIABLE_PATTERNS (27 entries). The DB list
-// has 18 entries — DB columns surface a wider class of crypto material
-// (signing keys, IVs, salts, signatures) than HTTP params do, and
-// defense-in-depth catches schemas that store these in dedicated
-// columns rather than encrypted blobs.
+// middleware's SENSITIVE_VARIABLE_PATTERNS. DB columns surface a wider
+// class of crypto material (signing keys, IVs, salts, signatures) than
+// HTTP params do, and defense-in-depth catches schemas that store
+// these in dedicated columns rather than encrypted blobs.
 //
-// Source of truth: ez_logs_agent's database_capturer.rb. Keep this
-// list in lockstep with the Ruby agent's `SENSITIVE_PATTERNS` so the
-// two agents redact the same column names. The server's
-// EventIngest::SensitiveFieldRedactor backstop uses the same 18
-// patterns — agent + server form one consistent redaction layer.
+// Origin: ez_logs_agent's database_capturer.rb (the first 18). Since
+// 0.2.0 this list is a superset of the Rails list (credential, pin,
+// otp, iban, card fields); the Rails gem and the server's
+// EventIngest::SensitiveFieldRedactor do not have those yet.
+// The trigger SQL (`ezlogs_is_sensitive_key`) mirrors this list so
+// sensitive columns never reach ezlogs_audit_log.
 export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "password",
   "token",
@@ -77,6 +78,18 @@ export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "digest",
   "signature",
   "hmac",
+  // 0.2.0 additions. `credential` / `passwd` / `apikey` were already in
+  // the HTTP list; `passcode` / `card_number` / `cardnumber` / `cvv` /
+  // `cvc` are new. Whole-word `pin` / `otp` / `totp` / `iban` come from
+  // SENSITIVE_WORD_PATTERNS. The SQL trigger mirrors this list.
+  "credential",
+  "passwd",
+  "passcode",
+  "apikey",
+  "card_number",
+  "cardnumber",
+  "cvv",
+  "cvc",
 ]);
 
 export interface DbAttributeChange {
@@ -111,6 +124,8 @@ export interface DbEmitInput {
    * it's not part of the public adapter contract.
    */
   _fromTrigger?: boolean;
+  /** When the write happened (trigger rows: `captured_at`). Defaults to now. */
+  timestamp?: Date | null;
 }
 
 // Single emit path used by all DB adapters. Builds an event with the
@@ -179,6 +194,7 @@ export function emitDbEvent(input: DbEmitInput): void {
           : [{ resource_type: input.modelClass, resource_id: resourceIdStr }],
       context,
       duration_ms: null,
+      timestamp: input.timestamp ?? null,
     });
 
     pushEvent(event);
@@ -274,8 +290,7 @@ export function isMeaningfulAttribute(name: string): boolean {
 }
 
 export function isDbSensitive(name: string): boolean {
-  const lower = name.toLowerCase();
-  return DB_SENSITIVE_PATTERNS.some((p) => lower.includes(p));
+  return matchesSensitiveKey(name, DB_SENSITIVE_PATTERNS);
 }
 
 // Scalar = simple, JSON-serializable value. Mirrors Ruby's `scalar?`

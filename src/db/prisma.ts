@@ -21,6 +21,8 @@
 
 import { logger } from "../logger.js";
 import { makeAsyncContextCapture } from "../edge-fallback.js";
+import { current as currentCorrelation } from "../correlation.js";
+import { configuration } from "../configuration.js";
 import {
   emitDbEvent,
   resolveDisplayName,
@@ -69,13 +71,49 @@ interface QueryExtensionContext {
   operation: string;
   args: { data?: unknown; where?: unknown; create?: unknown; update?: unknown };
   query: (args: unknown) => Promise<unknown>;
+  /** Prisma internal; `.transaction` is set inside a user transaction. */
+  __internalParams?: { transaction?: unknown };
 }
 
-// Public factory. Returns the object literal that Prisma's
-// `client.$extends({...})` accepts. Typed as `unknown` because the
-// Prisma `Extension` shape is generic over the client and we don't
-// want to take a hard type dep.
+/** The parts of a PrismaClient the correlation tagging needs. */
+interface TaggingClient {
+  $extends: (ext: unknown) => unknown;
+  $transaction: (queries: unknown[]) => Promise<unknown[]>;
+  $executeRawUnsafe: (sql: string, ...values: unknown[]) => unknown;
+}
+
+/**
+ * Public factory for `prisma.$extends(ezlogsPrisma())`.
+ *
+ * Returns Prisma's callback-form extension (what
+ * `Prisma.defineExtension((client) => …)` returns) so the hook can
+ * reach the client for correlation tagging: every write made inside a
+ * captured request runs as
+ *
+ *   client.$transaction([
+ *     client.$executeRawUnsafe("SELECT set_config('ezlogs.correlation_id', $1, TRUE)", id),
+ *     query(args),
+ *   ])
+ *
+ * — Prisma's documented RLS client-extension pattern. The audit
+ * trigger reads that setting, so rows from a plain `PrismaClient`
+ * (default engine, no driver adapter) join the right request. Reads
+ * pass through with no extra query.
+ *
+ * Not tagged (rows ship as their own actions, never misattributed):
+ * writes inside a user `$transaction` (batch or interactive) — Prisma
+ * can't nest a transaction there.
+ */
 export function ezlogsPrisma(): unknown {
+  return (client: TaggingClient) => client.$extends(buildPrismaExtension(client));
+}
+
+/**
+ * The extension descriptor. `client` null = capture only, no tagging
+ * (the adapter-pg path tags via the patched `pg` driver instead).
+ * @internal exported for tests.
+ */
+export function buildPrismaExtension(client: TaggingClient | null): unknown {
   return {
     name: "ezlogs",
     query: {
@@ -85,7 +123,7 @@ export function ezlogsPrisma(): unknown {
             return ctx.query(ctx.args);
           }
 
-          const result = await ctx.query(ctx.args);
+          const result = await runTagged(client, ctx);
           try {
             recordPrismaOperation(ctx, result);
           } catch (error) {
@@ -94,8 +132,91 @@ export function ezlogsPrisma(): unknown {
           return result;
         },
       },
+      // Raw writes (`$executeRaw\`UPDATE …\``) aren't model operations.
+      async $allOperations(ctx: QueryExtensionContext) {
+        if (ctx.operation !== "$executeRaw" && ctx.operation !== "$executeRawUnsafe") {
+          return ctx.query(ctx.args);
+        }
+        return runTagged(client, ctx);
+      },
     },
   };
+}
+
+const SET_CORRELATION_SQL = "SELECT set_config('ezlogs.correlation_id', $1, TRUE)";
+
+async function runTagged(
+  client: TaggingClient | null,
+  ctx: QueryExtensionContext,
+): Promise<unknown> {
+  if (!shouldTag(client, ctx)) return ctx.query(ctx.args);
+  try {
+    const results = await client!.$transaction([
+      client!.$executeRawUnsafe(SET_CORRELATION_SQL, currentCorrelation()),
+      ctx.query(ctx.args),
+    ]);
+    return results[1];
+  } catch (error) {
+    // e.g. Neon's HTTP adapter: no transactions. Nothing ran (the batch
+    // is rejected up front, or rolled back), so run the write untagged
+    // and stop tagging for this client (other clients are unaffected).
+    if (!isTransactionUnsupported(error)) throw error;
+    taggingDisabled.add(client!);
+    logger.warn(
+      "this Prisma client can't run transactions, so DB writes won't be linked to " +
+        `their request (they still show up as their own actions): ${describeError(error)}`,
+    );
+    return ctx.query(ctx.args);
+  }
+}
+
+// Keyed by the base client the extension was built for.
+let taggingDisabled = new WeakSet<object>();
+
+/** @internal test-only */
+export function _resetPrismaTaggingForTests(): void {
+  taggingDisabled = new WeakSet<object>();
+}
+
+/**
+ * Tag only when it can matter and can't hurt:
+ *   - the trigger reader is wired (auto-wire sets it only for Postgres
+ *     URLs) — otherwise nobody reads the setting;
+ *   - the client is Postgres (`set_config` is Postgres-only; MySQL /
+ *     SQLite / SQL Server / MongoDB clients are left untouched);
+ *   - a request correlation id exists;
+ *   - not inside a user $transaction. The only signal is Prisma's
+ *     internal `__internalParams.transaction` (same on 5.22 / 6.19 /
+ *     7.10); if a future Prisma drops `__internalParams`, we stop
+ *     tagging rather than risk a nested transaction.
+ */
+function shouldTag(client: TaggingClient | null, ctx: QueryExtensionContext): boolean {
+  if (!client || taggingDisabled.has(client)) return false;
+  if (configuration().databaseReader == null) return false;
+  if (!isPostgresClient(client)) return false;
+  if (typeof client.$transaction !== "function" || typeof client.$executeRawUnsafe !== "function") {
+    return false;
+  }
+  if (!currentCorrelation()) return false;
+  const params = ctx.__internalParams;
+  return params != null && !params.transaction;
+}
+
+function isPostgresClient(client: TaggingClient): boolean {
+  const c = client as {
+    _activeProvider?: unknown;
+    _engineConfig?: { activeProvider?: unknown };
+  };
+  const provider = c._activeProvider ?? c._engineConfig?.activeProvider;
+  // Unknown (future internals): rely on the reader being wired, which
+  // only happens for Postgres.
+  if (typeof provider !== "string") return true;
+  return provider === "postgresql" || provider === "postgres";
+}
+
+function isTransactionUnsupported(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /transaction/i.test(message) && /not (?:be )?supported|unsupported|not available/i.test(message);
 }
 
 function recordPrismaOperation(
@@ -510,7 +631,10 @@ function applyEzlogsExtension<T extends object>(prisma: T): T {
     return prisma;
   }
   try {
-    return client.$extends(ezlogsPrisma()) as T;
+    // No tagging here: the adapter-pg path tags via the patched `pg`
+    // driver, and a nested $transaction would deadlock on the
+    // per-adapter mutex below.
+    return client.$extends(buildPrismaExtension(null)) as T;
   } catch (error) {
     logger.debug(`patchPrismaClient: $extends failed: ${describeError(error)}`);
     return prisma;

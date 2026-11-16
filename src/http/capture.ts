@@ -35,8 +35,7 @@ import {
   resolveCorrelation,
   runWithCorrelation,
 } from "../correlation.js";
-import { flushAuditLog, takeAuditSnapshot } from "../triggers/reader.js";
-import { runWithAuditSnapshotScope } from "../triggers/audit-snapshot.js";
+import { flushAuditLog } from "../triggers/reader.js";
 import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
 import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
@@ -987,7 +986,7 @@ async function emitServerActionEvent(input: {
     // what the user actually submitted. The existing sanitization in
     // buildHttpSourceData (sensitive-field redaction, sanitize.ts)
     // applies to whatever we pass through.
-    const argParams = extractServerActionArgs(input.args);
+    const argParams = extractServerActionArgs(input.args, input.actionName);
     const requestParams: Record<string, unknown> | null =
       argParams !== null || fromPage !== null
         ? { ...(argParams ?? {}), ...(fromPage !== null ? { from_page: fromPage } : {}) }
@@ -1057,6 +1056,7 @@ async function emitServerActionEvent(input: {
  */
 function extractServerActionArgs(
   args: unknown[] | undefined,
+  actionName: string,
 ): Record<string, unknown> | null {
   if (!args || args.length === 0) return null;
 
@@ -1092,16 +1092,136 @@ function extractServerActionArgs(
     return Object.keys(out).length === 0 ? null : out;
   }
 
-  // No recognizable payload — preserve positional args (rare: a Server
-  // Action called with raw scalars/dates). Without this we'd silently
-  // drop information for non-form actions.
+  // No recognizable payload — preserve positional args (a Server
+  // Action called with raw scalars, e.g. `deleteInvoice(id)`).
+  //
+  // Positional args have no name, so key-based redaction can't see
+  // them: `signIn(email, password)` would ship the password as `arg1`.
+  // Top-level positional strings are therefore masked unless they are
+  // id-shaped (see `maskPositional`). Objects inside positional args
+  // keep their keys and go through the normal key-based sanitizer.
+  const words = actionWords(actionName);
+  const flags: MaskFlags = {
+    secretAction: words.some((w) => SECRET_ACTION_WORDS.has(w)),
+    paymentAction: words.some((w) => PAYMENT_ACTION_WORDS.has(w)),
+  };
   const out: Record<string, unknown> = {};
   args.forEach((a, i) => {
     if (isInsignificantArg(a)) return;
-    const v = serializeArgValue(a);
+    const v = maskPositional(serializeArgValue(a), flags);
     if (v !== undefined) out[`arg${i}`] = v;
   });
   return Object.keys(out).length === 0 ? null : out;
+}
+
+// Strict id shapes the server uses to find the primary record in a
+// Server Action's args. Generated ids carry digits; the digit /
+// mixed-case rules keep word-like strings ("inactive", a lowercase
+// passphrase) out. A random password that happens to look exactly like
+// a generated id is the accepted residual risk.
+const INT_OR_UUID = /^(?:\d{1,20}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+const CUID_V1 = /^c[a-z0-9]{24}$/;
+const CUID2 = /^[a-z][a-z0-9]{23}$/;
+// A ULID's first char encodes the timestamp and is always 0-7.
+const ULID = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+const NANOID_21 = /^[A-Za-z0-9_-]{21}$/;
+
+function digitCount(s: string): number {
+  return s.replace(/\D/g, "").length;
+}
+
+function isIdShaped(s: string): boolean {
+  if (INT_OR_UUID.test(s) || ULID.test(s)) return true;
+  // ≥2 digits on cuid v1 too: "correcthorsebatterystaple" is c + 24 letters.
+  if (CUID_V1.test(s) || CUID2.test(s)) return digitCount(s) >= 2;
+  if (NANOID_21.test(s)) {
+    return digitCount(s) >= 2 && /[a-z]/.test(s) && /[A-Z]/.test(s);
+  }
+  return false;
+}
+
+// Action-name words that mean "short numeric args are secrets"
+// (setPin(4821), verifyOtp("123456")). Mirrors the server redactor's
+// auth-word list plus card/cvv/code.
+const SECRET_ACTION_WORDS = new Set([
+  "pin", "otp", "code", "verify", "mfa", "2fa", "cvv", "cvc", "card",
+  "password", "passwd", "secret", "token", "sign", "signin", "login",
+  "reset", "credential", "credentials", "unlock",
+]);
+
+// Action-name words that mean "this is about payment cards".
+const PAYMENT_ACTION_WORDS = new Set([
+  "card", "pay", "payment", "charge", "checkout", "billing", "cvv", "cvc",
+]);
+
+/** `verify2FA` → ["verify", "2fa"], `setPinCode` → ["set", "pin", "code"]. */
+function actionWords(name: string): string[] {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/([a-zA-Z])(\d)/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** Digits passing the Luhn checksum (card numbers do). */
+function passesLuhn(digits: string): boolean {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i += 1) {
+    let d = Number(digits[digits.length - 1 - i]);
+    if (i % 2 === 1) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+/**
+ * Card-number shaped, Luhn-valid digits. 15-16 digits (Amex / Visa /
+ * Mastercard length) are masked whatever the action is called; other
+ * PAN lengths (13-19) only for payment-named actions, so 13-digit ms
+ * timestamps and 17-19 digit snowflake ids elsewhere stay visible.
+ * Residual: ~10% of 15-16 digit ids pass Luhn and get masked.
+ */
+function looksLikeCardNumber(digits: string, paymentAction: boolean): boolean {
+  if (digits.length < 13 || digits.length > 19 || !passesLuhn(digits)) return false;
+  return paymentAction || digits.length === 15 || digits.length === 16;
+}
+
+interface MaskFlags {
+  secretAction: boolean;
+  paymentAction: boolean;
+}
+
+/**
+ * Unnamed string → "[FILTERED]" unless id-shaped. Numbers, booleans
+ * and null pass through (numeric ids are the common case). Arrays of
+ * positional strings (`bulkDelete(ids)`) get the same per-item rule.
+ *
+ * Digit values (string or number) are also masked when they look like
+ * a card number (see looksLikeCardNumber), or are 4-8 digits and the
+ * action name has a secret word (`setPin`, `verifyOtp`, `verify2FA`).
+ * shortcut: a PIN passed to an innocently named action
+ * (`update(4821)`) still shows; upgrade with param-name hints if needed.
+ */
+function maskPositional(value: unknown, flags: MaskFlags): unknown {
+  if (Array.isArray(value)) return value.map((v) => maskPositional(v, flags));
+  const digits =
+    typeof value === "number" && Number.isInteger(value) && value >= 0
+      ? String(value)
+      : typeof value === "string" && /^\d+$/.test(value)
+        ? value
+        : null;
+  if (digits !== null) {
+    if (looksLikeCardNumber(digits, flags.paymentAction)) return "[FILTERED]";
+    if (flags.secretAction && digits.length >= 4 && digits.length <= 8) return "[FILTERED]";
+  }
+  if (typeof value === "string") {
+    return isIdShaped(value) ? value : "[FILTERED]";
+  }
+  return value;
 }
 
 function findPayloadIndex(args: unknown[]): number {
@@ -1692,28 +1812,10 @@ async function flushTriggerAuditLog(): Promise<void> {
 }
 
 /**
- * Snapshot `MAX(id)` from the audit log at the start of each request,
- * so the reader's time-window fallback can drain rows the trigger
- * fired during the request whose `correlation_id` is NULL (i.e. the
- * customer's client couldn't run SET LOCAL — supabase-js, PostgREST).
- *
- * Wrapped around the user's handler so the snapshot is visible
- * inside the actor + correlation scope. No-op when
- * `databaseSnapshotMode` isn't enabled. Used by every HTTP capturer
- * via the `runWithAuditSnapshotIfEnabled` wrapper below.
- */
-async function takeTriggerAuditSnapshotIfEnabled(): Promise<void> {
-  const config = configuration();
-  if (!config.databaseSnapshotMode) return;
-  if (!config.databaseReader) return;
-  await takeAuditSnapshot(config.databaseReader);
-}
-
-/**
- * Wrap a handler in (actor scope) + optional (audit-snapshot scope) +
- * optional (audit-emit-dedup scope) for capturers. Replaces the bare
- * `runWithActorScope` calls so the trigger plumbing is wired in one
- * place rather than at every entry point. Capturers do:
+ * Wrap a handler in (actor scope) + optional (audit-emit-dedup scope)
+ * for capturers. Replaces the bare `runWithActorScope` calls so the
+ * trigger plumbing is wired in one place rather than at every entry
+ * point. Capturers do:
  *
  *   return runWithCorrelation(correlationId, () =>
  *     runWithActorAndAuditScope(async () => {
@@ -1723,36 +1825,16 @@ async function takeTriggerAuditSnapshotIfEnabled(): Promise<void> {
  *
  * Scope layers:
  *   - actor scope: always (the agent needs `getCurrentActor()` everywhere).
- *   - audit-snapshot scope: only when `databaseSnapshotMode` is on
- *     (supabase / no-SET-LOCAL fallback path).
  *   - audit-emit-dedup scope: whenever a `databaseReader` is configured.
  *     The trigger reader can be flushed more than once per request
- *     (middleware page-nav, server-action exit, generic capture). Each
- *     flush re-reads the same audit rows by correlation — the dedup
- *     scope holds the set of ids already emitted so re-reads no-op.
- *     Always opened together with snapshot mode so the snapshot scope
- *     itself doesn't accidentally enable dedup independently.
+ *     (middleware page-nav, server-action exit, generic capture). The
+ *     dedup scope holds the ids already emitted so re-reads no-op.
  */
 function runWithActorAndAuditScope<R>(callback: () => Promise<R>): Promise<R> {
-  const config = configuration();
-  const hasReader = config.databaseReader != null;
-  const snapshotEnabled = config.databaseSnapshotMode;
-
-  if (!hasReader) {
+  if (configuration().databaseReader == null) {
     return runWithActorScope(callback);
   }
-
-  // Trigger path is wired (databaseReader configured). Always open the
-  // dedup scope; optionally open the snapshot scope on top.
-  return runWithActorScope(() =>
-    runWithEmittedAuditIdsScope(() => {
-      if (!snapshotEnabled) return callback();
-      return runWithAuditSnapshotScope(async () => {
-        await takeTriggerAuditSnapshotIfEnabled();
-        return callback();
-      });
-    }),
-  );
+  return runWithActorScope(() => runWithEmittedAuditIdsScope(callback));
 }
 
 function isExcludedPath(path: string, method?: string | null): boolean {

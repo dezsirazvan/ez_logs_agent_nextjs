@@ -56,6 +56,10 @@
 
   let exitCode = 1;
   try {
+    // A statement stuck behind a long transaction would make the app's
+    // writes queue behind it. Give up after 5s instead; re-running the
+    // (idempotent) install finishes the job.
+    await client.query("SET lock_timeout = '5s'");
     exitCode = await runInstall(args, {
       out: (l) => console.log(l),
       exec: (sql) => client.query(sql),

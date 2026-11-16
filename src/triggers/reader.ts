@@ -3,33 +3,31 @@
 //
 // This is the bridge the trigger-based capture path needs. The
 // SQL trigger (00_install.sql) writes a JSONB old_row / new_row
-// per mutation, scoped by GUC-supplied correlation id. At the end
-// of each request, the HTTP capturer calls `flushAuditLog` which
-// reads back every row tagged with the current correlation_id and
-// emits one `database_callback` event per row through the existing
-// emit path (`emitDbEvent`).
+// per mutation, tagged with the correlation id of the request that
+// made it (from the `ezlogs.correlation_id` GUC on direct `pg`
+// connections, or PostgREST's `request.headers` for supabase-js).
+// At the end of each request, the HTTP capturer calls
+// `flushAuditLog`, which CLAIMS (deletes and returns) every row
+// tagged with the current correlation id and emits one
+// `database_callback` event per row through `emitDbEvent`.
 //
-// Why pull-at-end-of-request rather than push-from-the-trigger:
-//   - The trigger runs inside the customer's transaction. We don't
-//     want to do a network round-trip from inside it (latency hit
-//     the customer didn't ask for).
-//   - We don't need realtime: events are buffered and shipped on
-//     the existing flush schedule. End-of-request reads are a few
-//     ms on a sub-100-row table.
-//   - The agent is already in scope at end of request — actor and
-//     correlation id are still readable.
+// Correlation rule (CLAUDE.md §4: partial is OK, wrong is not):
+// a request only ever emits rows carrying ITS OWN correlation id.
+// Rows with no correlation id (writes from a client the agent can't
+// tag: Prisma's default Rust engine, postgres.js, cron scripts…) are
+// never attributed to whichever request happens to be open. A
+// throttled sweep emits them as their own actions, without an actor.
+// (Before 0.2.0 a "snapshot" fallback claimed every untagged row
+// written during a request; under concurrency that stamped other
+// users' writes with the wrong actor.)
+//
+// Retention: rows are deleted when claimed, so the table only holds
+// rows not yet emitted. Untagged rows and rows older than
+// ORPHAN_AGE are drained by the sweep; rows older than PRUNE_AGE are
+// deleted without emitting (e.g. when no request ran for a day).
 //
 // The reader itself doesn't open transactions or connections; it
-// takes a `SqlExecutor` (the same shape `applyDatabaseContext` uses)
-// and runs a single SELECT. The customer wires that executor to
-// their pg / drizzle / prisma client however they prefer.
-//
-// Per-row delete vs. retention: we don't delete rows after read.
-// Customers schedule their own cleanup (e.g.
-//   `DELETE FROM ezlogs_audit_log WHERE captured_at < now() - '7 days'`
-// in a cron). The audit log doubles as a customer-facing forensic
-// trail — users may want to keep it longer than the EZLogs
-// retention.
+// takes a `SqlExecutor` (the same shape `applyDatabaseContext` uses).
 
 import { logger } from "../logger.js";
 import {
@@ -37,26 +35,25 @@ import {
   type DbAttributeChange,
   type DbOperation,
 } from "../db/shared.js";
-import { current as currentCorrelation } from "../correlation.js";
 import {
-  currentAuditSnapshot,
-  setAuditSnapshot,
-} from "./audit-snapshot.js";
+  current as currentCorrelation,
+  generate as generateCorrelation,
+  runWithCorrelation,
+} from "../correlation.js";
+import { runWithActorScope } from "../actor.js";
 import { currentEmittedAuditIds } from "./emit-dedup.js";
 import type { SqlExecutor } from "./context.js";
 
 /**
- * Shape of one row returned by the audit-log SELECT. Matches the
- * column list in `00_install.sql` exactly. Drivers vary on how they
+ * Shape of one row returned by the audit-log query. Matches the
+ * column list in `00_install.sql`. Drivers vary on how they
  * deserialize jsonb (`pg` returns plain objects; some serverless
  * drivers return strings) — `coerceJsonb` below handles both.
  */
 export interface AuditRow {
   /**
    * The audit log row's primary key, stringified. Used only for
-   * within-request emit dedup — never reaches the wire. We stringify
-   * here so drivers that return bigint, number, or string all live in
-   * one Set comparable type.
+   * within-request emit dedup — never reaches the wire.
    */
   id: string;
   table_name: string;
@@ -64,8 +61,12 @@ export interface AuditRow {
   old_row: Record<string, unknown> | string | null;
   new_row: Record<string, unknown> | string | null;
   resource_id: string | null;
-  // actor_id and correlation_id are also on the row but the agent
-  // already knows both from request scope — no need to round-trip.
+  /** Stored correlation id (null when the write couldn't be tagged). */
+  correlation_id?: string | null;
+  /** Postgres transaction id — groups untagged rows into one action. */
+  txid?: string | null;
+  /** When the trigger fired — becomes the event timestamp. */
+  captured_at?: Date | null;
 }
 
 /**
@@ -80,61 +81,72 @@ type ExecResult =
   | null
   | undefined;
 
+const COLUMNS =
+  "id, table_name, op, old_row, new_row, resource_id, correlation_id, txid, captured_at";
+
+/** Rows older than this are drained by the sweep even if tagged (their request never flushed). */
+const ORPHAN_AGE = "5 minutes";
+/** Rows older than this are deleted without emitting (and never swept). */
+const PRUNE_AGE = "24 hours";
+const SWEEP_BATCH = 100;
+// shortcut: 2k rows per 10 min (~290k/day) of expired rows; a bigger
+// backlog takes longer to clear but stays invisible (never swept).
+const PRUNE_BATCH = 2_000;
+const SWEEP_INTERVAL_MS = 10_000;
+const PRUNE_INTERVAL_MS = 10 * 60_000;
+
+// Module state is per process (per bundle layer); duplicates only mean
+// an extra cheap sweep, never a double emit (claims are DELETEs).
+let lastSweepAt = 0;
+let lastPruneAt = 0;
+// DELETE denied (read-only reader role): fall back to SELECT and
+// leave retention to the customer.
+let deleteDenied = false;
+// txid → generated correlation id, so an untagged transaction split
+// across two sweep batches still lands in one action.
+const txCorrelation = new Map<string, string>();
+
 /**
- * Fetch audit rows tagged with `correlationId` in capture order.
+ * Claim (delete + return) the audit rows tagged with `correlationId`,
+ * oldest first. A row can only be claimed once, so concurrent flushes
+ * never emit the same row twice.
  *
- * Returns rows oldest-first (matches the trigger's `clock_timestamp`
- * within a transaction) so the dashboard renders them chronologically.
+ * If the reader role may not DELETE, falls back to a plain SELECT
+ * (rows then stay until the customer cleans them up) and warns once.
  *
  * Errors are caught and returned as `[]` — a failed audit read must
- * never break the host request. The error is logged at debug.
+ * never break the host request.
  */
 export async function readAuditRows(
   exec: SqlExecutor,
   correlationId: string,
-  /**
-   * Snapshot of `MAX(id)` taken at the start of the request. Used as
-   * the lower bound for the time-window fallback path that catches
-   * rows whose `correlation_id` is NULL — i.e., supabase-js writes
-   * that didn't go through SET LOCAL because PostgREST doesn't
-   * expose explicit transactions to the client.
-   *
-   * When null, the reader falls back to correlation-only matching
-   * (Phase 5 primary path).
-   */
-  snapshotMaxId: bigint | null = null,
 ): Promise<AuditRow[]> {
   try {
-    // Two queries logically OR'd:
-    //   1. correlation_id = $1     (Phase 5 primary path: SET LOCAL fired)
-    //   2. correlation_id IS NULL AND id > $2  (Supabase / no-SET-LOCAL
-    //      path: agent attributes context from request scope at emit time)
-    //
-    // We always emit the correlation-tagged rows. The snapshot arm only
-    // engages when the customer has wired audit-snapshot bookkeeping
-    // (i.e. `takeAuditSnapshot` ran at request start). Without it,
-    // `snapshotMaxId === null` and the second arm is excluded entirely
-    // so we don't accidentally pick up unrelated rows.
-    const sql =
-      snapshotMaxId === null
-        ? `SELECT id, table_name, op, old_row, new_row, resource_id
-             FROM ezlogs_audit_log
-            WHERE correlation_id = $1
-            ORDER BY id ASC`
-        : `SELECT id, table_name, op, old_row, new_row, resource_id
-             FROM ezlogs_audit_log
-            WHERE correlation_id = $1
-               OR (correlation_id IS NULL AND id > $2)
-            ORDER BY id ASC`;
-    const params =
-      snapshotMaxId === null
-        ? [correlationId]
-        : [correlationId, snapshotMaxId.toString()];
-
-    const result = (await exec(sql, params)) as ExecResult;
-
-    const rows = extractRows(result);
-    return rows.map((r) => normalizeAuditRow(r));
+    if (!deleteDenied) {
+      try {
+        return sortById(
+          extractRows(
+            (await exec(
+              `DELETE FROM ezlogs_audit_log WHERE correlation_id = $1 RETURNING ${COLUMNS}`,
+              [correlationId],
+            )) as ExecResult,
+          ).map(normalizeAuditRow),
+        );
+      } catch (err) {
+        if (!isPermissionDenied(err)) throw err;
+        deleteDenied = true;
+        logger.warn(
+          "the database role used by the agent cannot DELETE from ezlogs_audit_log. " +
+            "Rows will not be cleaned up after they are sent; grant DELETE or schedule " +
+            "`DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '24 hours'`.",
+        );
+      }
+    }
+    const result = (await exec(
+      `SELECT ${COLUMNS} FROM ezlogs_audit_log WHERE correlation_id = $1 ORDER BY id ASC`,
+      [correlationId],
+    )) as ExecResult;
+    return extractRows(result).map(normalizeAuditRow);
   } catch (err) {
     logger.debug(
       `readAuditRows failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -144,44 +156,126 @@ export async function readAuditRows(
 }
 
 /**
- * Take a snapshot of the current `MAX(id)` from `ezlogs_audit_log` and
- * store it on the per-request scope. Called at the start of each HTTP
- * request when `databaseReader` is configured. The reader's time-window
- * fallback uses this as the lower bound for catching supabase-js writes
- * (rows whose `correlation_id` is NULL because PostgREST didn't run
- * inside our explicit transaction).
+ * Drain rows no request will claim: untagged rows, and tagged rows
+ * older than ORPHAN_AGE. Each is emitted under its stored correlation
+ * id, or — when it has none — under one fresh id per database
+ * transaction, always with no actor. Never attributes a row to the
+ * request that happens to run the sweep.
  *
- * Errors are swallowed — a failed snapshot just means the time-window
- * fallback degrades to "match correlation_id only" for this request.
- * Never break the host's request over a bookkeeping query.
+ * Returns the number of rows emitted. Errors are swallowed.
  */
-export async function takeAuditSnapshot(exec: SqlExecutor): Promise<void> {
+export async function sweepAuditLog(exec: SqlExecutor): Promise<number> {
+  if (deleteDenied) return 0;
   try {
-    const result = (await exec(
-      `SELECT COALESCE(MAX(id), 0) AS max_id FROM ezlogs_audit_log`,
-      [],
-    )) as ExecResult;
-    const rows = extractRows(result);
-    if (rows.length === 0) return;
-    const raw = (rows[0] ?? {}) as { max_id?: unknown };
-    // pg returns bigint columns as strings by default; Drizzle's
-    // `db.execute` shape varies. Coerce defensively.
-    const value =
-      typeof raw.max_id === "bigint"
-        ? raw.max_id
-        : typeof raw.max_id === "number"
-          ? BigInt(raw.max_id)
-          : typeof raw.max_id === "string" && /^\d+$/.test(raw.max_id)
-            ? BigInt(raw.max_id)
-            : null;
-    if (value === null) return;
-    setAuditSnapshot(value);
+    const rows = sortById(
+      extractRows(
+        (await exec(
+          `DELETE FROM ezlogs_audit_log
+            WHERE id IN (
+              SELECT id FROM ezlogs_audit_log
+               WHERE (correlation_id IS NULL
+                      OR captured_at < now() - interval '${ORPHAN_AGE}')
+                 -- Never resurface history: past the retention cap a
+                 -- row is pruned, not sent as new activity.
+                 AND captured_at > now() - interval '${PRUNE_AGE}'
+               ORDER BY id
+               LIMIT ${SWEEP_BATCH}
+               FOR UPDATE SKIP LOCKED)
+            RETURNING ${COLUMNS}`,
+          [],
+        )) as ExecResult,
+      ).map(normalizeAuditRow),
+    );
+    for (const row of rows) {
+      const correlationId = row.correlation_id ?? correlationForTx(row.txid);
+      runWithCorrelation(correlationId, () =>
+        runWithActorScope(() => emitOne(row)),
+      );
+    }
+    return rows.length;
   } catch (err) {
     logger.debug(
-      `takeAuditSnapshot failed: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      `sweepAuditLog failed: ${err instanceof Error ? err.message : String(err)}`,
     );
+    return 0;
+  }
+}
+
+/** Delete rows older than PRUNE_AGE without emitting them. Errors swallowed. */
+export async function pruneAuditLog(exec: SqlExecutor): Promise<void> {
+  if (deleteDenied) return;
+  try {
+    await exec(
+      `DELETE FROM ezlogs_audit_log
+        WHERE id IN (
+          SELECT id FROM ezlogs_audit_log
+           WHERE captured_at < now() - interval '${PRUNE_AGE}'
+           LIMIT ${PRUNE_BATCH})`,
+      [],
+    );
+  } catch (err) {
+    logger.debug(
+      `pruneAuditLog failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Probe whether `ezlogs_audit_log` exists. `true` / `false` when the
+ * query answered, `null` when it failed (database unreachable) — the
+ * caller must not treat a transient failure as "not installed".
+ */
+export async function auditLogInstalled(exec: SqlExecutor): Promise<boolean | null> {
+  try {
+    const rows = extractRows(
+      (await exec(
+        `SELECT to_regclass('public.ezlogs_audit_log') IS NOT NULL AS installed`,
+        [],
+      )) as ExecResult,
+    );
+    const installed = (rows[0] as { installed?: unknown } | undefined)?.installed;
+    return typeof installed === "boolean" ? installed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Warn once when the reader's role can't see the audit log's rows.
+ * ezlogs_audit_log has row-level security with no policies, so a role
+ * that is not the owner (and not superuser / BYPASSRLS) reads 0 rows —
+ * silently — even with GRANTs. Returns true when access looks blocked.
+ * Errors are swallowed (returns false).
+ */
+export async function checkAuditLogAccess(exec: SqlExecutor): Promise<boolean> {
+  try {
+    const rows = extractRows(
+      (await exec(
+        `SELECT current_user AS role
+           FROM pg_class c
+           JOIN pg_roles r ON r.rolname = current_user
+          WHERE c.oid = 'public.ezlogs_audit_log'::regclass
+            AND c.relrowsecurity
+            AND NOT r.rolsuper
+            AND NOT r.rolbypassrls
+            AND NOT pg_has_role(current_user, c.relowner, 'MEMBER')
+            AND NOT EXISTS (SELECT 1 FROM pg_policies p
+                             WHERE p.schemaname = 'public'
+                               AND p.tablename = 'ezlogs_audit_log')`,
+        [],
+      )) as ExecResult,
+    );
+    const role = (rows[0] as { role?: unknown } | undefined)?.role;
+    if (typeof role !== "string") return false;
+    logger.warn(
+      `the database role "${role}" is not the owner of ezlogs_audit_log, which has ` +
+        "row-level security, so the agent reads 0 rows and no DB changes are sent. As the " +
+        `table owner, run: GRANT SELECT, DELETE ON ezlogs_audit_log TO "${role}"; ` +
+        `CREATE POLICY ezlogs_reader ON ezlogs_audit_log TO "${role}" USING (true);`,
+    );
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -245,9 +339,10 @@ export function emitAuditRows(rows: ReadonlyArray<AuditRow>): void {
 }
 
 /**
- * End-of-request entry point. Reads rows for the current correlation
- * id and emits each one. Skips when no correlation is in scope (no
- * way to match rows back to this request) or no exec is supplied.
+ * End-of-request entry point. Claims rows for the current correlation
+ * id and emits each one, then runs the throttled sweep (untagged /
+ * orphaned rows, as their own actions) and prune. Skips when no
+ * correlation is in scope or no exec is supplied.
  *
  * The HTTP capturers call this after the user's handler returns,
  * before they push the HTTP event itself, so DB events arrive
@@ -257,20 +352,38 @@ export async function flushAuditLog(exec: SqlExecutor | null | undefined): Promi
   if (!exec) return;
   const correlationId = currentCorrelation();
   if (!correlationId) return;
-  // currentAuditSnapshot() returns null when the customer hasn't wired
-  // takeAuditSnapshot at request start (e.g. pure-pg stacks where SET
-  // LOCAL does the job). In that case the reader falls back to its
-  // correlation-only filter — no behavioral change vs. earlier versions.
-  const snapshot = currentAuditSnapshot();
-  const rows = await readAuditRows(exec, correlationId, snapshot);
-  if (rows.length === 0) return;
+  const rows = await readAuditRows(exec, correlationId);
+  emitFresh(rows);
 
-  // Within-request dedup. The HTTP capture path can call this multiple
-  // times in one request (middleware page-nav, server-action exit,
-  // generic capture); each call re-reads the same rows by correlation.
-  // The emitted-ids set is per-request scope, so concurrent requests
-  // don't interfere. Null = no scope open = adapter call path; emit
-  // unconditionally so we don't break callers that bypass the wrapper.
+  const now = Date.now();
+  // Prune first, so the sweep never sees rows past the retention cap.
+  if (now - lastPruneAt >= PRUNE_INTERVAL_MS) {
+    lastPruneAt = now;
+    // Awaited: a customer-supplied reader may be a single client, and
+    // overlapping queries on it would interleave. Small batch (indexed
+    // on captured_at) keeps the cost to a few ms on the request path.
+    await pruneAuditLog(exec);
+  }
+  if (now - lastSweepAt >= SWEEP_INTERVAL_MS) {
+    lastSweepAt = now;
+    await sweepAuditLog(exec);
+  }
+}
+
+/** Test-only. */
+export function _resetAuditReaderForTests(): void {
+  lastSweepAt = 0;
+  lastPruneAt = 0;
+  deleteDenied = false;
+  txCorrelation.clear();
+}
+
+function emitFresh(rows: AuditRow[]): void {
+  if (rows.length === 0) return;
+  // Within-request dedup. Claims are DELETEs so a row normally comes
+  // back once, but the SELECT fallback (no DELETE privilege) re-reads
+  // the same rows on every flush of the request. Null = no scope open
+  // = adapter call path; emit unconditionally.
   const emitted = currentEmittedAuditIds();
   if (emitted === null) {
     emitAuditRows(rows);
@@ -282,8 +395,29 @@ export async function flushAuditLog(exec: SqlExecutor | null | undefined): Promi
     emitted.add(row.id);
     fresh.push(row);
   }
-  if (fresh.length === 0) return;
   emitAuditRows(fresh);
+}
+
+function correlationForTx(txid: string | null | undefined): string {
+  if (!txid) return generateCorrelation();
+  let id = txCorrelation.get(txid);
+  if (!id) {
+    if (txCorrelation.size >= 1000) txCorrelation.clear();
+    id = generateCorrelation();
+    txCorrelation.set(txid, id);
+  }
+  return id;
+}
+
+function isPermissionDenied(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === "42501";
+}
+
+function sortById(rows: AuditRow[]): AuditRow[] {
+  // RETURNING order is unspecified; emit in capture order.
+  return rows.sort((a, b) =>
+    a.id.length !== b.id.length ? a.id.length - b.id.length : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+  );
 }
 
 // ---------------------------------------------------------------------
@@ -310,6 +444,7 @@ function emitOne(row: AuditRow): void {
       initialAttributes: newRow,
       modelInstance: newRow,
       displayName: null,
+      timestamp: row.captured_at ?? null,
       _fromTrigger: true,
     });
     return;
@@ -332,6 +467,7 @@ function emitOne(row: AuditRow): void {
       // user just told the system to call this row.
       modelInstance: newRow,
       displayName: null,
+      timestamp: row.captured_at ?? null,
       _fromTrigger: true,
     });
     return;
@@ -352,6 +488,7 @@ function emitOne(row: AuditRow): void {
       initialAttributes: oldRow,
       modelInstance: oldRow,
       displayName: null,
+      timestamp: row.captured_at ?? null,
       _fromTrigger: true,
     });
     return;
@@ -418,6 +555,12 @@ function extractRows(result: ExecResult): ReadonlyArray<unknown> {
   return [];
 }
 
+function toDate(value: unknown): Date | null {
+  if (value == null) return null;
+  const d = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function normalizeAuditRow(raw: unknown): AuditRow {
   const r = (raw ?? {}) as Record<string, unknown>;
   return {
@@ -427,6 +570,9 @@ function normalizeAuditRow(raw: unknown): AuditRow {
     old_row: (r.old_row ?? null) as AuditRow["old_row"],
     new_row: (r.new_row ?? null) as AuditRow["new_row"],
     resource_id: r.resource_id == null ? null : String(r.resource_id),
+    correlation_id: r.correlation_id == null ? null : String(r.correlation_id),
+    txid: r.txid == null ? null : String(r.txid),
+    captured_at: toDate(r.captured_at),
   };
 }
 

@@ -115,9 +115,36 @@ npx ezlogs-nextjs install-triggers
 ```
 
 Migration tables, sessions, and the agent's own audit table are
-skipped automatically. Without this, the agent still captures DB
-writes via per-ORM adapters — you just lose the from-value half of
-each change. See [docs/database.md](./docs/database.md) for trade-offs.
+skipped automatically. The trigger path needs the `pg` package in your
+project (`npm i pg`); if `pg` or the audit table is missing, the agent
+logs one warning at startup and leaves the trigger path off. Without
+triggers, DB writes are captured only if you wire a per-ORM adapter
+(`ezlogsPrisma`, `ezlogsDrizzleLogger`, `wrapSupabase`) — see
+[docs/database.md](./docs/database.md) for trade-offs.
+
+**Recommended setup for Prisma** (plain `new PrismaClient()`, no driver
+adapter): triggers **plus** the extension, which tags each write with
+the request so DB changes join the right action and actor.
+
+```ts
+// lib/prisma.ts
+import { PrismaClient } from "@prisma/client";
+import { ezlogsPrisma } from "ezlogs-nextjs/prisma";
+
+export const prisma = new PrismaClient().$extends(ezlogsPrisma());
+```
+
+Each write inside a captured request runs as
+`$transaction([set_config(correlation id), your query])` (Prisma's
+documented RLS-extension pattern); reads are untouched. Writes inside
+your own `prisma.$transaction(...)` are not tagged: they still show up,
+as separate actions without an actor. Without the extension, a plain
+PrismaClient's writes are never tagged.
+
+**Upgrading from 0.1.x:** run `npx ezlogs-nextjs install-triggers --tables=none`
+**before** deploying the new agent (functions only, no table locks),
+deploy right after, and later re-run `npx ezlogs-nextjs install-triggers`
+at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
 
 ---
 
@@ -170,6 +197,50 @@ The agent is designed to be **invisible** to your application.
 
 Your application's reliability is more important than capturing every
 event. EZLogs is best-effort, not guaranteed delivery.
+
+## Security: what is captured and redacted
+
+- **Request params / Server Action args.** Keys matching a sensitive
+  name are sent as `"[FILTERED]"`: password, token, secret, api key,
+  credential, auth, signature, card number / cvv, ssn, … (substring),
+  and the short words `pin`, `otp`, `totp`, `iban`, `mfa`,
+  `passphrase` (whole word, so `shipping` / `options` are kept).
+  camelCase keys are covered (`apiKey`, `mdmUnlockPin`). Add your own
+  fragments with `excludedGraphqlVariableKeys`.
+- **Unnamed Server Action arguments** (`signIn(email, password)`) have
+  no key to judge by, so every positional string is sent as
+  `"[FILTERED]"` unless it has a strict generated-id shape (integer,
+  UUID, cuid, cuid2, ULID, nanoid — with digit / mixed-case checks, so
+  words like `inactive` stay masked). Numbers and booleans are kept,
+  except Luhn-valid card numbers (15-16 digits always, 13-19 for payment-named actions) and 4-8
+  digit values when the action name has a secret word (`setPin`,
+  `verifyOtp`, `addCard`). Residual risk: a PIN passed to an innocently
+  named action (`update(4821)`) is shown. Object / FormData arguments
+  keep their field names and get the key rule above — pass an object
+  if you want values shown.
+- **Database rows (trigger path).** Columns with sensitive names are
+  removed by the trigger itself, so they are never written to
+  `ezlogs_audit_log`. An update that only touches such columns writes
+  no audit row.
+- **Retention of `ezlogs_audit_log`.** Rows are deleted as soon as the
+  agent sends them. Rows nobody claimed (untagged writes, or tagged
+  rows older than 5 minutes) are sent as their own actions by a
+  throttled sweep. Rows older than 24 hours are deleted unsent. The
+  agent's role needs `DELETE` on the table; without it the agent warns
+  once and you must schedule
+  `DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '24 hours'`.
+- **Access to `ezlogs_audit_log`.** Row-level security is on and all
+  privileges are revoked from `PUBLIC` and Supabase's `anon` /
+  `authenticated`, so the table is not reachable through PostgREST.
+  The installing role (owner) and the trigger are unaffected; a reader
+  connecting as another role gets one startup warning with the GRANT +
+  CREATE POLICY it needs.
+- **Correlation is never guessed.** A DB write is grouped with a
+  request only when it carries that request's id (set by the agent on
+  `pg` connections, or via the `x-correlation-id` header PostgREST
+  exposes for supabase-js). Untagged writes show up as their own
+  actions without an actor. An inbound `x-ezlogs-correlation-id` is
+  honored only in the agent's own format and if under an hour old.
 
 ## Wire-format parity
 
