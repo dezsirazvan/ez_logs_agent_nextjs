@@ -1,20 +1,53 @@
 #!/usr/bin/env node
-// CLI shim for `npx @ezlogs/nextjs install-triggers`.
+// CLI for `npx ezlogs-nextjs install-triggers` (also installed as the
+// `install-triggers` bin).
 //
 // Lazy-imports the dist CJS bundle + `pg` so we don't load either when
-// the customer is just installing the package. `pg` is a devDependency
-// of the agent for tests; in customer projects it's expected to be
-// present transitively (drizzle-orm, prisma, etc. all pull it in) or
-// the customer can install it explicitly. We don't list it as a peer
-// because the only path that needs it is this CLI.
+// the customer is just installing the package. `pg` is resolved from
+// the customer's project first (the directory the command runs in),
+// so it works with npm, pnpm and bun layouts where `pg` isn't hoisted
+// next to this package. We don't list it as a peer because only this
+// CLI and the trigger reader need it.
 //
 // Exits non-zero on any install failure so CI scripts can catch it.
 
+const fs = require("node:fs");
+const path = require("node:path");
+
+// The ezlogs-nextjs this project would load (nearest node_modules up
+// from the working directory, so monorepo hoisting counts), or null.
+function installedFromProject() {
+  for (let dir = process.cwd(); ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, "node_modules", "ezlogs-nextjs");
+    if (fs.existsSync(candidate)) return fs.realpathSync(candidate);
+    if (path.dirname(dir) === dir) return null;
+  }
+}
+
 (async () => {
   const { runInstall, parseArgs } = require("../dist/triggers/index.cjs");
+  const { version } = require("../package.json");
 
   const argv = process.argv.slice(2);
+  const command = argv.find((a) => !a.startsWith("-"));
+  if (command !== undefined && command !== "install-triggers") {
+    console.error(
+      `[ezlogs] Unknown command "${command}". Usage: npx ezlogs-nextjs install-triggers [--help]`,
+    );
+    process.exit(1);
+  }
   const args = parseArgs(argv);
+
+  // `npx` / `bunx` download the package to a temp dir when it isn't
+  // installed in this project — a version that may differ from the one
+  // your app runs, and a place `pg` can't be found from.
+  if (installedFromProject() !== fs.realpathSync(path.join(__dirname, ".."))) {
+    console.warn(
+      `[ezlogs] Running ezlogs-nextjs ${version} from ${path.dirname(__dirname)}, not from ` +
+        "this project's node_modules. Run it from your app's directory after " +
+        "`npm install ezlogs-nextjs` (or `./node_modules/.bin/ezlogs-nextjs install-triggers`).",
+    );
+  }
 
   // For --help / --print / unknown-engine paths the programmatic entry
   // doesn't need a real exec. Forward without a connection.
@@ -25,13 +58,14 @@
 
   let pg;
   try {
-    pg = require("pg");
+    pg = require(require.resolve("pg", { paths: [process.cwd(), __dirname] }));
   } catch {
     console.error(
-      "[ezlogs] install-triggers needs `pg` installed in your project " +
-        "(it ships as a devDependency of the agent itself, not a peer). " +
-        "Run `npm install --save-dev pg` and try again, or run with " +
-        "--print and pipe the SQL into your own tool.",
+      `[ezlogs] install-triggers needs the \`pg\` package, and it was not found from ${process.cwd()}.\n` +
+        "  Install it in your app (the agent also needs it at runtime to read the audit log):\n" +
+        "    npm install pg      (or: pnpm add pg / yarn add pg / bun add pg)\n" +
+        "  then run this command again from your app's directory.\n" +
+        "  Or print the SQL and run it with your own tool: npx ezlogs-nextjs install-triggers --print",
     );
     process.exit(1);
   }

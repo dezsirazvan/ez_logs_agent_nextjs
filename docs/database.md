@@ -159,13 +159,44 @@ Drizzle and raw `pg` users do NOT need any wrappers: the agent's
 existing `patchPgClient` already handles those paths because there's
 no engine boundary between the caller and `pg.Client.prototype.query`.
 
+## What a DB event carries
+
+- **Changes**: from→to per column. json/jsonb columns are diffed per
+  leaf and sent as dotted keys (`settings.integration_testing_mode:
+  false → true`), up to 3 levels deep and 20 leaves per column (5 when
+  the old value is unknown, e.g. the Prisma extension). Secret-shaped
+  string values (JWTs, API keys, private keys, card numbers) are
+  masked.
+- **Soft deletes** (`deleted_at`, `archived_at`, …) are normal changes
+  and are sent (they were ignored before 0.3.0). Only `id`,
+  `created_at` / `createdAt`, `updated_at` / `updatedAt` and Auth.js'
+  `emailVerified` / `expires` are left out.
+- **Timestamps** from `timestamp without time zone` columns (looked up
+  in the catalog once per table) are sent as UTC (`…Z`), which is how
+  Prisma and Drizzle store them. Values Postgres fills in itself
+  (`DEFAULT now()`) use the session time zone: UTC on hosted Postgres;
+  if your server runs another zone those are off by that offset.
+- **Display name** (`display_name`), so updates and deletes can say
+  which record: `displayNameFor` from your config, else the first of
+  `name`, `title`, `number`, `label`, the record's own `<model>_number`
+  (`invoice_number` on `invoices`). Person columns (email, first / last
+  / full name) are never used by default, because the record name is
+  shown on default (redacted) shares and embeds; opt a model in with
+  `displayNameFor`. Sensitive columns are never used.
+- **Join tables** with a composite primary key (`asset_tags`) get one
+  resource id per single-column foreign key, typed by the referenced
+  table, so the event says which records were linked.
+
 ## Fallback: per-ORM adapters
 
-When the trigger path isn't viable (PlanetScale, supabase-js, customers
-who can't run the migration), per-ORM adapters keep working. They produce
+When the trigger path isn't viable (PlanetScale, MySQL, customers who
+can't run the migration), per-ORM adapters keep working. They produce
 `{ operation, model_class }` events without from-value diffs (Prisma /
 Drizzle) or with single-id `resource_id` extraction (supabase-js
-single-eq mutations).
+single-eq mutations). The Prisma extension sends the new value of each
+updated column with no `from` (the old value is unknown, not empty),
+the full returned row on create (DB defaults included) and the deleted
+row on delete.
 
 | ORM | Import |
 |---|---|
@@ -181,6 +212,10 @@ Trade-offs and known limitations are documented in
 Sensitive columns are dropped (not sent at all). Patterns, matched
 case-insensitively against the column name and its snake_case form
 (`apiKey` → `api_key`):
+
+Nested json/jsonb keys get the same check (`settings.api_key` is
+dropped). Request params and job arguments use a key rule too, but
+there matching values are kept as `"[FILTERED]"` instead of dropped.
 
 - substring: `password`, `token`, `secret`, `api_key`, `credit_card`,
   `ssn`, `social_security`, `encrypted`, `private_key`, `public_key`,
@@ -240,5 +275,4 @@ GRANT SELECT, DELETE ON ezlogs_audit_log TO app_reader;
 CREATE POLICY ezlogs_reader ON ezlogs_audit_log TO app_reader USING (true);
 ```
 
-Customers add their own column-name fragments via `excludedTables`
-(coarse-grained) or a future column-level filter (planned).
+Exclude whole tables with `excludedTables`.

@@ -3,6 +3,115 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.3.0] — 2026-11-16
+
+Wire format unchanged: new information rides on existing optional
+fields (`arguments`, `display_name`, `error_message`, `resource_ids`,
+dotted attribute names).
+
+**Upgrade steps:** none from 0.2.x — no SQL changed, so
+`install-triggers` does not need a re-run. From 0.1.x follow the 0.2.0
+steps below. Three behavior changes to know about:
+- Soft-delete columns (`deleted_at`, `deletedAt`, `archived_at`, …) are
+  now sent as changes.
+- Upstash: `wrapQStashClient` now forwards `x-ezlogs-correlation-id`
+  (was `x-correlation-id`); the worker side reads both, so messages
+  queued by 0.2.x still link.
+- A Server Action that returns a failure (`{ success: false, error }`)
+  no longer reports `status_code: 500`; it has no status code, the
+  failure is in `outcome` + `error_message`.
+
+### Fixed — capture gaps
+- **DB writes inside background jobs are captured under the job's
+  action** (the request that enqueued it). `wrapBullWorker` now wraps
+  the Worker's processor (BullMQ 4/5 `processFn`) instead of only
+  listening to `completed` / `failed`; Trigger.dev, Supabase Queues and
+  Upstash Workflow already ran the body in scope. Every job runner now
+  sends the job's audit rows when the job finishes (before, nothing in
+  a job process ever read them), claiming only rows written since the
+  job started, so the enqueuing request keeps its own rows and nothing
+  is sent twice when the reader can't DELETE. Inngest middleware can't
+  wrap the body: `runInsideInngestCorrelation(event, fn)` now does, and
+  flushes. BullMQ control flow (`DelayedError`, `WaitingError`,
+  `WaitingChildrenError`, rate limiting) is re-thrown without a failure
+  event; failures where the processor never ran (`maxStartedAttempts`)
+  are still reported via the `failed` event, once. Verified against
+  real Redis on BullMQ 5.76 and 6.7 (CI runs both): processor swap,
+  abort-signal passing, control-flow errors, rate limiting, sandboxed
+  processors, concurrency isolation. A Worker without BullMQ's
+  `processFn` / `callProcessJob` internals falls back to the 0.2.x
+  `completed` / `failed` listeners (job events only), with one debug
+  log.
+- **Upstash Workflow runs started with `Client.trigger()`** join the
+  request that started them: new `wrapWorkflowClient(client)` sends
+  the correlation id as a user header, which Upstash re-sends on every
+  step. Before, each step delivery became its own URL-titled action.
+  `captureWorkflowRequest` accepts only the agent's id format, at most
+  24 hours old (it runs inside `serve()`, after the QStash signature
+  check; other inbound ids keep the 1-hour limit).
+- **json/jsonb changes** are sent per changed leaf as dotted keys
+  (`settings.integration_testing_mode: false → true`, depth ≤ 3, ≤ 20
+  leaves per column, ≤ 5 when the old value is unknown) instead of
+  being dropped. Sensitive nested keys are dropped; secret-shaped
+  string values (JWTs, API keys, private keys, card numbers) are
+  masked.
+- **Record names on DB events.** `display_name` falls back from `name`
+  / `title` / `number` to `label` and the record's own number column
+  (`invoice_number` on `invoices`), so updates and deletes can name the
+  record. Person columns (email, first / last / full name) are never
+  used: `display_name` becomes the record name on default (redacted)
+  shares and embeds, which mask people. Use `displayNameFor` to opt a
+  model in. Never a sensitive column.
+- **Prisma extension without triggers:** updates no longer send
+  `from: null` (rendered as "changed from empty"); `from` is omitted
+  when unknown. Creates send the returned row (DB defaults such as
+  `status: "draft"`) over `args.data` (columns a `select` left out),
+  deletes the deleted row.
+- **Prisma `@@map` duplicates:** with the trigger path wired, the
+  extension compared the model name (`Project`) with tracked table
+  names (`projects`) and emitted a second, thinner event. It now uses
+  the model's table name from Prisma's runtime data model.
+- **Soft deletes** were ignored, so a soft delete produced no DB event.
+- **Trigger timestamps** from `timestamp without time zone` columns
+  (read from the catalog once per table; `*_at` / `*At` names if the
+  catalog can't be read) are sent as UTC (`…Z`); they were read as
+  local time. Assumes the database session time zone is UTC for values
+  Postgres fills in itself (`DEFAULT now()`), the hosted default.
+- **Join tables** with a composite primary key get one resource id per
+  single-column foreign key (looked up once per table), so the event
+  says which records were linked. Such events carry no `display_name`
+  (a join row's name must not label the linked record). The catalog
+  lookup is retried after a minute if it fails.
+- **HTTP:** a thrown route error reports `status_code: 500` (was
+  missing); `redirect()` / `notFound()` / `forbidden()` thrown from a
+  route or Server Action keep Next's status (307 / 308 / 404 / 403)
+  and are not exceptions; a 4xx/5xx JSON response's `error` /
+  `message` becomes `error_message` (≤ 200 chars; emails, card
+  numbers, JWTs, bearer tokens, private keys and common API key
+  prefixes masked) instead of "HTTP 403"; route params (`[id]`) are
+  merged into `request_params`; Server Actions report `remote_ip`.
+- **Background job `arguments`** (Rails gem parity): the job payload,
+  sanitized with the Rails gem's rules, minus the agent's correlation
+  key.
+
+### Install
+- `npx ezlogs-nextjs install-triggers` / `bunx ezlogs-nextjs …` now run
+  the locally installed package (new `ezlogs-nextjs` bin; the old
+  `install-triggers` bin still works). Before, npx / bunx found no
+  `ezlogs-nextjs` bin locally and downloaded the published package.
+  The CLI warns when it runs from outside your project's
+  `node_modules`, resolves `pg` from your project, and explains how to
+  install it when it is missing.
+- README: "which database setup?" table (Supabase, Prisma, Drizzle,
+  others), `allowInsecureTransport` for `http://` dev servers, dropped
+  vs `"[FILTERED]"` wording.
+
+### Not changed
+- RSC / prefetch / `_next` requests stay excluded. Telemetry routes
+  (analytics, beacon, vitals, heartbeat…) are still captured and left
+  to the server's significance classifier, which already treats them as
+  background.
+
 ## [0.2.0] — 2026-11-16
 
 Wire format unchanged.

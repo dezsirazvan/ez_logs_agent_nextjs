@@ -114,21 +114,27 @@ const txCorrelation = new Map<string, string>();
  * If the reader role may not DELETE, falls back to a plain SELECT
  * (rows then stay until the customer cleans them up) and warns once.
  *
+ * `since` limits the claim to rows written at or after that moment
+ * (a job claims only what it wrote, never the enqueuing request's rows).
+ *
  * Errors are caught and returned as `[]` — a failed audit read must
  * never break the host request.
  */
 export async function readAuditRows(
   exec: SqlExecutor,
   correlationId: string,
+  since: Date | null = null,
 ): Promise<AuditRow[]> {
+  const where = since ? "correlation_id = $1 AND captured_at >= $2" : "correlation_id = $1";
+  const params: unknown[] = since ? [correlationId, since.toISOString()] : [correlationId];
   try {
     if (!deleteDenied) {
       try {
         return sortById(
           extractRows(
             (await exec(
-              `DELETE FROM ezlogs_audit_log WHERE correlation_id = $1 RETURNING ${COLUMNS}`,
-              [correlationId],
+              `DELETE FROM ezlogs_audit_log WHERE ${where} RETURNING ${COLUMNS}`,
+              params,
             )) as ExecResult,
           ).map(normalizeAuditRow),
         );
@@ -143,8 +149,8 @@ export async function readAuditRows(
       }
     }
     const result = (await exec(
-      `SELECT ${COLUMNS} FROM ezlogs_audit_log WHERE correlation_id = $1 ORDER BY id ASC`,
-      [correlationId],
+      `SELECT ${COLUMNS} FROM ezlogs_audit_log WHERE ${where} ORDER BY id ASC`,
+      params,
     )) as ExecResult;
     return extractRows(result).map(normalizeAuditRow);
   } catch (err) {
@@ -186,6 +192,7 @@ export async function sweepAuditLog(exec: SqlExecutor): Promise<number> {
         )) as ExecResult,
       ).map(normalizeAuditRow),
     );
+    await loadTableMeta(exec, rows);
     for (const row of rows) {
       const correlationId = row.correlation_id ?? correlationForTx(row.txid);
       runWithCorrelation(correlationId, () =>
@@ -348,11 +355,15 @@ export function emitAuditRows(rows: ReadonlyArray<AuditRow>): void {
  * before they push the HTTP event itself, so DB events arrive
  * grouped under the same correlation as the HTTP card.
  */
-export async function flushAuditLog(exec: SqlExecutor | null | undefined): Promise<void> {
+export async function flushAuditLog(
+  exec: SqlExecutor | null | undefined,
+  options: { since?: Date | null } = {},
+): Promise<void> {
   if (!exec) return;
   const correlationId = currentCorrelation();
   if (!correlationId) return;
-  const rows = await readAuditRows(exec, correlationId);
+  const rows = await readAuditRows(exec, correlationId, options.since ?? null);
+  await loadTableMeta(exec, rows);
   emitFresh(rows);
 
   const now = Date.now();
@@ -376,6 +387,98 @@ export function _resetAuditReaderForTests(): void {
   lastPruneAt = 0;
   deleteDenied = false;
   txCorrelation.clear();
+  tableMeta.clear();
+  metaRetryAt = 0;
+}
+
+// Per-table column facts, read once per table from the catalog:
+//   - single-column foreign keys, so rows of tables without a primary
+//     key value (join tables) still name the records they link;
+//   - `timestamp without time zone` columns, whose values get `Z`.
+interface TableMeta {
+  fks: ReadonlyArray<{ column: string; refTable: string }>;
+  naiveTimestamps: ReadonlySet<string>;
+}
+const tableMeta = new Map<string, TableMeta>();
+// After a failed lookup, wait before asking the catalog again.
+const META_RETRY_MS = 60_000;
+let metaRetryAt = 0;
+
+async function loadTableMeta(exec: SqlExecutor, rows: ReadonlyArray<AuditRow>): Promise<void> {
+  if (Date.now() < metaRetryAt) return;
+  const tables = [
+    ...new Set(rows.map((r) => r.table_name).filter((t) => t !== "" && !t.includes(",") && !tableMeta.has(t))),
+  ];
+  if (tables.length === 0) return;
+  // Table names travel as one comma-joined text param (no array
+  // parameter: not every driver serializes JS arrays).
+  const list = tables.join(",");
+  try {
+    const fkRows = extractRows(
+      (await exec(
+        `SELECT cl.relname AS table_name, a.attname AS column_name, rf.relname AS ref_table
+           FROM pg_constraint c
+           JOIN pg_class cl ON cl.oid = c.conrelid
+           JOIN pg_namespace n ON n.oid = cl.relnamespace
+           JOIN pg_class rf ON rf.oid = c.confrelid
+           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+          WHERE c.contype = 'f'
+            AND n.nspname = 'public'
+            AND array_length(c.conkey, 1) = 1
+            AND cl.relname = ANY(string_to_array($1, ','))
+          ORDER BY cl.relname, a.attnum`,
+        [list],
+      )) as ExecResult,
+    );
+    const tsRows = extractRows(
+      (await exec(
+        `SELECT cl.relname AS table_name, a.attname AS column_name
+           FROM pg_attribute a
+           JOIN pg_class cl ON cl.oid = a.attrelid
+           JOIN pg_namespace n ON n.oid = cl.relnamespace
+          WHERE n.nspname = 'public'
+            AND cl.relname = ANY(string_to_array($1, ','))
+            AND a.attnum > 0
+            AND NOT a.attisdropped
+            AND a.atttypid = 'timestamp'::regtype`,
+        [list],
+      )) as ExecResult,
+    );
+    const fks = new Map<string, Array<{ column: string; refTable: string }>>();
+    for (const raw of fkRows) {
+      const r = (raw ?? {}) as { table_name?: unknown; column_name?: unknown; ref_table?: unknown };
+      if (typeof r.table_name !== "string" || typeof r.column_name !== "string" || typeof r.ref_table !== "string") {
+        continue;
+      }
+      fks.set(r.table_name, [...(fks.get(r.table_name) ?? []), { column: r.column_name, refTable: r.ref_table }]);
+    }
+    const timestamps = new Map<string, Set<string>>();
+    for (const raw of tsRows) {
+      const r = (raw ?? {}) as { table_name?: unknown; column_name?: unknown };
+      if (typeof r.table_name !== "string" || typeof r.column_name !== "string") continue;
+      timestamps.set(r.table_name, (timestamps.get(r.table_name) ?? new Set()).add(r.column_name));
+    }
+    for (const table of tables) {
+      tableMeta.set(table, { fks: fks.get(table) ?? [], naiveTimestamps: timestamps.get(table) ?? new Set() });
+    }
+  } catch (err) {
+    metaRetryAt = Date.now() + META_RETRY_MS;
+    logger.debug(`table metadata lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function relatedResourceIds(
+  table: string,
+  row: Record<string, unknown>,
+): Array<{ resource_type: string; resource_id: string }> {
+  const out: Array<{ resource_type: string; resource_id: string }> = [];
+  for (const fk of tableMeta.get(table)?.fks ?? []) {
+    const value = row[fk.column];
+    if (typeof value === "string" || typeof value === "number") {
+      out.push({ resource_type: fk.refTable, resource_id: String(value) });
+    }
+  }
+  return out;
 }
 
 function emitFresh(rows: AuditRow[]): void {
@@ -428,8 +531,11 @@ function emitOne(row: AuditRow): void {
   const op = mapOp(row.op);
   if (!op) return;
 
-  const oldRow = coerceJsonb(row.old_row);
-  const newRow = coerceJsonb(row.new_row);
+  const naive = tableMeta.get(row.table_name)?.naiveTimestamps ?? null;
+  const oldRow = withUtcTimestamps(coerceJsonb(row.old_row), naive);
+  const newRow = withUtcTimestamps(coerceJsonb(row.new_row), naive);
+  const related =
+    row.resource_id === null ? relatedResourceIds(row.table_name, newRow ?? oldRow ?? {}) : null;
 
   // For creates we ship the full new row as initial_attributes;
   // shared.ts strips ignored fields + sensitive keys. For updates
@@ -445,6 +551,7 @@ function emitOne(row: AuditRow): void {
       modelInstance: newRow,
       displayName: null,
       timestamp: row.captured_at ?? null,
+      relatedResourceIds: related,
       _fromTrigger: true,
     });
     return;
@@ -468,6 +575,7 @@ function emitOne(row: AuditRow): void {
       modelInstance: newRow,
       displayName: null,
       timestamp: row.captured_at ?? null,
+      relatedResourceIds: related,
       _fromTrigger: true,
     });
     return;
@@ -489,10 +597,34 @@ function emitOne(row: AuditRow): void {
       modelInstance: oldRow,
       displayName: null,
       timestamp: row.captured_at ?? null,
+      relatedResourceIds: related,
       _fromTrigger: true,
     });
     return;
   }
+}
+
+// `to_jsonb` renders `timestamp without time zone` with no zone
+// ("2026-11-16T10:12:34.921"). Prisma and Drizzle write those columns
+// in UTC, so they are marked UTC. Assumption: values written by the
+// database itself (`DEFAULT now()`) are in the session time zone, which
+// is UTC on hosted Postgres (Supabase, Neon, RDS defaults); a non-UTC
+// server time zone shifts those. Only columns the catalog reports as
+// `timestamp` are touched; without catalog info, only `*_at` / `*At`
+// columns. timestamptz values, dates and text pass through.
+const NAIVE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+function withUtcTimestamps(
+  row: Record<string, unknown> | null,
+  naiveColumns: ReadonlySet<string> | null,
+): Record<string, unknown> | null {
+  if (!row) return row;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    const isNaiveColumn = naiveColumns ? naiveColumns.has(key) : /(_at|At)$/.test(key);
+    out[key] = isNaiveColumn && typeof value === "string" && NAIVE_TIMESTAMP.test(value) ? `${value}Z` : value;
+  }
+  return out;
 }
 
 function mapOp(op: AuditRow["op"]): DbOperation | null {

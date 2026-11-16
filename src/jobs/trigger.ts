@@ -25,15 +25,8 @@
 //   retry_count  -> ctx.attempt.number - 1 (Trigger uses 1-indexed attempts)
 
 import { logger } from "../logger.js";
-import {
-  emitJobEvent,
-  extractCorrelationFromPayload,
-} from "./shared.js";
-import {
-  current as currentCorrelation,
-  generate as generateCorrelation,
-  runWithCorrelation,
-} from "../correlation.js";
+import { extractCorrelationFromPayload, runJobWithCapture } from "./shared.js";
+import { current as currentCorrelation } from "../correlation.js";
 
 // Loose structural type for the `tasks` object — we don't take a
 // hard dep on @trigger.dev/sdk/v3 because its types vary across
@@ -97,44 +90,19 @@ async function runWithEzlogsCapture(
   const attemptNumber = ctx.attempt?.number ?? 1;
   const retryCount = Math.max(0, attemptNumber - 1);
 
-  const correlationId =
-    extractCorrelationFromPayload(params.payload) ?? generateCorrelation();
-
-  return runWithCorrelation(correlationId, async () => {
-    const startedAt = new Date();
-    const startMs = startedAt.getTime();
-    try {
-      const result = await params.next();
-      emitJobEvent({
-        jobClass: taskId,
-        jobId: runId,
-        queue: queueName,
-        retryCount,
-        correlationId,
-        outcome: "success",
-        durationMs: Date.now() - startMs,
-        startedAt,
-      });
-      return result;
-    } catch (error) {
-      const message =
-        error instanceof Error
-          ? `${error.name}: ${error.message}`
-          : String(error);
-      emitJobEvent({
-        jobClass: taskId,
-        jobId: runId,
-        queue: queueName,
-        retryCount,
-        correlationId,
-        outcome: "failure",
-        errorMessage: message,
-        durationMs: Date.now() - startMs,
-        startedAt,
-      });
-      throw error;
-    }
-  });
+  // The task body runs inside the job's correlation scope; its DB
+  // writes are emitted under the same action when it finishes.
+  return runJobWithCapture(
+    {
+      jobClass: taskId,
+      jobId: runId,
+      queue: queueName,
+      retryCount,
+      correlationId: extractCorrelationFromPayload(params.payload),
+      payload: params.payload,
+    },
+    () => params.next(),
+  );
 }
 
 /**

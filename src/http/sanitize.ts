@@ -154,6 +154,60 @@ const FRAMEWORK_INTERNAL_KEYS = new Set([
   "_next",
 ]);
 
+/** Digits passing the Luhn checksum (card numbers do). */
+export function passesLuhn(digits: string): boolean {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i += 1) {
+    let d = Number(digits[digits.length - 1 - i]);
+    if (i % 2 === 1) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+// Secrets recognizable by their shape inside free text: JWTs, PEM
+// private keys, well-known API key prefixes (Stripe, GitHub, Slack,
+// AWS, OpenAI/Anthropic-style `sk-`), bearer / basic credentials.
+const SECRET_TEXT_PATTERNS: readonly RegExp[] = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+  /\beyJ[\w-]+\.[\w-]+\.[\w-]+/g,
+  /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]+/g,
+  /\bsk-[A-Za-z0-9_-]{16,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bxox[abposr]-[A-Za-z0-9-]+/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+];
+const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/**
+ * Mask secrets inside free text (error messages, json string values):
+ * the shapes above, `Bearer` / `Basic` credentials and Luhn-valid
+ * 15-16 digit card numbers become `"[FILTERED]"`; with `emails`, email
+ * addresses too.
+ */
+export function scrubSecretsInText(text: string, options: { emails?: boolean } = {}): string {
+  let out = text;
+  for (const pattern of SECRET_TEXT_PATTERNS) out = out.replace(pattern, "[FILTERED]");
+  out = out
+    .replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, "$1 [FILTERED]")
+    .replace(/\b\d(?:[ -]?\d){12,18}\b/g, (match) => {
+      const digits = match.replace(/[ -]/g, "");
+      return (digits.length === 15 || digits.length === 16) && passesLuhn(digits) ? "[FILTERED]" : match;
+    });
+  return options.emails ? out.replace(EMAIL, "[FILTERED]") : out;
+}
+
+/**
+ * Job arguments — port of the Rails gem's `Sanitizer.sanitize_args`:
+ * a positional list, same key redaction, depth and array rules.
+ */
+export function sanitizeArgs(args: unknown[], userPatterns: readonly string[] = []): unknown {
+  return sanitizeArrayValue(args, 0, userPatterns);
+}
+
 function sanitizeValue(
   key: string,
   value: unknown,

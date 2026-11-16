@@ -26,6 +26,8 @@ import {
   runWithCorrelation,
 } from "../correlation.js";
 import { configuration } from "../configuration.js";
+import { sanitizeArgs } from "../http/sanitize.js";
+import { flushAuditLog } from "../triggers/reader.js";
 
 /**
  * Stable key for embedding the correlation id in a job payload. All
@@ -42,6 +44,8 @@ export interface JobSourceData {
   queue?: string | null;
   /** 0-indexed retry count. Sidekiq's "retry_count": 0, 1, 2, ... */
   retry_count?: number | null;
+  /** Sanitized job payload (Rails gem `arguments`). */
+  arguments?: unknown;
 }
 
 export interface JobEmitInput {
@@ -55,6 +59,8 @@ export interface JobEmitInput {
   errorMessage?: string | null;
   durationMs?: number | null;
   startedAt: Date;
+  /** Raw job payload; sanitized here before it ships as `arguments`. */
+  payload?: unknown;
 }
 
 /**
@@ -72,6 +78,7 @@ export function emitJobEvent(input: JobEmitInput): void {
       job_id: input.jobId ?? null,
       queue: input.queue ?? null,
       retry_count: input.retryCount ?? null,
+      arguments: jobArguments(input.payload),
     });
 
     const event = buildEvent({
@@ -107,6 +114,14 @@ export async function runJobWithCapture<T>(
     queue?: string | null;
     retryCount?: number | null;
     correlationId: string | null;
+    /** Raw job payload, shipped sanitized as `arguments`. */
+    payload?: unknown;
+    /**
+     * Runner control flow thrown through the body (BullMQ's
+     * `DelayedError`, `WaitingChildrenError`…): re-thrown with no job
+     * event, since the job did not finish.
+     */
+    isControlFlow?: (error: unknown) => boolean;
   },
   work: () => Promise<T>,
 ): Promise<T> {
@@ -124,9 +139,11 @@ export async function runJobWithCapture<T>(
       retryCount: meta.retryCount ?? null,
       correlationId,
       startedAt,
+      payload: meta.payload,
     };
     try {
       const result = await work();
+      await flushJobAuditLog(startedAt);
       emitJobEvent({
         ...baseMeta,
         outcome: "success",
@@ -138,6 +155,8 @@ export async function runJobWithCapture<T>(
         error instanceof Error
           ? `${error.name}: ${error.message}`
           : String(error);
+      await flushJobAuditLog(startedAt);
+      if (meta.isControlFlow?.(error)) throw error;
       emitJobEvent({
         ...baseMeta,
         outcome: "failure",
@@ -147,6 +166,45 @@ export async function runJobWithCapture<T>(
       throw error;
     }
   });
+}
+
+// Clock skew allowance between the app and the database when matching
+// audit rows (`captured_at`, database clock) to a job's start (app clock).
+const JOB_FLUSH_SKEW_MS = 500;
+
+/**
+ * Emit the trigger audit rows the job body wrote (tagged with the job's
+ * correlation id because the body ran inside its scope). Only rows
+ * written since the job started: the enqueuing request (same
+ * correlation id) emits its own rows, so they are neither taken from it
+ * nor sent twice when the reader can't DELETE. Never throws.
+ */
+export async function flushJobAuditLog(startedAt: Date): Promise<void> {
+  try {
+    await flushAuditLog(configuration().databaseReader, {
+      since: new Date(startedAt.getTime() - JOB_FLUSH_SKEW_MS),
+    });
+  } catch (error) {
+    logger.debug(`job audit flush failed: ${describeError(error)}`);
+  }
+}
+
+/**
+ * Sanitized `arguments` for a job payload (Rails `arguments` field):
+ * an object keeps its keys (minus the agent's correlation key), a list
+ * stays positional. Same redaction as the Rails gem.
+ */
+function jobArguments(payload: unknown): unknown {
+  if (payload === null || payload === undefined) return null;
+  const patterns = configuration().excludedGraphqlVariableKeys;
+  if (Array.isArray(payload)) return payload.length === 0 ? null : sanitizeArgs(payload, patterns);
+  if (typeof payload === "object" && Object.getPrototypeOf(payload) === Object.prototype) {
+    const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+    delete rest[CORRELATION_PAYLOAD_KEY];
+    if (Object.keys(rest).length === 0) return null;
+    return (sanitizeArgs([rest], patterns) as unknown[])[0];
+  }
+  return sanitizeArgs([payload], patterns);
 }
 
 /**

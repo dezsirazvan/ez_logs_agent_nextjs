@@ -148,6 +148,7 @@ export async function captureQueueMessage<T>(
       queue: meta.queueName,
       retryCount: meta.readCount ?? null,
       correlationId,
+      payload: meta.message,
     },
     work,
   );

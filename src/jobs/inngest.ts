@@ -28,6 +28,7 @@ import { logger } from "../logger.js";
 import {
   emitJobEvent,
   extractCorrelationFromPayload,
+  flushJobAuditLog,
 } from "./shared.js";
 import {
   current as currentCorrelation,
@@ -68,6 +69,7 @@ export function ezlogsInngestMiddleware(): unknown {
           const runId = args.ctx?.runId ?? null;
           const attempt = typeof args.ctx?.attempt === "number" ? args.ctx.attempt : 0;
           const eventName = args.ctx?.event?.name ?? null;
+          const eventData = args.ctx?.event?.data;
           const correlationId =
             extractCorrelationFromPayload(args.ctx?.event?.data) ?? generateCorrelation();
           const startedAt = new Date();
@@ -100,6 +102,7 @@ export function ezlogsInngestMiddleware(): unknown {
                   errorMessage,
                   durationMs: Date.now() - startMs,
                   startedAt,
+                  payload: eventData,
                 });
               } catch (error) {
                 logger.debug(`inngest capture failed: ${describeError(error)}`);
@@ -146,19 +149,28 @@ export function ezlogsInngestMiddleware(): unknown {
 }
 
 /**
- * Helper for users who need to run downstream code inside the
- * correlation scope of an Inngest run (e.g. arbitrary work outside
- * the agent's automatic capture). Wraps a callback in
- * runWithCorrelation using the id extracted from an event's data.
+ * Run an Inngest function body (or a step) inside the run's
+ * correlation scope, so its DB writes are tagged and emitted under the
+ * action that sent the event. Inngest middleware can't wrap the body
+ * itself, so without this the job event is captured but the body's DB
+ * writes ship as their own actions:
  *
- * Most users won't need this — the middleware handles the common case.
+ *   inngest.createFunction({ id: "send-invoice" }, { event: "invoice/created" },
+ *     ({ event, step }) => runInsideInngestCorrelation(event, async () => { ... }))
  */
 export async function runInsideInngestCorrelation<T>(
   event: { data?: unknown } | undefined,
   callback: () => Promise<T>,
 ): Promise<T> {
   const id = extractCorrelationFromPayload(event?.data) ?? generateCorrelation();
-  return runWithCorrelation(id, callback);
+  const startedAt = new Date();
+  return runWithCorrelation(id, async () => {
+    try {
+      return await callback();
+    } finally {
+      await flushJobAuditLog(startedAt);
+    }
+  });
 }
 
 function formatError(error: unknown): string {

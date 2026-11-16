@@ -6,21 +6,34 @@
 // adapter reclassifies them as background_job events and propagates
 // correlation through the QStash header chain.
 //
-// Two surfaces:
+// Three surfaces:
 //
 // 1. wrapQStashClient(client):
 //    Patches `client.publishJSON` (and `publish`) so each outbound
 //    request seeds the current correlation id under `headers["upstash-
-//    forward-x-correlation-id"]`. QStash forwards headers prefixed
-//    with `Upstash-Forward-` to the destination, so our captured
-//    handler sees `x-correlation-id` on the inbound request.
+//    forward-x-ezlogs-correlation-id"]`. QStash forwards headers
+//    prefixed with `Upstash-Forward-` to the destination, so our
+//    captured handler sees `x-ezlogs-correlation-id` on the inbound
+//    request.
 //
 //    Use:
 //      import { Client } from "@upstash/qstash"
 //      import { wrapQStashClient } from "ezlogs-nextjs/upstash-workflow"
 //      const qstash = wrapQStashClient(new Client({ token }))
 //
-// 2. captureWorkflowRequest({ request, workflowName, ...}, work):
+// 2. wrapWorkflowClient(client):
+//    Patches `@upstash/workflow`'s `Client.trigger()` so the workflow
+//    run carries the current correlation id as a user header. Upstash
+//    Workflow re-sends user headers on every step delivery, so each
+//    step joins the action of the request that started the run
+//    (instead of one URL-titled action per step).
+//
+//    Use:
+//      import { Client } from "@upstash/workflow"
+//      import { wrapWorkflowClient } from "ezlogs-nextjs/upstash-workflow"
+//      const workflows = wrapWorkflowClient(new Client({ token }))
+//
+// 3. captureWorkflowRequest({ request, workflowName, ...}, work):
 //    Worker-side wrapper called inside a Next.js route that's
 //    serving an Upstash Workflow step. Reads correlation back from
 //    the request headers (or generates a new id), scopes the work,
@@ -50,6 +63,26 @@ import { current as currentCorrelation } from "../correlation.js";
 
 // QStash forwards any header with this prefix to the destination URL.
 const FORWARD_PREFIX = "upstash-forward-";
+// The header every agent entry point (captureRoute, captureServerAction,
+// middleware) reads the inbound correlation id from.
+const CORRELATION_HEADER = "x-ezlogs-correlation-id";
+// Pre-0.3.0 QStash stamping used this one; still read for queued messages.
+const LEGACY_CORRELATION_HEADER = "x-correlation-id";
+// Agent id format, at most 24 hours old (other inbound ids: 1 hour). A
+// workflow step can run hours after the run started (sleeps, retries);
+// `captureWorkflowRequest` runs inside `serve()`, which has already
+// verified the QStash signature, so the longer window only applies to
+// signed step deliveries.
+const AGENT_CORRELATION_ID = /^ezl_(\d{13})_[0-9a-f]{8}$/;
+const STEP_ID_MAX_AGE_MS = 24 * 60 * 60_000;
+const STEP_ID_MAX_SKEW_MS = 5 * 60_000;
+
+function isAcceptableStepId(value: string): boolean {
+  const match = AGENT_CORRELATION_ID.exec(value);
+  if (!match) return false;
+  const age = Date.now() - Number(match[1]);
+  return age <= STEP_ID_MAX_AGE_MS && age >= -STEP_ID_MAX_SKEW_MS;
+}
 
 interface QStashClientLike {
   publishJSON?: (request: QStashPublishRequest) => Promise<unknown>;
@@ -64,6 +97,48 @@ interface QStashPublishRequest {
 }
 
 const WRAPPED_FLAG = "__ezlogsUpstashQStashWrapped";
+const WORKFLOW_WRAPPED_FLAG = "__ezlogsUpstashWorkflowWrapped";
+
+interface WorkflowClientLike {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  trigger?: Function;
+}
+
+interface WorkflowTriggerOptions {
+  headers?: Record<string, string>;
+  [key: string]: unknown;
+}
+
+/**
+ * Patches `trigger` on the user's `@upstash/workflow` Client so each
+ * started run (single or batch) carries the current correlation id to
+ * every step. A caller-supplied `x-ezlogs-correlation-id` header wins.
+ * No-op outside a captured request. Idempotent.
+ */
+export function wrapWorkflowClient<T extends WorkflowClientLike>(client: T): T {
+  if ((client as unknown as Record<string, unknown>)[WORKFLOW_WRAPPED_FLAG]) return client;
+  if (typeof client.trigger === "function") {
+    const original = client.trigger.bind(client) as (params: unknown) => unknown;
+    (client as { trigger?: unknown }).trigger = (params: unknown) =>
+      original(Array.isArray(params) ? params.map(stampTriggerOptions) : stampTriggerOptions(params));
+  }
+  Object.defineProperty(client, WORKFLOW_WRAPPED_FLAG, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+  });
+  return client;
+}
+
+function stampTriggerOptions(options: unknown): unknown {
+  const id = currentCorrelation();
+  if (!id || !options || typeof options !== "object") return options;
+  const opts = options as WorkflowTriggerOptions;
+  const headers = { ...(opts.headers ?? {}) };
+  if (Object.keys(headers).some((k) => k.toLowerCase() === CORRELATION_HEADER)) return options;
+  headers[CORRELATION_HEADER] = id;
+  return { ...opts, headers };
+}
 
 /**
  * Patches `publishJSON` and `publish` on the user's QStash client so
@@ -104,7 +179,7 @@ function stampPublishRequest(
   const id = currentCorrelation();
   if (!id) return request;
 
-  const headerKey = `${FORWARD_PREFIX}x-correlation-id`;
+  const headerKey = `${FORWARD_PREFIX}${CORRELATION_HEADER}`;
   const headers: Record<string, string> = { ...(request.headers ?? {}) };
   // Caller-supplied id wins.
   const lower = Object.keys(headers).reduce<Record<string, string>>(
@@ -127,7 +202,11 @@ function stampPublishRequest(
  * Reads runtime metadata from Upstash's request headers:
  *   - Upstash-Workflow-Runid     -> job_id
  *   - Upstash-Retried            -> retry_count
- *   - the wrapped X-Correlation-ID (forwarded by QStash) -> correlation_id
+ *   - x-ezlogs-correlation-id (stamped by wrapWorkflowClient /
+ *     wrapQStashClient, agent id format only) -> correlation_id
+ *
+ * DB writes inside `work` are tagged with that correlation id and
+ * emitted when it finishes, so they join the same action.
  *
  * Returns the result of `work()`. Re-throws on failure so the user's
  * Workflow retry / failure-routing semantics still work.
@@ -199,14 +278,16 @@ function readHeader(headers: Headers, name: string): string | null {
 }
 
 function readCorrelationFromHeaders(headers: Headers): string | null {
-  // QStash forwards `Upstash-Forward-X-Correlation-ID` to the
-  // destination, where it lands as either `x-correlation-id` (Upstash
-  // strips the prefix) or — depending on configuration — the
-  // prefixed name itself. We try both for safety.
-  return (
-    readHeader(headers, "x-correlation-id") ??
-    readHeader(headers, "upstash-forward-x-correlation-id")
-  );
+  // QStash strips the `Upstash-Forward-` prefix on delivery; the
+  // prefixed names are read too for safety. Only the agent's own id
+  // format is honored (anything else would let a caller pick which
+  // action its writes join).
+  for (const name of [CORRELATION_HEADER, LEGACY_CORRELATION_HEADER]) {
+    const value =
+      readHeader(headers, name) ?? readHeader(headers, `${FORWARD_PREFIX}${name}`);
+    if (value && isAcceptableStepId(value)) return value;
+  }
+  return null;
 }
 
 function parseRetried(value: string | null): number | null {

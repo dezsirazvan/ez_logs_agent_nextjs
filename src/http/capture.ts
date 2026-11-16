@@ -36,6 +36,7 @@ import {
   runWithCorrelation,
 } from "../correlation.js";
 import { flushAuditLog } from "../triggers/reader.js";
+import { passesLuhn, scrubSecretsInText } from "./sanitize.js";
 import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
 import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
@@ -112,6 +113,10 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
 
       const snapshot = await snapshotRequest(request as Request);
       if (snapshot === null) return Promise.resolve(runHandler(...args)); // excluded
+      // App Router passes `{ params }` (a Promise since Next 15) as the
+      // second argument: `[id]` from the route template, like Rails'
+      // path params in `filtered_parameters`.
+      snapshot.rawParams = mergeRouteParams(snapshot.rawParams, await readRouteParams(args[1]));
 
       // Reuse the correlation id seeded by middleware (or upstream) when
       // present; otherwise derive one from a platform-injected request id
@@ -132,6 +137,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
           let response: Response | null = null;
           let exception: Error | null = null;
           let graphqlErrorMessage: string | null = null;
+          let responseErrorMessage: string | null = null;
 
           try {
             response = await Promise.resolve(runHandler(...args));
@@ -140,9 +146,20 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             if (snapshot.graphqlBody !== null && response.status === 200) {
               graphqlErrorMessage = await readGraphqlErrors(response);
             }
+            responseErrorMessage = await readResponseErrorMessage(response);
             return response;
           } catch (e) {
+            // redirect() / notFound() / permanentRedirect() thrown from a
+            // route: control flow, answered with its own status.
+            const controlStatus = nextControlFlowStatus(e);
+            if (controlStatus !== null) {
+              statusCode = controlStatus;
+              throw e;
+            }
             exception = e instanceof Error ? e : new Error(String(e));
+            // Next.js answers an uncaught route error with a 500 (Rails
+            // reports the same for an exception).
+            statusCode = 500;
             throw e;
           } finally {
             // Last chance to populate the actor — at this point any
@@ -156,6 +173,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
               statusCode,
               exception,
               graphqlErrorMessage,
+              responseErrorMessage,
               durationMs: Date.now() - startMs,
               startedAt: new Date(startMs),
             });
@@ -607,7 +625,10 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
             const failure = classifyServerActionResult(result);
             await emitServerActionEvent({
               actionName,
-              statusCode: failure ? 500 : 200,
+              // A returned failure (`{ success: false, error }`) is a
+              // handled refusal, not a crash: no HTTP status is
+              // invented; outcome + error_message carry it.
+              statusCode: failure ? null : 200,
               exception: failure ? new Error(failure.errorMessage) : null,
               durationMs: Date.now() - startMs,
               startedAt,
@@ -623,9 +644,12 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
               // Actor was resolved up-front; just collect any
               // late-bound Supabase actor as a final fallback.
               await maybeExtractSupabaseActor();
+              const controlStatus = nextControlFlowStatus(e) ?? 200;
               await emitServerActionEvent({
                 actionName,
-                statusCode: 200,
+                // redirect() is a success; notFound() / forbidden()
+                // keep their 4xx.
+                statusCode: controlStatus >= 400 ? controlStatus : 200,
                 exception: null,
                 durationMs: Date.now() - startMs,
                 startedAt,
@@ -951,15 +975,36 @@ function conformErrorMessage(result: Record<string, unknown>): string {
  * shows up as a failed Action card.
  */
 function isNextControlFlowError(error: unknown): boolean {
-  if (!error || typeof error !== "object") return false;
+  return nextControlFlowStatus(error) !== null;
+}
+
+/**
+ * The HTTP status Next.js answers a control-flow throw with, or null
+ * for a real error. Digests: `NEXT_REDIRECT;<type>;<url>;<status>;`
+ * (307 / 308), `NEXT_NOT_FOUND` (Next 14) and
+ * `NEXT_HTTP_ERROR_FALLBACK;<status>` (Next 15: notFound / forbidden /
+ * unauthorized).
+ */
+function nextControlFlowStatus(error: unknown): number | null {
+  if (!error || typeof error !== "object") return null;
   const digest = (error as { digest?: unknown }).digest;
-  if (typeof digest !== "string") return false;
-  return digest.startsWith("NEXT_REDIRECT") || digest.startsWith("NEXT_NOT_FOUND");
+  if (typeof digest !== "string") return null;
+  const parts = digest.split(";");
+  if (parts[0] === "NEXT_REDIRECT") {
+    const status = Number(parts[3]);
+    return status >= 300 && status < 400 ? status : 307;
+  }
+  if (parts[0] === "NEXT_NOT_FOUND") return 404;
+  if (parts[0] === "NEXT_HTTP_ERROR_FALLBACK") {
+    const status = Number(parts[1]);
+    return status >= 400 && status < 500 ? status : 404;
+  }
+  return null;
 }
 
 async function emitServerActionEvent(input: {
   actionName: string;
-  statusCode: number;
+  statusCode: number | null;
   exception: Error | null;
   durationMs: number;
   startedAt: Date;
@@ -1006,7 +1051,7 @@ async function emitServerActionEvent(input: {
       rawParams: requestParams,
       serverActionName: input.actionName,
       userAgent,
-      remoteIp: null,
+      remoteIp: extractRemoteIp(await readNextHeadersAsAdapter()),
       contentType: null,
       excludedVariableKeys: configuration().excludedGraphqlVariableKeys,
     });
@@ -1162,20 +1207,6 @@ function actionWords(name: string): string[] {
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
-}
-
-/** Digits passing the Luhn checksum (card numbers do). */
-function passesLuhn(digits: string): boolean {
-  let sum = 0;
-  for (let i = 0; i < digits.length; i += 1) {
-    let d = Number(digits[digits.length - 1 - i]);
-    if (i % 2 === 1) {
-      d *= 2;
-      if (d > 9) d -= 9;
-    }
-    sum += d;
-  }
-  return sum % 10 === 0;
 }
 
 /**
@@ -1706,6 +1737,8 @@ interface EmitInput {
   statusCode: number | null;
   exception: Error | null;
   graphqlErrorMessage: string | null;
+  /** `error` / `message` from a JSON error response body. */
+  responseErrorMessage?: string | null;
   durationMs: number;
   startedAt: Date;
 }
@@ -1761,6 +1794,7 @@ async function emitEvent(input: EmitInput): Promise<void> {
       input.statusCode,
       input.exception,
       input.graphqlErrorMessage,
+      input.responseErrorMessage ?? null,
     );
 
     const contextValue = buildContext();
@@ -1857,7 +1891,7 @@ function isExcludedPath(path: string, method?: string | null): boolean {
   return false;
 }
 
-function extractRemoteIp(headers: Headers): string | null {
+function extractRemoteIp(headers: { get(name: string): string | null }): string | null {
   const xff = headers.get("x-forwarded-for");
   if (xff) return xff.split(",")[0]?.trim() ?? null;
   return headers.get("x-real-ip") ?? null;
@@ -1874,6 +1908,54 @@ function safeClone(request: Request): Request | null {
 function safeJsonParse(text: string): unknown {
   try {
     return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+async function readRouteParams(routeContext: unknown): Promise<Record<string, unknown> | null> {
+  try {
+    const params: unknown = await (routeContext as { params?: unknown } | null | undefined)?.params;
+    if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+    return Object.keys(params).length > 0 ? (params as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeRouteParams(
+  rawParams: unknown,
+  routeParams: Record<string, unknown> | null,
+): unknown {
+  if (!routeParams) return rawParams;
+  if (rawParams === null || rawParams === undefined) return { ...routeParams };
+  if (typeof rawParams !== "object" || Array.isArray(rawParams)) return rawParams;
+  // Body / query keys win over a same-named path param.
+  return { ...routeParams, ...(rawParams as Record<string, unknown>) };
+}
+
+const MAX_ERROR_BODY_LENGTH = 16_384;
+
+/**
+ * The reason a route handler gave for refusing a request: `error` /
+ * `message` (or `error.message`) from a small JSON error body.
+ * Truncated to 200 chars, card numbers and tokens masked. Null when
+ * there is none or the body isn't small JSON.
+ */
+async function readResponseErrorMessage(response: Response): Promise<string | null> {
+  try {
+    if (response.status < 400) return null;
+    if (!(response.headers.get("content-type") ?? "").includes("json")) return null;
+    if (Number(response.headers.get("content-length") ?? 0) > MAX_ERROR_BODY_LENGTH) return null;
+    const text = await response.clone().text();
+    if (!text || text.length > MAX_ERROR_BODY_LENGTH) return null;
+    const body = safeJsonParse(text) as Record<string, unknown> | null;
+    if (!body || typeof body !== "object") return null;
+    const nested = body.error as { message?: unknown } | null | undefined;
+    const raw = [body.error, body.message, nested?.message].find(
+      (v): v is string => typeof v === "string" && v.trim().length > 0,
+    );
+    return raw ? truncate(scrubSecretsInText(raw.trim(), { emails: true })) : null;
   } catch {
     return null;
   }

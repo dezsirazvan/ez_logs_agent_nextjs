@@ -3,10 +3,12 @@
 // BullMQ has no formal middleware API. The reliable pattern is:
 //   - Enqueue side: wrap `queue.add(name, data, opts)` so the
 //     correlation id is stamped into `data` before Redis sees it.
-//   - Worker side: subscribe to `worker.on("completed" | "failed")`
-//     after the user constructs the Worker, and emit events from
-//     those listeners. We don't replace the processor function —
-//     correlation propagation happens via the stamped payload.
+//   - Worker side: replace the Worker's processor (`processFn`, set by
+//     the constructor in BullMQ 4/5) with one that runs the job body
+//     inside the job's correlation scope, so DB writes made by the job
+//     are tagged and emitted under the job's action, and the job event
+//     carries its sanitized `arguments`. Workers without a `processFn`
+//     fall back to `completed` / `failed` listeners (job event only).
 //
 // Public API:
 //
@@ -22,6 +24,7 @@ import { logger } from "../logger.js";
 import {
   emitJobEvent,
   extractCorrelationFromPayload,
+  runJobWithCapture,
   stampCorrelationOnPayload,
   CORRELATION_PAYLOAD_KEY,
 } from "./shared.js";
@@ -62,6 +65,12 @@ interface BullWorkerLike {
   // eslint-disable-next-line @typescript-eslint/ban-types
   off?: Function;
   name?: string;
+  /** BullMQ internal: the processor `callProcessJob` invokes. */
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  processFn?: Function;
+  /** BullMQ internal: calls `this.processFn(job, token, signal)`. */
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  callProcessJob?: Function;
 }
 
 interface BullJobLike {
@@ -113,14 +122,61 @@ export function wrapBullQueue<T extends BullQueueLike>(queue: T): T {
 }
 
 /**
- * Subscribes capture listeners to a BullMQ Worker. Each completed /
- * failed job emits one event. We use `attemptsMade` for retry_count
- * (parity with Sidekiq's `retry_count`).
+ * Captures a BullMQ Worker's jobs: one event per run, with the
+ * processor running inside the job's correlation scope (see the file
+ * header). Sandboxed processors (a file path) run in a child process:
+ * the job event is still captured, their DB writes are not tagged.
  *
  * Idempotent — calling on the same worker twice is a no-op.
  */
 export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
   if ((worker as unknown as Record<string, unknown>)[WRAPPED_FLAG]) return worker;
+
+  // Verified on BullMQ 5.76 and 6.7: the Worker keeps its processor in
+  // `processFn` and runs it through `callProcessJob`. If a future
+  // version stops doing that, fall back to `completed` / `failed`
+  // listeners (job events only, the 0.2.x behavior) instead of
+  // patching something BullMQ no longer calls.
+  const canWrapProcessor =
+    typeof worker.processFn === "function" && typeof worker.callProcessJob === "function";
+  if (!canWrapProcessor && !warnedNoProcessor) {
+    warnedNoProcessor = true;
+    logger.debug(
+      "wrapBullWorker: this BullMQ Worker has no processFn/callProcessJob; capturing job " +
+        "events from completed/failed only (DB writes inside jobs are not linked).",
+    );
+  }
+  if (canWrapProcessor) {
+    const original = worker.processFn!;
+    // Jobs whose outcome the processor wrap already reported.
+    const reported = new WeakSet<object>();
+    worker.processFn = function ezlogsProcess(this: unknown, ...args: unknown[]) {
+      const job = (args[0] ?? {}) as BullJobLike;
+      if (typeof args[0] === "object" && args[0] !== null) reported.add(args[0]);
+      return runJobWithCapture(
+        {
+          jobClass: job.name ?? worker.name ?? "BullMQJob",
+          jobId: job.id !== undefined && job.id !== null ? String(job.id) : null,
+          queue: job.queueName ?? worker.name ?? null,
+          // attemptsMade counts finished attempts: 0 on the first run.
+          retryCount: typeof job.attemptsMade === "number" ? job.attemptsMade : null,
+          correlationId: extractCorrelationFromPayload(job.data),
+          payload: job.data,
+          isControlFlow: isBullControlFlow,
+        },
+        () => Promise.resolve(original.apply(this, args)),
+      );
+    };
+    // Failures where the processor never ran (a job started more than
+    // `maxStartedAttempts`, a deferred failure) only show up here.
+    worker.on("failed", (...args: unknown[]) => {
+      const job = args[0] as BullJobLike | undefined;
+      if (!job || reported.has(job)) return;
+      captureJob(job, worker, "failure", describeFailure(args[1] as Error | undefined));
+    });
+    markWrapped(worker);
+    return worker;
+  }
 
   worker.on("completed", (...args: unknown[]) => {
     const job = args[0] as BullJobLike | undefined;
@@ -130,20 +186,38 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
 
   worker.on("failed", (...args: unknown[]) => {
     const job = args[0] as BullJobLike | undefined;
-    const error = args[1] as Error | undefined;
     if (!job) return;
-    const message = error
-      ? `${error.name ?? "Error"}: ${error.message ?? String(error)}`
-      : "Error: job failed";
-    captureJob(job, worker, "failure", message);
+    captureJob(job, worker, "failure", describeFailure(args[1] as Error | undefined));
   });
 
+  markWrapped(worker);
+  return worker;
+}
+
+let warnedNoProcessor = false;
+
+function describeFailure(error: Error | undefined): string {
+  return error ? `${error.name ?? "Error"}: ${error.message ?? String(error)}` : "Error: job failed";
+}
+
+// BullMQ moves the job (delayed, waiting for children, rate-limited)
+// instead of failing it when the processor throws one of these.
+const BULL_CONTROL_FLOW_ERRORS = new Set(["DelayedError", "WaitingError", "WaitingChildrenError"]);
+
+function isBullControlFlow(error: unknown): boolean {
+  const e = error as { name?: unknown; message?: unknown } | null;
+  return (
+    (typeof e?.name === "string" && BULL_CONTROL_FLOW_ERRORS.has(e.name)) ||
+    e?.message === "bullmq:rateLimitExceeded"
+  );
+}
+
+function markWrapped(worker: object): void {
   Object.defineProperty(worker, WRAPPED_FLAG, {
     value: true,
     enumerable: false,
     configurable: false,
   });
-  return worker;
 }
 
 function captureJob(
@@ -168,6 +242,7 @@ function captureJob(
       errorMessage,
       durationMs,
       startedAt,
+      payload: job.data,
     });
   } catch (error) {
     logger.debug(`bullmq capture failed: ${describeError(error)}`);

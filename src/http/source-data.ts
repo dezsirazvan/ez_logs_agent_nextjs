@@ -269,12 +269,14 @@ function compact(obj: Record<string, unknown>): Record<string, unknown> {
 /**
  * Determines outcome + error_message — port of `determine_outcome` in
  * http_request.rb. Same precedence: exception > 4xx/5xx > graphql
- * errors > success.
+ * errors > success. A 4xx/5xx carries the response body's own error
+ * text when the handler returned one (`responseError`), else "HTTP n".
  */
 export function determineOutcome(
   statusCode: number | null,
   exception: Error | null,
   graphqlResponseErrors: string | null,
+  responseError: string | null = null,
 ): { outcome: "success" | "failure"; error_message: string | null } {
   if (exception) {
     return {
@@ -283,7 +285,7 @@ export function determineOutcome(
     };
   }
   if (statusCode !== null && statusCode >= 400) {
-    return { outcome: "failure", error_message: `HTTP ${statusCode}` };
+    return { outcome: "failure", error_message: responseError ?? `HTTP ${statusCode}` };
   }
   if (graphqlResponseErrors) {
     return { outcome: "failure", error_message: graphqlResponseErrors };

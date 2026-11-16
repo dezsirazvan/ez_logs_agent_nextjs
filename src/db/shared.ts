@@ -16,7 +16,7 @@ import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
 import { current as currentCorrelation } from "../correlation.js";
 import { getCurrentActor } from "../actor.js";
-import { matchesSensitiveKey } from "../http/sanitize.js";
+import { matchesSensitiveKey, scrubSecretsInText } from "../http/sanitize.js";
 
 export type DbOperation = "create" | "update" | "destroy";
 
@@ -26,8 +26,8 @@ export type DbOperation = "create" | "update" | "destroy";
 //   - timestamps: Prisma's @default(now()) / @updatedAt, Drizzle's
 //     timestamp helpers, and supabase-js's typical `created_at` /
 //     `updated_at` columns
-//   - soft-delete timestamps: paranoid-mode convention across most
-//     Node ORMs
+//   (soft-delete columns like deleted_at / archived_at are NOT ignored:
+//   setting one is a business state change, same as the Rails gem)
 //   - Auth.js / NextAuth columns that show up in every Next.js app
 //     using the standard adapter
 //
@@ -39,8 +39,6 @@ export const IGNORED_ATTRIBUTES: readonly string[] = Object.freeze([
   "created_at",
   "updatedAt",
   "updated_at",
-  "deletedAt",
-  "deleted_at",
   // Auth.js / NextAuth standard columns
   "emailVerified",
   "expires",
@@ -126,6 +124,18 @@ export interface DbEmitInput {
   _fromTrigger?: boolean;
   /** When the write happened (trigger rows: `captured_at`). Defaults to now. */
   timestamp?: Date | null;
+  /**
+   * Database table name, when it differs from `modelClass` (Prisma
+   * `@@map`). Only used to check whether the trigger path already
+   * captures this table.
+   */
+  table?: string | null;
+  /**
+   * Resource ids for rows without a single primary key (join tables):
+   * one per foreign-key column, typed by the referenced table. Used
+   * only when `resourceId` is empty.
+   */
+  relatedResourceIds?: ReadonlyArray<{ resource_type: string; resource_id: string }> | null;
 }
 
 // Single emit path used by all DB adapters. Builds an event with the
@@ -156,7 +166,7 @@ export function emitDbEvent(input: DbEmitInput): void {
     // behavior to avoid double-emit on tables the customer DID track.
     if (config.databaseReader && !input._fromTrigger) {
       const tracked = config.triggerTrackedTables;
-      if (tracked === null || tracked.has(input.modelClass)) return;
+      if (tracked === null || tracked.has(input.table ?? input.modelClass)) return;
     }
 
     // UPDATE with only ignored/sensitive fields touched (e.g. just
@@ -178,7 +188,12 @@ export function emitDbEvent(input: DbEmitInput): void {
         ? null
         : String(input.resourceId);
 
-    const context = buildContext(input);
+    const related = resourceIdStr === null ? input.relatedResourceIds ?? [] : [];
+    // The server names an event's FIRST resource with display_name; a
+    // join row's own name must never label the record it points to.
+    const context = buildContext(
+      related.length > 0 ? { ...input, displayName: null, modelInstance: null } : input,
+    );
 
     const event = buildEvent({
       source_type: "database_callback",
@@ -190,7 +205,7 @@ export function emitDbEvent(input: DbEmitInput): void {
       correlation_id: currentCorrelation(),
       resource_ids:
         resourceIdStr === null
-          ? []
+          ? [...related]
           : [{ resource_type: input.modelClass, resource_id: resourceIdStr }],
       context,
       duration_ms: null,
@@ -271,7 +286,7 @@ export function filterMeaningfulAttributes(
 export function filterMeaningfulChanges(
   changes: DbAttributeChange[],
 ): DbAttributeChange[] {
-  return changes.filter((c) => {
+  return flattenNestedChanges(changes).filter((c) => {
     if (!isMeaningfulAttribute(c.attribute)) return false;
     if (!isScalar(c.to)) return false;
     // If `from` is undefined, the adapter didn't have a previous value
@@ -281,6 +296,95 @@ export function filterMeaningfulChanges(
     if (!isScalar(c.from)) return false;
     return valuesActuallyChanged(c.from, c.to);
   });
+}
+
+// json/jsonb columns: one change per changed leaf, as a dotted path
+// (`settings.integration_testing_mode: false -> true`). Bounded so a
+// big document can't flood the event: leaves past the depth cap stay
+// non-scalar (dropped), and at most MAX_NESTED_LEAVES per column ship.
+// Without a before-value (Prisma extension) every leaf of the new
+// document looks "changed", so only MAX_UNKNOWN_FROM_LEAVES ship.
+// String leaves are free-form app data: secret-shaped values (JWTs,
+// API keys, private keys, card numbers) are masked.
+// (Rails drops non-scalar changes entirely; see AGENT_PARITY_NOTES.)
+const MAX_NESTED_DEPTH = 3;
+const MAX_NESTED_LEAVES = 20;
+const MAX_UNKNOWN_FROM_LEAVES = 5;
+
+function flattenNestedChanges(changes: DbAttributeChange[]): DbAttributeChange[] {
+  if (!changes.some((c) => isPlainRecord(c.to) || isPlainRecord(c.from))) return changes;
+  const out: DbAttributeChange[] = [];
+  for (const c of changes) {
+    if (!isPlainRecord(c.to) && !isPlainRecord(c.from)) {
+      out.push(c);
+      continue;
+    }
+    // A sensitive / ignored column drops the whole document. Nested
+    // sensitive keys are dropped by the per-leaf check on the dotted
+    // name (`settings.api_key`).
+    if (!isMeaningfulAttribute(c.attribute)) continue;
+    const leaves: DbAttributeChange[] = [];
+    collectLeafChanges(c.attribute, c.from, c.to, 1, leaves);
+    const cap = c.from === undefined ? MAX_UNKNOWN_FROM_LEAVES : MAX_NESTED_LEAVES;
+    out.push(...leaves.slice(0, cap).map(scrubLeaf));
+  }
+  return out;
+}
+
+function collectLeafChanges(
+  path: string,
+  from: unknown,
+  to: unknown,
+  depth: number,
+  out: DbAttributeChange[],
+): void {
+  if (out.length > MAX_NESTED_LEAVES) return;
+  const fromObj = isPlainRecord(from);
+  const toObj = isPlainRecord(to);
+  // Descend only object -> object (or absent / null on one side);
+  // `"x" -> {…}` is a type change, kept as one non-scalar change.
+  if (
+    (fromObj || toObj) &&
+    depth <= MAX_NESTED_DEPTH &&
+    (fromObj || from == null) &&
+    (toObj || to == null)
+  ) {
+    const f = fromObj ? (from as Record<string, unknown>) : {};
+    const t = toObj ? (to as Record<string, unknown>) : {};
+    for (const key of new Set([...Object.keys(f), ...Object.keys(t)])) {
+      // Unknown prior state stays unknown; a known object missing the
+      // key means the key was empty.
+      const before = from === undefined ? undefined : (f[key] ?? null);
+      collectLeafChanges(`${path}.${key}`, before, t[key] ?? null, depth + 1, out);
+    }
+    return;
+  }
+  if (from !== undefined && sameJson(from, to)) return;
+  out.push(from === undefined ? { attribute: path, to } : { attribute: path, from, to });
+}
+
+function scrubLeaf(change: DbAttributeChange): DbAttributeChange {
+  const scrub = (v: unknown) => (typeof v === "string" ? scrubSecretsInText(v) : v);
+  const out: DbAttributeChange = { attribute: change.attribute, to: scrub(change.to) };
+  if (change.from !== undefined) out.from = scrub(change.from);
+  return out;
+}
+
+// A JSON object: plain prototype only (not Date, Decimal, Buffer or
+// any class instance).
+function isPlainRecord(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
 }
 
 export function isMeaningfulAttribute(name: string): boolean {
@@ -349,19 +453,26 @@ function isPrismaDecimal(
   );
 }
 
-// Display-name fallback chain — direct port of resolve_display_name,
-// extended with function-resolver support so users can compose names
-// from multiple columns (e.g. `${first_name} ${last_name}` when no
-// single column is meaningful).
+// Display-name fallback chain — port of resolve_display_name,
+// extended with function-resolver support.
 //
 // Resolution order:
 //   1. Custom `displayNameFor[ModelClass]` — function or column name.
 //      A function resolver runs inside try/catch; if it throws or
 //      returns a non-string, we fall through to the default chain
 //      rather than crash the host.
-//   2. `name`, `title`, `number` columns in that order.
-//
-// Returns null if no value found.
+//   2. `name`, `title`, `number` (the Rails gem's chain), `label`.
+//   3. The record's own number column (`invoice_number` on `invoices`).
+// Deliberately NOT used: email, first/last/full name and other
+// person-identifying columns. display_name becomes the record's
+// `resource_name`, which default (redacted) shares and embeds show,
+// while they mask actor labels; a person's name or email must not
+// leak that way. Customers opt in per model with `displayNameFor`.
+// Column names match snake_case or camelCase. Sensitive columns are
+// never used. Returns null if no value found.
+const DISPLAY_NAME_COLUMNS = ["name", "title", "number", "label"];
+const MAX_DISPLAY_NAME_LENGTH = 120;
+
 export function resolveDisplayName(
   modelClass: string,
   instance: Record<string, unknown>,
@@ -372,16 +483,40 @@ export function resolveDisplayName(
     const resolved = applyResolver(resolver, instance);
     if (resolved !== null) return resolved;
 
-    for (const field of ["name", "title", "number"]) {
-      const value = instance[field];
-      if (value !== null && value !== undefined && String(value).length > 0) {
-        return String(value);
-      }
+    // Normalized column name (lowercase, no `_`) -> value.
+    const columns = new Map<string, unknown>();
+    for (const key of Object.keys(instance)) {
+      if (isDbSensitive(key)) continue;
+      const norm = key.toLowerCase().replace(/_/g, "");
+      if (!columns.has(norm)) columns.set(norm, instance[key]);
     }
+    const text = (norm: string): string | null => {
+      const value = columns.get(norm);
+      if (typeof value !== "string" && typeof value !== "number" && typeof value !== "bigint") {
+        return null;
+      }
+      const str = String(value).trim();
+      return str.length > 0 ? str.slice(0, MAX_DISPLAY_NAME_LENGTH) : null;
+    };
+
+    for (const column of DISPLAY_NAME_COLUMNS) {
+      const value = text(column);
+      if (value !== null) return value;
+    }
+    return text(`${singularNorm(modelClass)}number`);
   } catch {
     // fall through
   }
   return null;
+}
+
+// `Invoice` / `invoices` / `line_items` -> `invoice` / `lineitem`.
+function singularNorm(modelClass: string): string {
+  const norm = modelClass.toLowerCase().replace(/_/g, "");
+  if (norm.endsWith("ies")) return norm.slice(0, -3) + "y";
+  if (/(ss|us|is)$/.test(norm)) return norm;
+  if (/(xes|ches|shes|sses)$/.test(norm)) return norm.slice(0, -2);
+  return norm.endsWith("s") ? norm.slice(0, -1) : norm;
 }
 
 function applyResolver(

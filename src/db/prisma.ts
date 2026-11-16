@@ -14,10 +14,13 @@
 // after_create / after_update / after_destroy.
 //
 // Known gap: for update operations Prisma's $extends.query gives us
-// the post-update row but NOT the pre-update row. We populate
-// `changes[].to` from the user's `args.data` payload and leave
-// `from: null`. ActiveRecord's `saved_changes` gives both for free;
-// Prisma does not. See AGENT_PARITY_NOTES.md.
+// the post-update row but NOT the pre-update row. We send `changes[].to`
+// for the columns in `args.data` and OMIT `from` (unknown, not empty).
+// ActiveRecord's `saved_changes` gives both for free; Prisma does not.
+// With the trigger path installed this extension emits nothing for
+// trigger-tracked tables (the trigger sees real before-values); it only
+// tags writes with the request's correlation id. See
+// AGENT_PARITY_NOTES.md.
 
 import { logger } from "../logger.js";
 import { makeAsyncContextCapture } from "../edge-fallback.js";
@@ -111,9 +114,14 @@ export function ezlogsPrisma(): unknown {
 /**
  * The extension descriptor. `client` null = capture only, no tagging
  * (the adapter-pg path tags via the patched `pg` driver instead).
+ * `schemaClient` (defaults to `client`) is read for each model's table
+ * name (`@@map`).
  * @internal exported for tests.
  */
-export function buildPrismaExtension(client: TaggingClient | null): unknown {
+export function buildPrismaExtension(
+  client: TaggingClient | null,
+  schemaClient: object | null = client,
+): unknown {
   return {
     name: "ezlogs",
     query: {
@@ -125,7 +133,7 @@ export function buildPrismaExtension(client: TaggingClient | null): unknown {
 
           const result = await runTagged(client, ctx);
           try {
-            recordPrismaOperation(ctx, result);
+            recordPrismaOperation(ctx, result, tableNameFor(schemaClient, ctx.model));
           } catch (error) {
             logger.debug(`prisma capture failed: ${describeError(error)}`);
           }
@@ -219,9 +227,25 @@ function isTransactionUnsupported(error: unknown): boolean {
   return /transaction/i.test(message) && /not (?:be )?supported|unsupported|not available/i.test(message);
 }
 
+/**
+ * The model's database table (`@@map("projects")` -> `projects`), from
+ * the client's runtime data model (DMMF). Falls back to the model name.
+ */
+function tableNameFor(schemaClient: object | null, model: string): string {
+  try {
+    const dbName = (
+      schemaClient as { _runtimeDataModel?: { models?: Record<string, { dbName?: unknown }> } } | null
+    )?._runtimeDataModel?.models?.[model]?.dbName;
+    return typeof dbName === "string" && dbName.length > 0 ? dbName : model;
+  } catch {
+    return model;
+  }
+}
+
 function recordPrismaOperation(
   ctx: QueryExtensionContext,
   result: unknown,
+  table: string,
 ): void {
   const dbOperation = OPERATION_TO_DB_OPERATION[ctx.operation as PrismaOperation];
   if (!dbOperation) return;
@@ -233,6 +257,7 @@ function recordPrismaOperation(
   if (isBatchResult(result)) {
     emitDbEvent({
       modelClass: ctx.model,
+      table,
       operation: dbOperation,
       resourceId: null,
       // For batch updates we still capture the `args.data` shape so
@@ -258,22 +283,24 @@ function recordPrismaOperation(
     // createManyAndReturn emits an array of created rows. Emit one
     // event per row so each gets its own resource_id.
     for (const row of result) {
-      emitSingleRowEvent(ctx, dbOperation, row);
+      emitSingleRowEvent(ctx, dbOperation, row, table);
     }
     return;
   }
 
-  emitSingleRowEvent(ctx, dbOperation, result);
+  emitSingleRowEvent(ctx, dbOperation, result, table);
 }
 
 function emitSingleRowEvent(
   ctx: QueryExtensionContext,
   dbOperation: DbOperation,
   row: unknown,
+  table: string,
 ): void {
   if (!isPlainObject(row)) {
     emitDbEvent({
       modelClass: ctx.model,
+      table,
       operation: dbOperation,
       resourceId: null,
     });
@@ -285,11 +312,19 @@ function emitSingleRowEvent(
   const displayName = resolveDisplayName(ctx.model, rowObj);
 
   if (dbOperation === "create") {
+    // The returned row over `args.data`: the row carries DB defaults
+    // (`status: "draft"`) and generated values; `args.data` fills the
+    // columns a `select` left out. Relation writes in `args.data`
+    // (`{ connect: … }`) are non-scalar and get filtered.
     emitDbEvent({
       modelClass: ctx.model,
+      table,
       operation: "create",
       resourceId,
-      initialAttributes: extractCreateAttributes(ctx, rowObj),
+      initialAttributes: {
+        ...(isPlainObject(ctx.args.data) ? (ctx.args.data as Record<string, unknown>) : {}),
+        ...rowObj,
+      },
       displayName,
       modelInstance: rowObj,
     });
@@ -299,6 +334,7 @@ function emitSingleRowEvent(
   if (dbOperation === "update") {
     emitDbEvent({
       modelClass: ctx.model,
+      table,
       operation: "update",
       resourceId,
       changes: extractUpdateChangesFromArgs(ctx, rowObj),
@@ -308,35 +344,21 @@ function emitSingleRowEvent(
     return;
   }
 
-  // destroy: no attribute snapshot, just display name.
+  // destroy: Prisma returns the deleted row — ship it as the pre-state.
   emitDbEvent({
     modelClass: ctx.model,
+    table,
     operation: "destroy",
     resourceId,
+    initialAttributes: rowObj,
     displayName,
     modelInstance: rowObj,
   });
 }
 
-// For create: prefer the user-provided `args.data` (so we capture
-// what they intended to set), fall back to the returned row (so we
-// pick up DB-generated defaults like timestamps).
-function extractCreateAttributes(
-  ctx: QueryExtensionContext,
-  resultRow: Record<string, unknown>,
-): Record<string, unknown> {
-  if (isPlainObject(ctx.args.data)) {
-    return ctx.args.data as Record<string, unknown>;
-  }
-  if (ctx.operation === "upsert" && isPlainObject(ctx.args.create)) {
-    return ctx.args.create as Record<string, unknown>;
-  }
-  return resultRow;
-}
-
 // For update: we don't know the "from" values without a pre-SELECT,
 // so we populate `to` from the result row (which is post-update) for
-// every column the user touched in `args.data`, and leave `from` null.
+// every column the user touched in `args.data`, and omit `from`.
 function extractUpdateChangesFromArgs(
   ctx: QueryExtensionContext,
   resultRow: Record<string, unknown>,
@@ -351,19 +373,17 @@ function extractUpdateChangesFromArgs(
 
   return Object.keys(data).map((attribute) => ({
     attribute,
-    from: null,
     to: resultRow[attribute] ?? data[attribute],
   }));
 }
 
 // updateMany without a row to point at — still record the touched
-// columns. `from: null`, `to: <value from data>`.
+// columns. `from` omitted, `to: <value from data>`.
 function extractChangesFromUpdateData(
   data: Record<string, unknown>,
 ): DbAttributeChange[] {
   return Object.keys(data).map((attribute) => ({
     attribute,
-    from: null,
     to: data[attribute],
   }));
 }
@@ -634,7 +654,7 @@ function applyEzlogsExtension<T extends object>(prisma: T): T {
     // No tagging here: the adapter-pg path tags via the patched `pg`
     // driver, and a nested $transaction would deadlock on the
     // per-adapter mutex below.
-    return client.$extends(buildPrismaExtension(null)) as T;
+    return client.$extends(buildPrismaExtension(null, prisma)) as T;
   } catch (error) {
     logger.debug(`patchPrismaClient: $extends failed: ${describeError(error)}`);
     return prisma;

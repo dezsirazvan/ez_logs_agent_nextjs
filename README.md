@@ -105,22 +105,37 @@ Restart your dev server, hit any route, and watch for
 `[ezlogs] FlushScheduler started` in the terminal. Events appear in
 your EZLogs dashboard within a few seconds.
 
-### 4. (Optional) Full DB diffs on Postgres
+Sending to a local EZLogs server over plain `http://` (development)?
+Events are still sent, but the agent warns on every start; pass
+`allowInsecureTransport: true` to `ezlogs.init` to silence it. Keep
+`https://` in production.
 
-One command installs Postgres triggers that capture every business-
-table write with full from→to change diffs:
+### 4. Database changes
+
+Steps 1-3 capture requests, Server Actions and jobs. Database changes
+need one more step, depending on your stack:
+
+| Your app writes with | Do this | You get |
+|---|---|---|
+| **Supabase** (supabase-js) | `npm i pg`, set `DATABASE_URL` to the Postgres connection string, run `npx ezlogs-nextjs install-triggers`. Nothing to wrap: the agent tags supabase-js requests and the trigger reads the tag. | Every write (`.from()`, `.rpc()`, bulk) with from→to diffs, linked to its request |
+| **Prisma** on Postgres | triggers (as above) + `new PrismaClient().$extends(ezlogsPrisma())` (below) | Same |
+| **Drizzle** (node-postgres) or raw **`pg`** | triggers (as above). The agent patches `pg` itself. | Same |
+| postgres.js, Neon HTTP, scripts | triggers (as above) | Writes show up as their own actions, not linked to the request |
+| MySQL, SQLite, PlanetScale, no trigger access | a per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)) | New values only, no before-values |
 
 ```bash
+npm i pg                          # the trigger installer and reader need it
 npx ezlogs-nextjs install-triggers
 ```
 
-Migration tables, sessions, and the agent's own audit table are
-skipped automatically. The trigger path needs the `pg` package in your
-project (`npm i pg`); if `pg` or the audit table is missing, the agent
-logs one warning at startup and leaves the trigger path off. Without
-triggers, DB writes are captured only if you wire a per-ORM adapter
-(`ezlogsPrisma`, `ezlogsDrizzleLogger`, `wrapSupabase`) — see
-[docs/database.md](./docs/database.md) for trade-offs.
+Run it from your app's directory with the package installed there
+(with bun: `bunx ezlogs-nextjs install-triggers` or
+`./node_modules/.bin/ezlogs-nextjs install-triggers`); if the package
+isn't installed locally, npx / bunx download whatever version is
+published, and the CLI warns. Migration tables, sessions, and the
+agent's own audit table are skipped automatically. If `pg` or the
+audit table is missing at runtime, the agent logs one warning at
+startup and leaves the trigger path off.
 
 **Recommended setup for Prisma** (plain `new PrismaClient()`, no driver
 adapter): triggers **plus** the extension, which tags each write with
@@ -141,7 +156,13 @@ your own `prisma.$transaction(...)` are not tagged: they still show up,
 as separate actions without an actor. Without the extension, a plain
 PrismaClient's writes are never tagged.
 
-**Upgrading from 0.1.x:** run `npx ezlogs-nextjs install-triggers --tables=none`
+Without triggers, the extension still sends Prisma writes itself (new
+values only — Prisma doesn't expose the old row). With triggers it
+sends nothing for tracked tables; the trigger rows are the single
+source, so there are no duplicates (also for `@@map`-ed models).
+
+**Upgrading:** from 0.2.x to 0.3.0 there is nothing to re-run (no SQL
+changes). From 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
 **before** deploying the new agent (functions only, no table locks),
 deploy right after, and later re-run `npx ezlogs-nextjs install-triggers`
 at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
@@ -152,10 +173,10 @@ at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
 
 | Source | What | Where it comes from |
 |---|---|---|
-| HTTP | Method, path, status, duration, sanitized params, GraphQL op | App Router + Pages Router (auto-wrapped) |
-| Server Actions | Action name, args, outcome, redirect/notFound handled as success | File-level + inline `"use server"` (auto-wrapped) |
-| Database | `model_class`, `operation`, full from→to diffs (trigger path) | Postgres triggers, Prisma, Drizzle, supabase-js |
-| Background jobs | `job_class`, `job_id`, `queue`, `retry_count` | BullMQ, Inngest, Trigger.dev, pgmq, Upstash Workflow |
+| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response | App Router + Pages Router (auto-wrapped) |
+| Server Actions | Action name, args, caller IP, outcome (a returned `{ success: false, error }` is a failure with that message), redirect/notFound handled as success | File-level + inline `"use server"` (auto-wrapped) |
+| Database | `model_class`, `operation`, full from→to diffs incl. json leaves (trigger path), record name | Postgres triggers, Prisma, Drizzle, supabase-js |
+| Background jobs | `job_class`, `job_id`, `queue`, `retry_count`, sanitized `arguments`, plus the DB writes the job made | BullMQ, Inngest, Trigger.dev, pgmq, Upstash Workflow |
 
 Every event in one inbound request shares a `correlation_id` so the
 server stitches them into a single Action card.
@@ -221,7 +242,10 @@ event. EZLogs is best-effort, not guaranteed delivery.
 - **Database rows (trigger path).** Columns with sensitive names are
   removed by the trigger itself, so they are never written to
   `ezlogs_audit_log`. An update that only touches such columns writes
-  no audit row.
+  no audit row. Sensitive keys inside json/jsonb columns are dropped
+  by the agent before sending. DB values are dropped, not sent as
+  `"[FILTERED]"` (that placeholder is for request params and job
+  arguments).
 - **Retention of `ezlogs_audit_log`.** Rows are deleted as soon as the
   agent sends them. Rows nobody claimed (untagged writes, or tagged
   rows older than 5 minutes) are sent as their own actions by a

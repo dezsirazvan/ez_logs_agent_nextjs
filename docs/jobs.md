@@ -1,8 +1,14 @@
 # Background job adapters
 
 Five runners. Pick the one(s) your app uses. All emit the same
-`background_job` event shape with `job_class`, `job_id`, `queue`, and
-`retry_count`.
+`background_job` event shape with `job_class`, `job_id`, `queue`,
+`retry_count` and the job's sanitized `arguments` (same redaction as
+request params: `password`, `token`, … become `"[FILTERED]"`).
+
+DB writes made by the job body run inside the job's correlation, so
+with the trigger path they appear in the same action as the request
+that enqueued the job (BullMQ, Trigger.dev, Supabase Queues, Upstash
+Workflow; Inngest via `runInsideInngestCorrelation`).
 
 | Runner | Import |
 |---|---|
@@ -26,8 +32,17 @@ export const worker = wrapBullWorker(new Worker("emails", processor));
 ```
 
 `wrapBullQueue` stamps the current correlation into every job payload
-at enqueue. `wrapBullWorker` restores it inside the worker so DB
-events emitted while processing inherit the correlation.
+at enqueue (pass `data` as a plain object). `wrapBullWorker` wraps the
+Worker's processor so the job body runs inside that correlation, emits
+one event per run, and sends the DB writes the job made. Call it right
+after `new Worker(...)`. Sandboxed processors (a file path instead of a
+function) run in a child process: the job event is captured, their DB
+writes are not linked to it. BullMQ's own control flow (`DelayedError`,
+`WaitingChildrenError`, rate limiting) is not reported as a failure.
+Verified on BullMQ 5.76 and 6.7 (with BullMQ 6, install `ioredis` or
+pass a client). If a future BullMQ changes the Worker internals the
+wrapper relies on, it falls back to job events only (no linked DB
+writes) and logs that once at debug level.
 
 ## Inngest
 
@@ -39,6 +54,19 @@ export const inngest = new Inngest({
   id: "my-app",
   middleware: [ezlogsInngestMiddleware()],
 });
+```
+
+Inngest middleware can't wrap the function body, so to link the body's
+DB writes to the action that sent the event, wrap it:
+
+```ts
+import { runInsideInngestCorrelation } from "ezlogs-nextjs/inngest";
+
+inngest.createFunction({ id: "send-invoice" }, { event: "invoice/created" },
+  ({ event }) => runInsideInngestCorrelation(event, async () => {
+    /* ... */
+  }),
+);
 ```
 
 ## Trigger.dev
@@ -80,15 +108,22 @@ await captureQueueMessage(
 ## Upstash Workflow / QStash
 
 ```ts
-import { Client } from "@upstash/qstash";
+import { Client as QStashClient } from "@upstash/qstash";
+import { Client as WorkflowClient } from "@upstash/workflow";
 import { serve } from "@upstash/workflow/nextjs";
 import {
   wrapQStashClient,
+  wrapWorkflowClient,
   captureWorkflowRequest,
 } from "ezlogs-nextjs/upstash-workflow";
 
+// Starting runs with `workflows.trigger({ url, body })`:
+export const workflows = wrapWorkflowClient(
+  new WorkflowClient({ token: process.env.QSTASH_TOKEN! }),
+);
+// Publishing with QStash directly:
 export const qstash = wrapQStashClient(
-  new Client({ token: process.env.QSTASH_TOKEN! }),
+  new QStashClient({ token: process.env.QSTASH_TOKEN! }),
 );
 
 export const { POST } = serve(async (context) => {
@@ -103,7 +138,9 @@ export const { POST } = serve(async (context) => {
 });
 ```
 
-QStash-signed inbound requests would otherwise look like ordinary
-inbound HTTP. The adapter detects the `Upstash-Signature` header and
-re-tags them as `background_job` so they don't pollute the HTTP-event
-stream.
+The wrapped clients send the current correlation id with the run
+(Upstash re-sends it on every step), so each step's job event and DB
+writes join the action of the request that started the workflow,
+instead of one separate action per step. Wrap the client you actually
+call (`trigger()` vs `publish()`); unwrapped runs still show up, each
+step as its own action.
