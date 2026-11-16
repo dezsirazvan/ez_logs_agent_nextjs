@@ -122,7 +122,10 @@ zero overhead.
 Events are linked via a `correlation_id`. The agent threads it through:
 
 - Request headers (`X-Ezlogs-Correlation-ID`)
-- `AsyncLocalStorage` (Node runtime)
+- `AsyncLocalStorage` (Node runtime). In a plain ESM process (`"type": "module"`,
+  e.g. a BullMQ worker) this needs Node >= 20.16 or >= 22.3; on older Node
+  the agent warns once at startup that concurrent work can share a
+  correlation id.
 - Platform fallbacks (`x-vercel-id`, `cf-ray`, `x-request-id`) for apps
   without `middleware.ts`
 - Postgres `SET LOCAL` on the wrapped connection (when using

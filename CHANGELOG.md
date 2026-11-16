@@ -3,6 +3,21 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.3.4] — 2026-11-16
+
+Wire format unchanged. **Upgrade steps:** none.
+
+### Fixed
+- **Plain Node ESM processes had no request scope.** The ESM build
+  loaded `node:async_hooks` through `require`, which does not exist
+  there, so a `"type": "module"` process (a BullMQ worker, a script)
+  fell back to one shared variable: jobs and requests running at the
+  same time could lose or swap their correlation id and actor. The
+  agent now gets `AsyncLocalStorage` from `process.getBuiltinModule`
+  first (Node >= 20.16 / 22.3), then `require`. Inside Next.js and in
+  CommonJS nothing changes. If neither works on Node, it warns once
+  instead of silently sharing; Edge stays quiet as before.
+
 ## [0.3.3] — 2026-11-16
 
 Wire format unchanged. **Upgrade steps:** none (no SQL changed, no

@@ -13,9 +13,14 @@
 // Edge bundles get real async-context tracking even though they
 // can't `require("node:async_hooks")`.
 //
-// Either path missing? We fall back to a module-scoped variable.
-// That's correct on Edge (per-request V8 isolate) and best-effort
-// on weird runtimes. Server Node always succeeds via require().
+// On Node we ask `process.getBuiltinModule` (Node >= 20.16 / 22.3)
+// before `require`: the ESM build has no `require` (tsup's shim
+// throws), so a plain `"type": "module"` process (a BullMQ worker, a
+// script) would otherwise lose async-context tracking.
+//
+// Every path missing? We fall back to a module-scoped variable.
+// That's correct on Edge (per-request V8 isolate). On Node it would
+// mix correlation ids between concurrent requests, so we warn once.
 
 interface AsyncLocalStorageCtor {
   new <T>(): {
@@ -32,23 +37,38 @@ function loadAsyncLocalStorage(): AsyncLocalStorageCtor | null {
     .AsyncLocalStorage;
   if (typeof fromGlobal === "function") return fromGlobal;
 
-  // 2. Runtime require — invisible to static bundlers because the
-  // string is computed. We can't use `import("node:async_hooks")`
-  // because static analyzers DO follow dynamic imports.
+  // The string is split so a future bundler doing string-match
+  // analysis sees no literal "async_hooks". Cosmetic but cheap.
+  const moduleName = "node:" + ["async", "hooks"].join("_");
+
+  // 2. process.getBuiltinModule — works in ESM and CJS alike, and is
+  // a plain function call, so static bundlers don't follow it.
   try {
+    const getBuiltin = (
+      globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }
+    ).process?.getBuiltinModule;
+    if (typeof getBuiltin === "function") {
+      const mod = getBuiltin(moduleName) as
+        | { AsyncLocalStorage?: AsyncLocalStorageCtor }
+        | undefined;
+      if (typeof mod?.AsyncLocalStorage === "function") return mod.AsyncLocalStorage;
+    }
+  } catch {
+    // ignore — try require next
+  }
+
+  // 3. Runtime require (CJS, or a bundler that provides one) —
+  // invisible to static bundlers because the string is computed. We
+  // can't use `import("node:async_hooks")` because static analyzers
+  // DO follow dynamic imports.
+  try {
+    // Aliased, not called directly: bundlers would turn a direct
+    // `require(<expression>)` into a context module.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const req: ((id: string) => any) | undefined =
-      typeof require !== "undefined"
-        ? require
-        : // In ESM, `createRequire` is the official escape hatch.
-          // We pull it via globalThis to avoid a static `import`
-          // that would itself be browser-bundled.
-          undefined;
+      typeof require !== "undefined" ? require : undefined;
     if (typeof req === "function") {
-      // The string is split so a future bundler doing string-match
-      // analysis sees no literal "async_hooks". Cosmetic but cheap.
-      const moduleName = ["async", "hooks"].join("_");
-      const mod = req("node:" + moduleName) as {
+      const mod = req(moduleName) as {
         AsyncLocalStorage?: AsyncLocalStorageCtor;
       };
       if (typeof mod.AsyncLocalStorage === "function") return mod.AsyncLocalStorage;
@@ -57,7 +77,32 @@ function loadAsyncLocalStorage(): AsyncLocalStorageCtor | null {
     // ignore — fall through to the no-ALS path
   }
 
+  warnNoAsyncLocalStorageOnNode();
   return null;
+}
+
+// Edge (per-request isolate) and the browser are fine with the shared
+// variable. A Node process is not: concurrent requests and jobs would
+// read each other's correlation id and actor.
+function warnNoAsyncLocalStorageOnNode(): void {
+  // Declared here, not at module level: this runs during module init,
+  // before later top-level consts are initialized.
+  const WARNED_KEY = Symbol.for("ezlogs-nextjs:no-als-warned");
+  const g = globalThis as {
+    EdgeRuntime?: unknown;
+    process?: { versions?: { node?: string } };
+    [WARNED_KEY]?: boolean;
+  };
+  if (g.EdgeRuntime !== undefined || !g.process?.versions?.node) return;
+  if (g[WARNED_KEY]) return;
+  g[WARNED_KEY] = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[ezlogs] AsyncLocalStorage is unavailable on Node ${g.process.versions.node}. ` +
+      "Concurrent requests and jobs will share one correlation id and actor, " +
+      "so events can be grouped into the wrong action. Upgrade to Node >= 20.16 " +
+      "(or >= 22.3), or load ezlogs-nextjs through CommonJS (require).",
+  );
 }
 
 export interface ScopedStorage<T> {
