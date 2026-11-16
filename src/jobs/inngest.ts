@@ -37,7 +37,9 @@ import {
 } from "../correlation.js";
 
 interface InngestRunContext {
-  fn?: { id?: string };
+  // v3: `id(prefix?)` is a method and the plain id lives in `opts.id`;
+  // older shapes expose `id` as a string.
+  fn?: { id?: string | ((prefix?: string) => string); opts?: { id?: string } };
   ctx?: {
     runId?: string;
     attempt?: number;
@@ -65,7 +67,7 @@ export function ezlogsInngestMiddleware(): unknown {
         // one function). Returns per-run hooks that fire as the run
         // proceeds. We track the run via closure-scoped state.
         onFunctionRun(args: InngestRunContext) {
-          const fnId = args.fn?.id ?? "inngest-function";
+          const fnId = functionId(args.fn) ?? "inngest-function";
           const runId = args.ctx?.runId ?? null;
           const attempt = typeof args.ctx?.attempt === "number" ? args.ctx.attempt : 0;
           const eventName = args.ctx?.event?.name ?? null;
@@ -171,6 +173,17 @@ export async function runInsideInngestCorrelation<T>(
       await flushJobAuditLog(startedAt);
     }
   });
+}
+
+function functionId(fn: InngestRunContext["fn"]): string | null {
+  try {
+    const id = typeof fn?.id === "function" ? fn.id() : fn?.id;
+    if (typeof id === "string" && id) return id;
+  } catch {
+    // fall through to opts.id
+  }
+  const optsId = fn?.opts?.id;
+  return typeof optsId === "string" && optsId ? optsId : null;
 }
 
 function formatError(error: unknown): string {

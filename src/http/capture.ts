@@ -28,7 +28,12 @@ import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
 import { flushScheduler } from "../pipeline/flush-scheduler.js";
 import { isServerless } from "../pipeline/serverless.js";
-import { getCurrentActor, runWithActorScope, setActor } from "../actor.js";
+import {
+  getCurrentActor,
+  maybeExtractSupabaseActor,
+  runWithActorScope,
+  setActor,
+} from "../actor.js";
 import { classifyUserAgent, type AgentDetection } from "../user-agent-detector.js";
 import {
   current as currentCorrelation,
@@ -1530,28 +1535,6 @@ async function maybeRunActorHookFromServerAction(): Promise<void> {
 
   const userAgent = headers ? safeGetHeader(headers, "user-agent") : null;
   applyActorFromHookAndUa(hookResult, userAgent);
-}
-
-/**
- * Fallback actor extraction via the most-recently-constructed Supabase
- * client. Called AFTER the user's handler has run — by that point a
- * Supabase client has typically been created and its auth cookies are
- * accessible. Skipped when actorFromSupabase=false or when a previous
- * actorFromRequest hook already set an actor.
- */
-async function maybeExtractSupabaseActor(): Promise<void> {
-  const config = configuration();
-  if (!config.actorFromSupabase) return;
-  if (getCurrentActor()) return; // user-supplied hook already populated it
-
-  try {
-    // Lazy import so non-Supabase apps don't pay the cost.
-    const mod = await import("../db/supabase.js");
-    const actor = await mod.tryExtractSupabaseActor();
-    if (actor) setActor(actor);
-  } catch (error) {
-    logger.debug(`actorFromSupabase failed: ${describeError(error)}`);
-  }
 }
 
 /**

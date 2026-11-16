@@ -16,7 +16,7 @@
 
 import { logger } from "./logger.js";
 import { createScopedStorage } from "./edge-fallback.js";
-import type { ActorContext } from "./configuration.js";
+import { configuration, type ActorContext } from "./configuration.js";
 
 export type { ActorContext } from "./configuration.js";
 
@@ -47,9 +47,58 @@ export function setActor(input: unknown): ActorContext | null {
   return sanitized;
 }
 
-/** Run `callback` with a fresh, empty actor scope. Used by HTTP capture. */
-export function runWithActorScope<R>(callback: () => R): R {
-  return storage.run(null, callback);
+// Per-scope Supabase actor source: the client constructed in this
+// request, and whether it was already asked (no user). Mutable object,
+// one per runWithActorScope.
+interface ActorSourceSlot {
+  client?: unknown;
+  tried?: boolean;
+}
+const sourceStorage = createScopedStorage<ActorSourceSlot>(
+  Symbol.for("ezlogs-nextjs:actor-source-storage"),
+);
+
+/** The current scope's actor-source slot, or null outside any scope. */
+export function currentActorSource(): ActorSourceSlot | null {
+  return sourceStorage.read();
+}
+
+/**
+ * Run `callback` in a fresh actor scope: empty (HTTP capture), or
+ * holding the actor a job carried from the request that started it.
+ */
+export function runWithActorScope<R>(
+  callback: () => R,
+  actor: ActorContext | null = null,
+): R {
+  return storage.run(actor, () => sourceStorage.run({}, callback));
+}
+
+/**
+ * Fallback actor extraction via the most-recently-constructed Supabase
+ * client. Called AFTER the user's handler has run — by that point a
+ * Supabase client has typically been created and its auth cookies are
+ * accessible — and before a workflow run is started, so its steps can
+ * carry the actor. Skipped when actorFromSupabase=false or when an
+ * actor is already set (e.g. by the actorFromRequest hook).
+ */
+export async function maybeExtractSupabaseActor(): Promise<void> {
+  const config = configuration();
+  if (!config.actorFromSupabase) return;
+  if (getCurrentActor()) return; // user-supplied hook already populated it
+  // Asked already with no user, and no new client since: skip getUser().
+  const slot = currentActorSource();
+  if (slot?.tried) return;
+
+  try {
+    // Lazy import so non-Supabase apps don't pay the cost.
+    const mod = await import("./db/supabase.js");
+    const actor = await mod.tryExtractSupabaseActor();
+    if (slot) slot.tried = true;
+    if (actor) setActor(actor);
+  } catch (error) {
+    logger.debug(`actorFromSupabase failed: ${describe(error)}`);
+  }
 }
 
 /**

@@ -148,3 +148,11 @@ with every delivery. If you pass your own `workflowRunId`, it is kept
 and only the first delivery joins the request. Wrap the client you actually
 call (`trigger()` vs `publish()`); unwrapped runs still show up, each
 step as its own action.
+
+The actor travels the same way. The step's DB writes keep the person
+(or agent) who started the run, even though they happen after the
+response. Only the actor's id is sent. It is signed with your project
+token and bound to the correlation id, so a forged delivery cannot name
+an actor. With no known actor, an id over 64 bytes, or an agent / hybrid
+actor (or one with a principal, which the id alone can't express), the
+steps' writes have no actor. Nothing is guessed.

@@ -3,6 +3,46 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.3.2] — 2026-11-16
+
+Wire format unchanged. **Upgrade steps:** none (no SQL changed, no
+usage change).
+
+### Fixed
+- **`next build` fails with the documented `wrapQStashClient`.** Its
+  parameter type rejected `@upstash/qstash` 2.12's generic
+  `publishJSON<TBody, TRequest>` (TS2345 / TS2740), so any app with a
+  typed QStash getter failed the build's type check (`next dev` skips
+  it). The wrapper now accepts any client and returns the caller's own
+  client type. A `tsc --noEmit` fixture against the real
+  `@upstash/qstash` and `@upstash/workflow` types runs in the test suite.
+  The wrapper also keeps headers passed as a `Headers` instance or an
+  entry list (they were dropped when the correlation id was added).
+- **Upstash Workflow steps lose the actor.** Writes made in workflow
+  steps after the response (production, where QStash delivers the
+  steps) had the right correlation but no actor: only the correlation
+  id travelled with the run, and job scopes never had an actor. The
+  wrappers now carry the actor id next to the correlation id (header +
+  run id, signed with the project token and bound to the correlation
+  id). `captureWorkflowRequest` runs the step as that actor only when
+  the signature verifies. The late Supabase actor fallback runs before
+  the run starts, so it is known in time. With no verified actor the
+  writes keep an empty actor, as before. Only the id travels, so an
+  agent / hybrid actor or one with a `principal` is not carried (it
+  would arrive looking human); those steps keep an empty actor.
+- **Supabase actor fallback could read another request's user.** The
+  "current Supabase client" used for `actorFromSupabase` was one
+  process-wide slot, so under concurrency request A could resolve
+  request B's user. A client created inside a request is now kept in
+  that request's scope and only that scope reads it (the process-wide
+  slot is used only outside any scope). A "no user" answer is
+  remembered per request until a new client is created, so `getUser()`
+  is not called again on every publish / trigger.
+- **Inngest job events had no `job_class`.** In inngest v3 `fn.id` is a
+  method, so a function was sent and dropped by JSON. The middleware
+  now calls it, falls back to `fn.opts.id`, and still reads the older
+  string shape.
+
 ## [0.3.1] — 2026-11-16
 
 Wire format unchanged. **Upgrade steps:** none (no SQL changed).

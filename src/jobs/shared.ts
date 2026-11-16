@@ -28,6 +28,7 @@ import {
 import { configuration } from "../configuration.js";
 import { sanitizeArgs } from "../http/sanitize.js";
 import { flushAuditLog } from "../triggers/reader.js";
+import { runWithActorScope, type ActorContext } from "../actor.js";
 
 /**
  * Stable key for embedding the correlation id in a job payload. All
@@ -114,6 +115,12 @@ export async function runJobWithCapture<T>(
     queue?: string | null;
     retryCount?: number | null;
     correlationId: string | null;
+    /**
+     * Actor carried from the request that started the job (verified by
+     * the adapter). Its DB writes are attributed to it; omitted, the
+     * job keeps whatever actor scope it runs in.
+     */
+    actor?: ActorContext | null;
     /** Raw job payload, shipped sanitized as `arguments`. */
     payload?: unknown;
     /**
@@ -129,7 +136,7 @@ export async function runJobWithCapture<T>(
   // Mirrors Sidekiq server middleware: `job["correlation_id"] || Correlation.generate`.
   const correlationId = meta.correlationId ?? generateCorrelation();
 
-  return runWithCorrelation(correlationId, async () => {
+  const body = async (): Promise<T> => {
     const startedAt = new Date();
     const startMs = startedAt.getTime();
     const baseMeta = {
@@ -165,7 +172,11 @@ export async function runJobWithCapture<T>(
       });
       throw error;
     }
-  });
+  };
+  const actor = meta.actor;
+  return runWithCorrelation(correlationId, () =>
+    actor ? runWithActorScope(body, actor) : body(),
+  );
 }
 
 // Clock skew allowance between the app and the database when matching

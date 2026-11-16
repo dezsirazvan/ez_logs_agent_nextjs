@@ -65,6 +65,12 @@ import {
   runJobWithCapture,
 } from "./shared.js";
 import { current as currentCorrelation } from "../correlation.js";
+import { configuration } from "../configuration.js";
+import {
+  getCurrentActor,
+  maybeExtractSupabaseActor,
+  type ActorContext,
+} from "../actor.js";
 
 // QStash forwards any header with this prefix to the destination URL.
 const FORWARD_PREFIX = "upstash-forward-";
@@ -85,7 +91,18 @@ const AGENT_CORRELATION_ID = /^ezl_(\d{13})_[0-9a-f]{8}$/;
 // out many runs needs a collision-free suffix. (No length / charset
 // limit in the SDK 1.3.3 source or the docs; the default id is a
 // 21-char nanoid, this one is 55 chars of [a-z0-9_].)
-const AGENT_RUN_ID = /^wfr_(ezl_\d{13}_[0-9a-f]{8})_[0-9a-f]{24}$/;
+// Optionally followed by `_<actor token>` (see actorToken).
+const AGENT_RUN_ID = /^wfr_(ezl_\d{13}_[0-9a-f]{8})_[0-9a-f]{24}(?:_(a[0-9a-f]{2,128}_[0-9a-f]{16}))?$/;
+// Header carrying the actor token next to the correlation id.
+const ACTOR_HEADER = "x-ezlogs-actor";
+// `a<hex of the actor id>_<HMAC tag>`. The tag (HMAC-SHA256 keyed with
+// the project token over correlation id + actor id, 64 bits) means a
+// forged delivery can't name an actor. Hex keeps the run id in
+// [a-z0-9_] like the rest of it.
+const ACTOR_TOKEN = /^a([0-9a-f]{2,128})_([0-9a-f]{16})$/;
+// Longer actor ids are not carried (the run id would get long); their
+// post-response writes keep an empty actor, as before.
+const ACTOR_ID_MAX_BYTES = 64;
 const RUN_ID_SUFFIX_BYTES = 12;
 const STEP_ID_MAX_AGE_MS = 24 * 60 * 60_000;
 const STEP_ID_MAX_SKEW_MS = 5 * 60_000;
@@ -97,16 +114,19 @@ function isAcceptableStepId(value: string): boolean {
   return age <= STEP_ID_MAX_AGE_MS && age >= -STEP_ID_MAX_SKEW_MS;
 }
 
+// Loose on purpose: @upstash/qstash's generic `publishJSON<TBody,
+// TRequest>` is not assignable to any concrete signature, and the
+// wrapper returns the caller's own client type.
 interface QStashClientLike {
-  publishJSON?: (request: QStashPublishRequest) => Promise<unknown>;
-  publish?: (request: QStashPublishRequest) => Promise<unknown>;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  publishJSON?: Function;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  publish?: Function;
 }
 
 interface QStashPublishRequest {
-  url?: string;
-  topic?: string;
-  body?: unknown;
-  headers?: Record<string, string>;
+  headers?: unknown;
+  [key: string]: unknown;
 }
 
 const WRAPPED_FLAG = "__ezlogsUpstashQStashWrapped";
@@ -132,8 +152,15 @@ export function wrapWorkflowClient<T extends WorkflowClientLike>(client: T): T {
   if ((client as unknown as Record<string, unknown>)[WORKFLOW_WRAPPED_FLAG]) return client;
   if (typeof client.trigger === "function") {
     const original = client.trigger.bind(client) as (params: unknown) => unknown;
-    (client as { trigger?: unknown }).trigger = (params: unknown) =>
-      original(Array.isArray(params) ? params.map(stampTriggerOptions) : stampTriggerOptions(params));
+    (client as { trigger?: unknown }).trigger = async (params: unknown) => {
+      // Once per call, not per run of a batch (it may call Supabase auth).
+      if (currentCorrelation()) await maybeExtractSupabaseActor();
+      return original(
+        Array.isArray(params)
+          ? await Promise.all(params.map(stampTriggerOptions))
+          : await stampTriggerOptions(params),
+      );
+    };
   }
   Object.defineProperty(client, WORKFLOW_WRAPPED_FLAG, {
     value: true,
@@ -143,7 +170,7 @@ export function wrapWorkflowClient<T extends WorkflowClientLike>(client: T): T {
   return client;
 }
 
-function stampTriggerOptions(options: unknown): unknown {
+async function stampTriggerOptions(options: unknown): Promise<unknown> {
   const current = currentCorrelation();
   if (!current || !options || typeof options !== "object") return options;
   const opts = options as WorkflowTriggerOptions;
@@ -151,12 +178,16 @@ function stampTriggerOptions(options: unknown): unknown {
   const supplied = Object.keys(headers).find((k) => k.toLowerCase() === CORRELATION_HEADER);
   const id = supplied ? headers[supplied]! : current;
   if (!supplied) headers[CORRELATION_HEADER] = id;
+  const token = AGENT_CORRELATION_ID.test(id) ? await actorToken(id) : null;
+  if (token && !Object.keys(headers).some((k) => k.toLowerCase() === ACTOR_HEADER)) {
+    headers[ACTOR_HEADER] = token;
+  }
   const stamped: WorkflowTriggerOptions = { ...opts, headers };
   // The run id is the only value Upstash repeats on every delivery.
   // Only the agent's own id format goes in (the worker side accepts
   // nothing else); a caller-chosen run id is kept.
   if (opts.workflowRunId == null && AGENT_CORRELATION_ID.test(id)) {
-    stamped.workflowRunId = `${id}_${randomHex(RUN_ID_SUFFIX_BYTES)}`;
+    stamped.workflowRunId = `${id}_${randomHex(RUN_ID_SUFFIX_BYTES)}${token ? `_${token}` : ""}`;
   }
   return stamped;
 }
@@ -172,18 +203,11 @@ function stampTriggerOptions(options: unknown): unknown {
 export function wrapQStashClient<T extends QStashClientLike>(client: T): T {
   if ((client as unknown as Record<string, unknown>)[WRAPPED_FLAG]) return client;
 
-  if (typeof client.publishJSON === "function") {
-    const original = client.publishJSON.bind(client);
-    const wrapped: NonNullable<QStashClientLike["publishJSON"]> = (request) =>
-      original(stampPublishRequest(request));
-    (client as { publishJSON?: typeof wrapped }).publishJSON = wrapped;
-  }
-
-  if (typeof client.publish === "function") {
-    const original = client.publish.bind(client);
-    const wrapped: NonNullable<QStashClientLike["publish"]> = (request) =>
-      original(stampPublishRequest(request));
-    (client as { publish?: typeof wrapped }).publish = wrapped;
+  for (const method of ["publishJSON", "publish"] as const) {
+    if (typeof client[method] !== "function") continue;
+    const original = client[method]!.bind(client) as (request: unknown) => Promise<unknown>;
+    (client as QStashClientLike)[method] = async (request: QStashPublishRequest) =>
+      original(await stampPublishRequest(request));
   }
 
   Object.defineProperty(client, WRAPPED_FLAG, {
@@ -194,25 +218,87 @@ export function wrapQStashClient<T extends QStashClientLike>(client: T): T {
   return client;
 }
 
-function stampPublishRequest(
+async function stampPublishRequest(
   request: QStashPublishRequest,
-): QStashPublishRequest {
+): Promise<QStashPublishRequest> {
   const id = currentCorrelation();
-  if (!id) return request;
+  if (!id || !request || typeof request !== "object") return request;
 
   const headerKey = `${FORWARD_PREFIX}${CORRELATION_HEADER}`;
-  const headers: Record<string, string> = { ...(request.headers ?? {}) };
+  const raw = request.headers;
+  // A Headers instance or [name, value][] spreads to {}: copy its entries.
+  const headers: Record<string, string> =
+    raw instanceof Headers || Array.isArray(raw)
+      ? Object.fromEntries(new Headers(raw as [string, string][]))
+      : { ...((raw as Record<string, string> | undefined) ?? {}) };
   // Caller-supplied id wins.
-  const lower = Object.keys(headers).reduce<Record<string, string>>(
-    (acc, key) => {
-      acc[key.toLowerCase()] = key;
-      return acc;
-    },
-    {},
-  );
-  if (lower[headerKey]) return request;
+  if (Object.keys(headers).some((key) => key.toLowerCase() === headerKey)) return request;
   headers[headerKey] = id;
+  await maybeExtractSupabaseActor();
+  const token = await actorToken(id);
+  if (token) headers[`${FORWARD_PREFIX}${ACTOR_HEADER}`] = token;
   return { ...request, headers };
+}
+
+/**
+ * The current actor's id as a signed token for post-response work
+ * (workflow steps, QStash deliveries), bound to `correlationId`.
+ * Callers first run the late Supabase actor fallback, so a run started
+ * before the request's end still gets the actor the request resolves.
+ * Null when there is no actor, the actor is not a plain human (kind or
+ * principal can't travel), no project token, or the id is too long.
+ * Never throws.
+ */
+async function actorToken(correlationId: string): Promise<string | null> {
+  try {
+    const actor = getCurrentActor();
+    // Only the id travels: an agent / hybrid actor or one with a
+    // principal would arrive looking human, so it is not carried.
+    if (!actor || (actor.kind && actor.kind !== "human") || actor.principal) return null;
+    const actorId = actor.id;
+    const key = configuration().projectToken;
+    if (!actorId || !key) return null;
+    const bytes = new TextEncoder().encode(actorId);
+    if (bytes.length > ACTOR_ID_MAX_BYTES) return null;
+    return `a${toHex(bytes)}_${await actorTag(key, correlationId, actorId)}`;
+  } catch (error) {
+    logger.debug(`upstash actor stamp failed: ${describeError(error)}`);
+    return null;
+  }
+}
+
+/** The actor a verified token names, or null. Never throws. */
+async function readActorToken(
+  token: string | null | undefined,
+  correlationId: string,
+): Promise<ActorContext | null> {
+  try {
+    const match = token ? ACTOR_TOKEN.exec(token) : null;
+    const key = configuration().projectToken;
+    if (!match || !key || match[1]!.length % 2 !== 0) return null;
+    const bytes = new Uint8Array(match[1]!.match(/../g)!.map((h) => parseInt(h, 16)));
+    const actorId = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (!actorId) return null;
+    const expected = await actorTag(key, correlationId, actorId);
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ match[2]!.charCodeAt(i);
+    return diff === 0 ? { id: actorId } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function actorTag(key: string, correlationId: string, actorId: string): Promise<string> {
+  const enc = new TextEncoder();
+  const hmacKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    enc.encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await globalThis.crypto.subtle.sign("HMAC", hmacKey, enc.encode(`${correlationId}\n${actorId}`));
+  return toHex(new Uint8Array(mac).subarray(0, 8));
 }
 
 /**
@@ -246,6 +332,15 @@ export async function captureWorkflowRequest<T>(
   const correlationId = readCorrelationFromHeaders(headers);
   const runId = readHeader(headers, "upstash-workflow-runid");
   const retried = parseRetried(readHeader(headers, "upstash-retried"));
+  // The actor that started the run, when its token verifies against
+  // this correlation id. Otherwise the step's writes have no actor.
+  const actor = correlationId
+    ? ((await readActorToken(
+        readHeader(headers, ACTOR_HEADER) ?? readHeader(headers, `${FORWARD_PREFIX}${ACTOR_HEADER}`),
+        correlationId,
+      )) ??
+      (await readActorToken(runId ? AGENT_RUN_ID.exec(runId)?.[2] : null, correlationId)))
+    : null;
 
   return runJobWithCapture(
     {
@@ -254,6 +349,7 @@ export async function captureWorkflowRequest<T>(
       queue: meta.stepName ?? meta.workflowName,
       retryCount: retried,
       correlationId,
+      actor,
     },
     work,
   );
@@ -293,7 +389,11 @@ export function emitUpstashWorkflowEvent(input: {
 function randomHex(bytes: number): string {
   const buf = new Uint8Array(bytes);
   globalThis.crypto.getRandomValues(buf);
-  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+  return toHex(buf);
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function readHeader(headers: Headers, name: string): string | null {

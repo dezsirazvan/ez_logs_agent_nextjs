@@ -30,6 +30,7 @@
 // values and leave `from: null`. Same gap as Prisma.
 
 import { logger } from "../logger.js";
+import { currentActorSource } from "../actor.js";
 import { configuration } from "../configuration.js";
 import {
   emitDbEvent,
@@ -193,9 +194,10 @@ export function wrapSupabase<T>(client: T): T {
   });
 
   // Register this client as a candidate actor source. The HTTP capture
-  // will call `.auth.getUser()` on the most-recently-registered client
-  // when `actorFromSupabase` is enabled (the default) and no other
-  // actor has been set on the request scope.
+  // will call `.auth.getUser()` on the client registered in the same
+  // request scope (outside any scope: the most recent one) when
+  // `actorFromSupabase` is enabled (the default) and no other actor has
+  // been set on the request scope.
   registerActorSource(obj);
 
   return client;
@@ -203,9 +205,11 @@ export function wrapSupabase<T>(client: T): T {
 
 // ---- actor extraction ---------------------------------------------------
 
-// Per-async-context "current Supabase client" — the most recent one
-// constructed inside the current correlation scope. Stored on globalThis
-// so it survives Next.js / Webpack / Turbopack module duplication.
+// "Current Supabase client" for actor extraction. Inside a request /
+// job scope it is the client constructed in THAT scope (per-scope slot,
+// see actor.ts), so concurrent requests never read each other's user.
+// Outside any scope it falls back to a process-global "most recent
+// client" (pinned on globalThis to survive module duplication).
 const GLOBAL_CLIENT_KEY = Symbol.for("ezlogs-nextjs:supabase-current-client");
 
 interface GlobalWithCurrentClient {
@@ -214,6 +218,12 @@ interface GlobalWithCurrentClient {
 
 function registerActorSource(client: SupabaseClientLike): void {
   try {
+    const slot = currentActorSource();
+    if (slot) {
+      slot.client = client;
+      slot.tried = false; // a new client may know the user
+      return;
+    }
     const g = globalThis as unknown as GlobalWithCurrentClient;
     g[GLOBAL_CLIENT_KEY] = client;
   } catch {
@@ -222,8 +232,9 @@ function registerActorSource(client: SupabaseClientLike): void {
 }
 
 /**
- * Returns the current actor (if any) by asking the most-recently-
- * registered Supabase client for its authenticated user. Returns null
+ * Returns the current actor (if any) by asking the Supabase client
+ * registered in this scope (outside any scope: the most recent one)
+ * for its authenticated user. Returns null
  * when no client is registered or the call fails. Used by the HTTP
  * capturer's default `actorFromSupabase` path.
  *
@@ -234,8 +245,10 @@ export async function tryExtractSupabaseActor(): Promise<{
   id: string;
   label?: string;
 } | null> {
-  const g = globalThis as unknown as GlobalWithCurrentClient;
-  const client = g[GLOBAL_CLIENT_KEY];
+  const slot = currentActorSource();
+  const client = slot
+    ? (slot.client as SupabaseClientLike | undefined)
+    : (globalThis as unknown as GlobalWithCurrentClient)[GLOBAL_CLIENT_KEY];
   if (!client || typeof client.auth?.getUser !== "function") return null;
 
   try {
