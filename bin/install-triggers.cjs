@@ -40,12 +40,39 @@ function installedFromProject() {
 
   // `npx` / `bunx` download the package to a temp dir when it isn't
   // installed in this project — a version that may differ from the one
-  // your app runs, and a place `pg` can't be found from.
-  if (installedFromProject() !== fs.realpathSync(path.join(__dirname, ".."))) {
+  // your app runs, and a place `pg` can't be found from. They also do
+  // it when it IS installed but the lockfile's bin metadata predates
+  // the `ezlogs-nextjs` bin (seen with bun and a `file:` dependency):
+  // then point at the project's own copy.
+  const local = installedFromProject();
+  let runLocal = null;
+  if (local !== fs.realpathSync(path.join(__dirname, ".."))) {
+    let hint;
+    if (local) {
+      let localVersion = "?";
+      try {
+        localVersion = JSON.parse(fs.readFileSync(path.join(local, "package.json"), "utf8")).version;
+      } catch {
+        /* keep "?" */
+      }
+      const localBin = path.join(local, "bin", "install-triggers.cjs");
+      if (fs.existsSync(localBin)) {
+        runLocal = `node ${JSON.stringify(path.relative(process.cwd(), localBin))} install-triggers`;
+      }
+      hint =
+        `This project has ezlogs-nextjs ${localVersion} installed, but npx / bunx did not use it ` +
+        "(usually a lockfile whose bin entries predate 0.3.0, e.g. bun with a `file:` dependency). " +
+        "Run your project's copy instead:\n" +
+        (runLocal ? `    ${runLocal}\n  or ` : "    ") +
+        "./node_modules/.bin/ezlogs-nextjs install-triggers (./node_modules/.bin/install-triggers on older installs).";
+    } else {
+      hint =
+        "Run it from your app's directory after `npm install ezlogs-nextjs` " +
+        "(or `./node_modules/.bin/ezlogs-nextjs install-triggers`).";
+    }
     console.warn(
       `[ezlogs] Running ezlogs-nextjs ${version} from ${path.dirname(__dirname)}, not from ` +
-        "this project's node_modules. Run it from your app's directory after " +
-        "`npm install ezlogs-nextjs` (or `./node_modules/.bin/ezlogs-nextjs install-triggers`).",
+        `this project's node_modules. ${hint}`,
     );
   }
 
@@ -65,7 +92,8 @@ function installedFromProject() {
         "  Install it in your app (the agent also needs it at runtime to read the audit log):\n" +
         "    npm install pg      (or: pnpm add pg / yarn add pg / bun add pg)\n" +
         "  then run this command again from your app's directory.\n" +
-        "  Or print the SQL and run it with your own tool: npx ezlogs-nextjs install-triggers --print",
+        "  Or print the SQL and run it with your own tool: npx ezlogs-nextjs install-triggers --print" +
+        (runLocal ? `\n  This copy was not run from your project; try: ${runLocal}` : ""),
     );
     process.exit(1);
   }

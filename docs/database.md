@@ -166,7 +166,12 @@ no engine boundary between the caller and `pg.Client.prototype.query`.
   false → true`), up to 3 levels deep and 20 leaves per column (5 when
   the old value is unknown, e.g. the Prisma extension). Secret-shaped
   string values (JWTs, API keys, private keys, card numbers) are
-  masked.
+  masked. Bookkeeping leaves are dropped (`created_at` / `updated_at`
+  style keys, `synced_at` / `last_updated_at` / `modified_at` stamps,
+  numeric `version` / `lock_version` / `__v` counters), so
+  `field_sources.name.updated_at` never shows up; value changes come
+  before keys that were added or removed, and the record's own columns
+  come before any dotted leaf.
 - **Soft deletes** (`deleted_at`, `archived_at`, …) are normal changes
   and are sent (they were ignored before 0.3.0). Only `id`,
   `created_at` / `createdAt`, `updated_at` / `updatedAt` and Auth.js'
@@ -242,7 +247,10 @@ redacts at ingest as a backstop.
   never attributed to an unrelated request. They are sent as their own
   actions, one per database transaction, without an actor. 0.1.x's
   `databaseSnapshotMode` guessed instead and was removed (the option is
-  ignored).
+  ignored). If writes made while requests (or jobs) run in a process
+  keep arriving untagged and that process has never sent a tagged row,
+  the agent logs one warning naming the fix (usually
+  `$extends(ezlogsPrisma())`, or `ezlogs.init` missing in a worker).
 - Rows are deleted when sent. A sweep (≤ once per 10 s per process)
   sends untagged rows and tagged rows older than 5 minutes, but only
   rows under 24 hours old, timestamped with when the write happened;

@@ -23,10 +23,15 @@
 //
 // 2. wrapWorkflowClient(client):
 //    Patches `@upstash/workflow`'s `Client.trigger()` so the workflow
-//    run carries the current correlation id as a user header. Upstash
-//    Workflow re-sends user headers on every step delivery, so each
-//    step joins the action of the request that started the run
-//    (instead of one URL-titled action per step).
+//    run carries the current correlation id, so each step joins the
+//    action of the request that started the run (instead of one
+//    URL-titled action per step). Two carriers:
+//      - a user header, which reaches the first delivery only: the SDK
+//        (1.3.x) publishes later steps, context.call results and
+//        parallel steps without the trigger's user headers;
+//      - the run id (`wfr_<correlation id>_<24 hex>`), which Upstash
+//        sends as `Upstash-Workflow-RunId` on every delivery. Only
+//        when the caller didn't pick a `workflowRunId`.
 //
 //    Use:
 //      import { Client } from "@upstash/workflow"
@@ -74,6 +79,14 @@ const LEGACY_CORRELATION_HEADER = "x-correlation-id";
 // verified the QStash signature, so the longer window only applies to
 // signed step deliveries.
 const AGENT_CORRELATION_ID = /^ezl_(\d{13})_[0-9a-f]{8}$/;
+// Run ids minted by wrapWorkflowClient: `wfr_` (added by the SDK) +
+// correlation id + a 96-bit random suffix. Upstash treats a reused run
+// id as a duplicate and silently starts no run, so one request fanning
+// out many runs needs a collision-free suffix. (No length / charset
+// limit in the SDK 1.3.3 source or the docs; the default id is a
+// 21-char nanoid, this one is 55 chars of [a-z0-9_].)
+const AGENT_RUN_ID = /^wfr_(ezl_\d{13}_[0-9a-f]{8})_[0-9a-f]{24}$/;
+const RUN_ID_SUFFIX_BYTES = 12;
 const STEP_ID_MAX_AGE_MS = 24 * 60 * 60_000;
 const STEP_ID_MAX_SKEW_MS = 5 * 60_000;
 
@@ -131,13 +144,21 @@ export function wrapWorkflowClient<T extends WorkflowClientLike>(client: T): T {
 }
 
 function stampTriggerOptions(options: unknown): unknown {
-  const id = currentCorrelation();
-  if (!id || !options || typeof options !== "object") return options;
+  const current = currentCorrelation();
+  if (!current || !options || typeof options !== "object") return options;
   const opts = options as WorkflowTriggerOptions;
   const headers = { ...(opts.headers ?? {}) };
-  if (Object.keys(headers).some((k) => k.toLowerCase() === CORRELATION_HEADER)) return options;
-  headers[CORRELATION_HEADER] = id;
-  return { ...opts, headers };
+  const supplied = Object.keys(headers).find((k) => k.toLowerCase() === CORRELATION_HEADER);
+  const id = supplied ? headers[supplied]! : current;
+  if (!supplied) headers[CORRELATION_HEADER] = id;
+  const stamped: WorkflowTriggerOptions = { ...opts, headers };
+  // The run id is the only value Upstash repeats on every delivery.
+  // Only the agent's own id format goes in (the worker side accepts
+  // nothing else); a caller-chosen run id is kept.
+  if (opts.workflowRunId == null && AGENT_CORRELATION_ID.test(id)) {
+    stamped.workflowRunId = `${id}_${randomHex(RUN_ID_SUFFIX_BYTES)}`;
+  }
+  return stamped;
 }
 
 /**
@@ -203,7 +224,8 @@ function stampPublishRequest(
  *   - Upstash-Workflow-Runid     -> job_id
  *   - Upstash-Retried            -> retry_count
  *   - x-ezlogs-correlation-id (stamped by wrapWorkflowClient /
- *     wrapQStashClient, agent id format only) -> correlation_id
+ *     wrapQStashClient, agent id format only), else the correlation
+ *     id inside a run id minted by wrapWorkflowClient -> correlation_id
  *
  * DB writes inside `work` are tagged with that correlation id and
  * emitted when it finishes, so they join the same action.
@@ -268,6 +290,12 @@ export function emitUpstashWorkflowEvent(input: {
   }
 }
 
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  globalThis.crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function readHeader(headers: Headers, name: string): string | null {
   try {
     const value = headers.get(name);
@@ -287,7 +315,11 @@ function readCorrelationFromHeaders(headers: Headers): string | null {
       readHeader(headers, name) ?? readHeader(headers, `${FORWARD_PREFIX}${name}`);
     if (value && isAcceptableStepId(value)) return value;
   }
-  return null;
+  // Later step deliveries carry no user headers; a run started by
+  // wrapWorkflowClient has the correlation id in its run id.
+  const runId = readHeader(headers, "upstash-workflow-runid");
+  const fromRunId = runId ? AGENT_RUN_ID.exec(runId)?.[1] : undefined;
+  return fromRunId && isAcceptableStepId(fromRunId) ? fromRunId : null;
 }
 
 function parseRetried(value: string | null): number | null {

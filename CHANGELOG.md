@@ -3,6 +3,63 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.3.1] — 2026-11-16
+
+Wire format unchanged. **Upgrade steps:** none (no SQL changed).
+
+### Fixed
+- **jsonb bookkeeping no longer buries the real change.** Nested
+  leaves whose key only records a write (`created_at` / `updated_at`
+  style keys, `synced_at` / `last_updated_at` / `modified_at` stamps,
+  numeric `version` / `lock_version` / `__v` counters) are
+  dropped, so `field_sources.job_title.updated_at` is never sent and a
+  touch-only jsonb update sends no event. Within a column, value
+  changes rank before keys that were added or removed (the 20-leaf cap
+  applies after ranking), and the record's own columns come before any
+  dotted leaf. Soft-delete style names (`deleted_at`, `archived_at`),
+  nested `id`s and other business keys (`subscription.expires`) are
+  kept.
+- **Upstash Workflow: every step delivery joins the request.**
+  `@upstash/workflow` (1.3.x) sends the trigger's headers with the
+  first delivery only; later steps, `context.call` results and parallel
+  steps arrive without them, so each run's last delivery became its own
+  action. `wrapWorkflowClient` now also mints the run id as
+  `wfr_<correlation id>_<24 hex>` (only when you don't pass a
+  `workflowRunId`; 96 random bits, because Upstash silently starts no
+  run for a reused run id), and `captureWorkflowRequest` reads the correlation
+  from `Upstash-Workflow-RunId` when the header is missing. Same rules
+  as the header: agent id format only, at most 24 hours old, inside
+  `serve()` after the signature check. Tested against the real SDK and
+  a fake QStash server delivering every step.
+
+### Added
+- **Self-check for untagged database writes.** With the trigger path,
+  a client the agent can't tag (a plain `new PrismaClient()` without
+  `$extends(ezlogsPrisma())`, a worker process that never called
+  `ezlogs.init`, a second copy of `pg`) splits each action in two: the
+  request without record names, and its DB rows as an actor-less
+  action. When a request or job claims none of its own rows while
+  untagged rows were written during it, five times over at least two
+  minutes, and the process has never claimed a tagged row, the agent
+  logs one warning naming the likely fix (worded for jobs in a worker;
+  another process writing at the same time can also cause it). At most
+  one check per 10 seconds and 50 per process. Rows are still never attributed to a request by guessing.
+  (`pg` used directly was already auto-tagged when `DATABASE_URL` is
+  set; the warning also covers an app that loads its own `pg` copy.)
+
+### Install
+- When `npx` / `bunx` run a downloaded copy although the project has
+  `ezlogs-nextjs` installed (lockfile bin entries older than 0.3.0,
+  seen with bun and a `file:` dependency), the CLI says so and prints
+  the command that runs the project's copy
+  (`node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`),
+  also when it then fails for a missing `pg`.
+
+### Package
+- tsup now splits shared code into chunks instead of copying it into
+  every subpath bundle: 2.09 MB -> 1.3 MB unpacked. Every subpath was
+  checked with `require` and `import` from the packed tarball.
+
 ## [0.3.0] — 2026-11-16
 
 Wire format unchanged: new information rides on existing optional

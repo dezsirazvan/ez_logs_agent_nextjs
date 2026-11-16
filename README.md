@@ -119,7 +119,7 @@ need one more step, depending on your stack:
 |---|---|---|
 | **Supabase** (supabase-js) | `npm i pg`, set `DATABASE_URL` to the Postgres connection string, run `npx ezlogs-nextjs install-triggers`. Nothing to wrap: the agent tags supabase-js requests and the trigger reads the tag. | Every write (`.from()`, `.rpc()`, bulk) with from→to diffs, linked to its request |
 | **Prisma** on Postgres | triggers (as above) + `new PrismaClient().$extends(ezlogsPrisma())` (below) | Same |
-| **Drizzle** (node-postgres) or raw **`pg`** | triggers (as above). The agent patches `pg` itself. | Same |
+| **Drizzle** (node-postgres) or raw **`pg`** | triggers (as above). With `DATABASE_URL` set, the agent patches `pg` itself; if your app loads its own copy of `pg` (monorepos), pass it: `ezlogs.init({ ..., patchDatabaseClient: pg })`. | Same |
 | postgres.js, Neon HTTP, scripts | triggers (as above) | Writes show up as their own actions, not linked to the request |
 | MySQL, SQLite, PlanetScale, no trigger access | a per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)) | New values only, no before-values |
 
@@ -132,7 +132,10 @@ Run it from your app's directory with the package installed there
 (with bun: `bunx ezlogs-nextjs install-triggers` or
 `./node_modules/.bin/ezlogs-nextjs install-triggers`); if the package
 isn't installed locally, npx / bunx download whatever version is
-published, and the CLI warns. Migration tables, sessions, and the
+published, and the CLI warns. They also download it when your
+lockfile's bin entries predate 0.3.0 (seen with bun and a `file:`
+dependency); the CLI then prints the command that runs your project's
+copy: `node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`. Migration tables, sessions, and the
 agent's own audit table are skipped automatically. If `pg` or the
 audit table is missing at runtime, the agent logs one warning at
 startup and leaves the trigger path off.
@@ -155,6 +158,16 @@ documented RLS-extension pattern); reads are untouched. Writes inside
 your own `prisma.$transaction(...)` are not tagged: they still show up,
 as separate actions without an actor. Without the extension, a plain
 PrismaClient's writes are never tagged.
+
+**Background workers** (BullMQ and other job processes) are separate
+processes: call `ezlogs.init` there too and build the database client
+the same way (extension for Prisma), or the job's writes show up as
+separate actions without an actor.
+
+**Self-check:** if writes made while requests or jobs run in a process
+keep arriving untagged, and that process has never sent a tagged row,
+the agent logs one warning naming the fix. It never guesses which
+request an untagged row belongs to.
 
 Without triggers, the extension still sends Prisma writes itself (new
 values only — Prisma doesn't expose the old row). With triggers it

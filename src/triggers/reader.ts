@@ -106,6 +106,34 @@ let deleteDenied = false;
 // across two sweep batches still lands in one action.
 const txCorrelation = new Map<string, string>();
 
+// Untagged-writes self-check. A client the agent can't tag (plain
+// PrismaClient without the extension, a second `pg` copy, a worker
+// that never wired anything) writes rows with no correlation id: each
+// request then shows up twice (request without names + DB rows
+// without actor). When a request / job claims none of its own rows
+// but untagged rows were written while it ran, that is a strike (the
+// rows may also come from another process: a strike is a hint, not
+// proof). After UNTAGGED_STRIKES strikes spread over at least
+// untaggedMinSpanMs, and as long as this process has never claimed a
+// tagged row, log one warning naming the likely fix. Only a warning:
+// the rows are never attributed to the request.
+const UNTAGGED_STRIKES = 5;
+// Checks per process (one indexed `SELECT 1 … LIMIT 1` each, at most
+// one per untaggedCheckIntervalMs), then give up.
+const UNTAGGED_CHECK_BUDGET = 50;
+let untaggedCheckIntervalMs = 10_000;
+let untaggedMinSpanMs = 2 * 60_000;
+// A request's window starts at its correlation id's timestamp, at most this far back.
+const UNTAGGED_WINDOW_MAX_MS = 5 * 60_000;
+// App clock vs database clock (`captured_at`).
+const UNTAGGED_CLOCK_SKEW_MS = 1_000;
+let taggedRowSeen = false;
+let untaggedStrikes = 0;
+let untaggedChecks = 0;
+let lastUntaggedCheckAt = 0;
+let firstUntaggedStrikeAt = 0;
+let untaggedWarned = false;
+
 /**
  * Claim (delete + return) the audit rows tagged with `correlationId`,
  * oldest first. A row can only be claimed once, so concurrent flushes
@@ -365,6 +393,8 @@ export async function flushAuditLog(
   const rows = await readAuditRows(exec, correlationId, options.since ?? null);
   await loadTableMeta(exec, rows);
   emitFresh(rows);
+  if (rows.length > 0) taggedRowSeen = true;
+  else await checkUntaggedWrites(exec, correlationId, options.since ?? null);
 
   const now = Date.now();
   // Prune first, so the sweep never sees rows past the retention cap.
@@ -381,8 +411,66 @@ export async function flushAuditLog(
   }
 }
 
+async function checkUntaggedWrites(
+  exec: SqlExecutor,
+  correlationId: string,
+  since: Date | null,
+): Promise<void> {
+  if (taggedRowSeen || untaggedWarned || untaggedChecks >= UNTAGGED_CHECK_BUDGET) return;
+  const now = Date.now();
+  if (now - lastUntaggedCheckAt < untaggedCheckIntervalMs) return;
+  const idMs = Number(/^ezl_(\d{13})_/.exec(correlationId)?.[1] ?? NaN);
+  const startMs = Math.max((since?.getTime() ?? idMs) - UNTAGGED_CLOCK_SKEW_MS, now - UNTAGGED_WINDOW_MAX_MS);
+  if (!Number.isFinite(startMs)) return;
+  lastUntaggedCheckAt = now;
+  untaggedChecks++;
+  try {
+    const rows = extractRows(
+      (await exec(
+        `SELECT 1 FROM ezlogs_audit_log WHERE correlation_id IS NULL AND captured_at >= $1 LIMIT 1`,
+        [new Date(startMs).toISOString()],
+      )) as ExecResult,
+    );
+    if (rows.length === 0) return;
+  } catch {
+    return;
+  }
+  if (untaggedStrikes++ === 0) firstUntaggedStrikeAt = now;
+  if (untaggedStrikes < UNTAGGED_STRIKES || now - firstUntaggedStrikeAt < untaggedMinSpanMs) return;
+  // Concurrent flushes can pass the gate together: exactly one warns.
+  if (untaggedWarned) return;
+  untaggedWarned = true;
+  const where = since ? "background jobs" : "requests";
+  logger.warn(
+    `database writes made while ${where} ran in this process reached ezlogs_audit_log ` +
+      "with no request tag, and this process has never sent a tagged row. They show up " +
+      "as separate actions with no actor (they are never guessed onto a request). Most " +
+      "likely the database client this app writes with is not tagged (or another process " +
+      "wrote them during these windows). Prisma: `new PrismaClient().$extends(ezlogsPrisma())` (from " +
+      '"ezlogs-nextjs/prisma"). Drizzle / node-postgres: let the agent patch `pg` (set ' +
+      "DATABASE_URL, or `ezlogs.init({ patchDatabaseClient: pg })` with your app's `pg`). " +
+      "In a worker process (BullMQ, …), call `ezlogs.init` there too and build the client " +
+      "the same way. Writes inside your own `prisma.$transaction(...)` stay untagged " +
+      'either way. See README, "Database changes".',
+  );
+}
+
+/** Test-only: shrink the self-check's throttle and span. */
+export function _setUntaggedCheckTimingForTests(intervalMs: number, minSpanMs: number): void {
+  untaggedCheckIntervalMs = intervalMs;
+  untaggedMinSpanMs = minSpanMs;
+}
+
 /** Test-only. */
 export function _resetAuditReaderForTests(): void {
+  taggedRowSeen = false;
+  untaggedStrikes = 0;
+  untaggedChecks = 0;
+  lastUntaggedCheckAt = 0;
+  firstUntaggedStrikeAt = 0;
+  untaggedWarned = false;
+  untaggedCheckIntervalMs = 10_000;
+  untaggedMinSpanMs = 2 * 60_000;
   lastSweepAt = 0;
   lastPruneAt = 0;
   deleteDenied = false;

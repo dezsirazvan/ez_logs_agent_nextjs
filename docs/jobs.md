@@ -138,9 +138,13 @@ export const { POST } = serve(async (context) => {
 });
 ```
 
-The wrapped clients send the current correlation id with the run
-(Upstash re-sends it on every step), so each step's job event and DB
-writes join the action of the request that started the workflow,
-instead of one separate action per step. Wrap the client you actually
+The wrapped clients send the current correlation id with the run, so
+each step's job event and DB writes join the action of the request
+that started the workflow, instead of one separate action per step.
+`wrapWorkflowClient` puts it in a header (first delivery) and in the
+run id (`wfr_<correlation id>_<24 hex>`), because the SDK sends later
+step deliveries without your trigger headers while the run id comes
+with every delivery. If you pass your own `workflowRunId`, it is kept
+and only the first delivery joins the request. Wrap the client you actually
 call (`trigger()` vs `publish()`); unwrapped runs still show up, each
 step as its own action.

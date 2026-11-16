@@ -306,14 +306,53 @@ export function filterMeaningfulChanges(
 // document looks "changed", so only MAX_UNKNOWN_FROM_LEAVES ship.
 // String leaves are free-form app data: secret-shaped values (JWTs,
 // API keys, private keys, card numbers) are masked.
+// Bookkeeping leaves (`field_sources.name.updated_at`, version
+// counters) are dropped, value changes rank before keys that appeared
+// or disappeared, and nested leaves come after the record's own
+// columns, so the cap never pushes a real change out for metadata.
 // (Rails drops non-scalar changes entirely; see AGENT_PARITY_NOTES.)
 const MAX_NESTED_DEPTH = 3;
 const MAX_NESTED_LEAVES = 20;
 const MAX_UNKNOWN_FROM_LEAVES = 5;
+// Leaves examined per column before ranking (bounds the work on huge documents).
+const MAX_SCANNED_LEAVES = 200;
+
+// Nested keys that only record when / how often something was written:
+// create / update stamps plus sync/refresh stamps. Not the rest of the
+// top-level ignored set (`subscription.expires` is business data, a
+// nested `assignee.id` names a linked record). Soft-delete style names
+// (`deleted_at`, `archived_at`, `ends_at`) stay: business state.
+const NESTED_BOOKKEEPING_KEYS: ReadonlySet<string> = new Set([
+  "created_at",
+  "createdAt",
+  "updated_at",
+  "updatedAt",
+]);
+const NESTED_BOOKKEEPING_STAMP =
+  /^(?:last_?)?(?:updated|modified|synced|refreshed|fetched|touched|cached)_?at$/i;
+// Counters bumped on every write; only when both sides are numbers.
+const NESTED_VERSION_COUNTER = /^(?:__v|version|lock_?version)$/i;
+
+function isNestedBookkeeping(key: string, from: unknown, to: unknown): boolean {
+  if (NESTED_BOOKKEEPING_KEYS.has(key) || NESTED_BOOKKEEPING_STAMP.test(key)) return true;
+  return (
+    NESTED_VERSION_COUNTER.test(key) &&
+    typeof to === "number" &&
+    (from === undefined || from === null || typeof from === "number")
+  );
+}
+
+// 0: value changed (known before and after), 1: key appeared /
+// disappeared, 2: before-value unknown.
+function leafRank(change: DbAttributeChange): number {
+  if (change.from === undefined) return 2;
+  return change.from === null || change.to === null ? 1 : 0;
+}
 
 function flattenNestedChanges(changes: DbAttributeChange[]): DbAttributeChange[] {
   if (!changes.some((c) => isPlainRecord(c.to) || isPlainRecord(c.from))) return changes;
   const out: DbAttributeChange[] = [];
+  const nested: DbAttributeChange[] = [];
   for (const c of changes) {
     if (!isPlainRecord(c.to) && !isPlainRecord(c.from)) {
       out.push(c);
@@ -325,10 +364,12 @@ function flattenNestedChanges(changes: DbAttributeChange[]): DbAttributeChange[]
     if (!isMeaningfulAttribute(c.attribute)) continue;
     const leaves: DbAttributeChange[] = [];
     collectLeafChanges(c.attribute, c.from, c.to, 1, leaves);
+    // Stable sort: document order within a rank.
+    leaves.sort((a, b) => leafRank(a) - leafRank(b));
     const cap = c.from === undefined ? MAX_UNKNOWN_FROM_LEAVES : MAX_NESTED_LEAVES;
-    out.push(...leaves.slice(0, cap).map(scrubLeaf));
+    nested.push(...leaves.slice(0, cap).map(scrubLeaf));
   }
-  return out;
+  return out.concat(nested);
 }
 
 function collectLeafChanges(
@@ -338,7 +379,7 @@ function collectLeafChanges(
   depth: number,
   out: DbAttributeChange[],
 ): void {
-  if (out.length > MAX_NESTED_LEAVES) return;
+  if (out.length >= MAX_SCANNED_LEAVES) return;
   const fromObj = isPlainRecord(from);
   const toObj = isPlainRecord(to);
   // Descend only object -> object (or absent / null on one side);
@@ -360,6 +401,7 @@ function collectLeafChanges(
     return;
   }
   if (from !== undefined && sameJson(from, to)) return;
+  if (path.includes(".") && isNestedBookkeeping(path.slice(path.lastIndexOf(".") + 1), from, to)) return;
   out.push(from === undefined ? { attribute: path, to } : { attribute: path, from, to });
 }
 
