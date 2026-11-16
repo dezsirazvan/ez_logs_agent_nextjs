@@ -24,7 +24,8 @@
 // Retention: rows are deleted when claimed, so the table only holds
 // rows not yet emitted. Untagged rows and rows older than
 // ORPHAN_AGE are drained by the sweep; rows older than PRUNE_AGE are
-// deleted without emitting (e.g. when no request ran for a day).
+// deleted without emitting (e.g. when no request ran for a week). A
+// day-long idle (crons, other processes writing) still ships.
 //
 // The reader itself doesn't open transactions or connections; it
 // takes a `SqlExecutor` (the same shape `applyDatabaseContext` uses).
@@ -88,10 +89,11 @@ const COLUMNS =
 const ORPHAN_AGE = "5 minutes";
 const ORPHAN_AGE_MS = 5 * 60_000;
 /** Rows older than this are deleted without emitting (and never swept). */
-const PRUNE_AGE = "24 hours";
+const PRUNE_AGE = "7 days";
 const SWEEP_BATCH = 100;
-// shortcut: 2k rows per 10 min (~290k/day) of expired rows; a bigger
-// backlog takes longer to clear but stays invisible (never swept).
+// shortcut: prunes at most 2k rows per 10 min per process (~290k/day)
+// of expired rows; a bigger backlog takes longer to clear (it stays
+// invisible: never swept) and warns once. Raise it if that warning shows.
 const PRUNE_BATCH = 2_000;
 const SWEEP_INTERVAL_MS = 10_000;
 const PRUNE_INTERVAL_MS = 10 * 60_000;
@@ -100,6 +102,7 @@ const PRUNE_INTERVAL_MS = 10 * 60_000;
 // an extra cheap sweep, never a double emit (claims are DELETEs).
 let lastSweepAt = 0;
 let lastPruneAt = 0;
+let pruneBacklogWarned = false;
 // Last request / job flush in this process. The timer sweep runs only
 // for a while after it, so an idle app doesn't query the database
 // forever (keeps Neon & co. asleep).
@@ -177,7 +180,7 @@ export async function readAuditRows(
         logger.warn(
           "the database role used by the agent cannot DELETE from ezlogs_audit_log. " +
             "Rows will not be cleaned up after they are sent; grant DELETE or schedule " +
-            "`DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '24 hours'`.",
+            "`DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '7 days'`.",
         );
       }
     }
@@ -245,14 +248,28 @@ export async function sweepAuditLog(exec: SqlExecutor): Promise<number> {
 export async function pruneAuditLog(exec: SqlExecutor): Promise<void> {
   if (deleteDenied) return;
   try {
-    await exec(
-      `DELETE FROM ezlogs_audit_log
-        WHERE id IN (
-          SELECT id FROM ezlogs_audit_log
-           WHERE captured_at < now() - interval '${PRUNE_AGE}'
-           LIMIT ${PRUNE_BATCH})`,
-      [],
+    const rows = extractRows(
+      (await exec(
+        `WITH pruned AS (
+           DELETE FROM ezlogs_audit_log
+            WHERE id IN (
+              SELECT id FROM ezlogs_audit_log
+               WHERE captured_at < now() - interval '${PRUNE_AGE}'
+               LIMIT ${PRUNE_BATCH})
+           RETURNING 1)
+         SELECT count(*)::int AS n FROM pruned`,
+        [],
+      )) as ExecResult,
     );
+    const pruned = Number((rows[0] as { n?: unknown } | undefined)?.n ?? 0);
+    if (pruned >= PRUNE_BATCH && !pruneBacklogWarned) {
+      pruneBacklogWarned = true;
+      logger.warn(
+        `deleted ${pruned} ezlogs_audit_log rows older than ${PRUNE_AGE} unsent; more may remain. ` +
+          "The agent only sends rows while requests run; rows written while the app was idle " +
+          `for ${PRUNE_AGE}, or faster than the sweep sends them, are dropped.`,
+      );
+    }
   } catch (err) {
     logger.debug(
       `pruneAuditLog failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -502,6 +519,7 @@ export function _resetAuditReaderForTests(): void {
   untaggedMinSpanMs = 2 * 60_000;
   lastSweepAt = 0;
   lastPruneAt = 0;
+  pruneBacklogWarned = false;
   lastRequestFlushAt = 0;
   deleteDenied = false;
   txCorrelation.clear();

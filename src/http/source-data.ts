@@ -297,9 +297,10 @@ export function determineOutcome(
   if (graphqlResponseErrors) {
     return { outcome: "failure", error_message: graphqlResponseErrors };
   }
-  // A tRPC batch with a failed call answers 207 (the caller only sets
-  // `responseError` for a tRPC error body); same rule as GraphQL 200 + errors.
-  if (statusCode === 207 && responseError) {
+  // Below 400 the caller only sets `responseError` for a tRPC error
+  // body: a 207 batch with a failed call, or a failed call in a 200
+  // streamed batch. Same rule as GraphQL 200 + errors.
+  if (responseError) {
     return { outcome: "failure", error_message: responseError };
   }
   return { outcome: "success", error_message: null };

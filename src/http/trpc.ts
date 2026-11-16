@@ -11,6 +11,16 @@
  *     (optionally superjson-wrapped as `{ error: { json: {…} } }`), or
  *     an array of those for a batch. We read the zod field error first,
  *     then the message, with the 0.3.3 validation masking.
+ *   - Streamed batch (`httpBatchStreamLink`, `trpc-accept: application/jsonl`):
+ *     a 200 JSON Lines body. Line 1 is the head (`{"0":[[0],[null,0,0]]}`,
+ *     one placeholder per call); each later line is a chunk
+ *     `[chunkId, status, value]`, the whole line superjson-wrapped as
+ *     `{ json, meta? }` when a transformer is set. A call's own chunk
+ *     (its id is in the head: `[[0],[null,0,<chunkId>]]`) has value
+ *     `[[{ error: shape }]]` or `[[{ result: 0 }], …]`; nested data,
+ *     promises and yields use the same shape, so only call chunks are
+ *     read that way. A rejected promise / failed iterable carries the
+ *     error shape itself as value (never an array), whatever its id.
  */
 
 import { capErrorText, specificErrorMessage } from "./source-data.js";
@@ -43,6 +53,11 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
+/** A tRPC route: a `trpc` param (the `[trpc]` segment) or a `[trpc]` route module path. */
+export function isTrpcRoute(raw: unknown, routeModulePath: string | null = null): boolean {
+  return (isRecord(raw) && "trpc" in raw) || routeModulePath?.includes("[trpc]") === true;
+}
+
 /**
  * Request params with the tRPC / superjson envelope removed. Only on a
  * tRPC route: a `trpc` param (the `[trpc]` segment) or a route module
@@ -50,8 +65,7 @@ function safeJsonParse(text: string): unknown {
  * when it isn't one of those shapes.
  */
 export function unwrapTrpcParams(raw: unknown, url: URL, routeModulePath: string | null = null): unknown {
-  if (!isRecord(raw)) return raw;
-  if (!("trpc" in raw) && !routeModulePath?.includes("[trpc]")) return raw;
+  if (!isRecord(raw) || !isTrpcRoute(raw, routeModulePath)) return raw;
   const batch = url.searchParams.get("batch") === "1";
   const rest: Record<string, unknown> = {};
   let payload: unknown = undefined;
@@ -144,4 +158,73 @@ function callReason(message: string, zodError: unknown, userPatterns: readonly s
     if (parsed !== undefined) return "Validation failed";
   }
   return message.length > 0 ? message : null;
+}
+
+// A tRPC error chunk is small; longer lines (big results) are skipped.
+const MAX_STREAM_LINE = 16_384;
+
+/**
+ * Reads a streamed tRPC batch body (JSON Lines) as it passes through,
+ * keeping only the current line (at most MAX_STREAM_LINE chars), and
+ * records the reason of the first failed call, as `trpcErrorMessage`.
+ */
+export function trpcStreamErrorScanner(userPatterns: readonly string[] = []): {
+  push(chunk: Uint8Array): void;
+  readonly error: string | null;
+} {
+  const decoder = new TextDecoder();
+  let line = "";
+  let skipping = false; // inside an over-long line: dropped up to its newline
+  let error: string | null = null;
+  let callChunks: Set<number> | null = null; // from the head line
+  return {
+    get error() {
+      return error;
+    },
+    push(chunk) {
+      if (error) return;
+      const parts = decoder.decode(chunk, { stream: true }).split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        if (!skipping) line += parts[i];
+        if (line.length > MAX_STREAM_LINE) {
+          line = "";
+          skipping = true;
+        }
+        if (i === parts.length - 1) return; // incomplete line: wait for more
+        if (!skipping) {
+          if (callChunks) error = streamLineError(line, callChunks, userPatterns);
+          else callChunks = headCallChunks(line);
+        }
+        if (error) return;
+        line = "";
+        skipping = false;
+      }
+    },
+  };
+}
+
+// Head `{"0":[[0],[null,0,<chunkId>]],…}`: the chunk id of each call.
+function headCallChunks(text: string): Set<number> {
+  const ids = new Set<number>();
+  const head = unwrap(safeJsonParse(text));
+  if (!isRecord(head)) return ids;
+  for (const call of Object.values(head)) {
+    const ref: unknown = Array.isArray(call) ? call[1] : null;
+    if (Array.isArray(ref) && typeof ref[2] === "number") ids.add(ref[2]);
+  }
+  return ids;
+}
+
+function streamLineError(
+  text: string,
+  callChunks: ReadonlySet<number>,
+  userPatterns: readonly string[],
+): string | null {
+  const chunk = unwrap(safeJsonParse(text));
+  if (!Array.isArray(chunk) || chunk.length !== 3 || typeof chunk[0] !== "number") return null;
+  const value: unknown = chunk[2];
+  // A value is always an array (`[[data], …]`); a non-array is an error shape.
+  if (!Array.isArray(value)) return trpcErrorMessage({ error: value }, userPatterns);
+  if (!callChunks.has(chunk[0]) || !Array.isArray(value[0])) return null;
+  return trpcErrorMessage(value[0][0], userPatterns);
 }

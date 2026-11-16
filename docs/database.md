@@ -281,10 +281,12 @@ redacts at ingest as a backstop.
   keep arriving untagged and that process has never sent a tagged row,
   the agent logs one warning naming the fix (usually
   `$extends(ezlogsPrisma())`, or `ezlogs.init` missing in a worker).
-- Rows are deleted when sent. A sweep (≤ once per 10 s per process)
-  sends untagged rows and tagged rows older than 5 minutes, but only
-  rows under 24 hours old, timestamped with when the write happened;
-  rows older than 24 hours are deleted unsent. The audit log does not record which EZLogs
+- Rows are deleted when claimed, before they are sent (best-effort: a
+  rejected token or a full buffer loses them). A sweep (≤ once per
+  10 s per process) sends untagged rows and tagged rows older than
+  5 minutes, up to 7 days old, timestamped with when the write
+  happened; rows older than 7 days are deleted unsent (one warning
+  when a backlog remains). The audit log does not record which EZLogs
   project a row belongs to: rows left over from before a token switch
   or a restored snapshot are sent by whichever project reads next. Use
   one project per database.

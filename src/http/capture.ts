@@ -61,7 +61,7 @@ import {
   specificErrorMessage,
   type GraphqlMetadata,
 } from "./source-data.js";
-import { trpcErrorMessage, unwrapTrpcParams } from "./trpc.js";
+import { isTrpcRoute, trpcErrorMessage, trpcStreamErrorScanner, unwrapTrpcParams } from "./trpc.js";
 import {
   extractGraphqlErrorsFromBody,
   isGraphqlPath,
@@ -197,14 +197,27 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             if (snapshot.graphqlBody !== null && response.status === 200) {
               graphqlErrorMessage = await readGraphqlErrors(response);
             }
-            responseErrorMessage = await readResponseErrorMessage(response);
+            const trpcRoute = isTrpcRoute(snapshot.rawParams, context.routeModulePath ?? null);
+            responseErrorMessage = await readResponseErrorMessage(response, trpcRoute);
+            // tRPC's httpBatchStreamLink answers 200 and puts a failed
+            // call's error in a later line of the streamed body.
+            const trpcStream =
+              responseErrorMessage === null && trpcRoute
+                ? trpcStreamErrorScanner(configuration().excludedGraphqlVariableKeys)
+                : null;
             // Streamed bodies (tRPC's httpBatchStreamLink, AI SDK, SSE)
             // do their work after the handler returns: drain the DB rows
             // and emit once the body is done.
-            const followedResponse = followBody(response, snapshot.method, (streamError) => {
-              if (streamError) exception = streamError;
-              return finish();
-            });
+            const followedResponse = followBody(
+              response,
+              snapshot.method,
+              (streamError) => {
+                if (streamError) exception = streamError;
+                responseErrorMessage ??= trpcStream?.error ?? null;
+                return finish();
+              },
+              trpcStream ? (chunk) => trpcStream.push(chunk) : undefined,
+            );
             if (followedResponse) {
               followed = true;
               return followedResponse;
@@ -2020,11 +2033,13 @@ async function emitEvent(input: EmitInput): Promise<void> {
  * no `AsyncLocalStorage.snapshot`. Serverless: followed only when the
  * platform's `waitUntil` can keep the function alive until the event
  * ships; otherwise the event ships before the response, as before.
+ * `onChunk` sees each chunk before it is passed on (its errors are ignored).
  */
 function followBody(
   response: Response,
   method: string,
   onDone: (error: Error | null) => Promise<void>,
+  onChunk?: (chunk: Uint8Array) => void,
 ): Response | null {
   try {
     if (!response.body || method === "HEAD" || response.bodyUsed) return null;
@@ -2056,6 +2071,11 @@ function followBody(
               controller.close();
               finish(null);
             } else {
+              try {
+                onChunk?.(chunk.value);
+              } catch (e) {
+                logger.debug(`streamed chunk scan failed: ${describeError(e)}`);
+              }
               controller.enqueue(chunk.value);
             }
           } catch (e) {
@@ -2216,12 +2236,13 @@ const MAX_ERROR_BODY_LENGTH = 16_384;
  * Truncated to 200 chars, card numbers and tokens masked. Null when
  * there is none or the body isn't small JSON.
  */
-async function readResponseErrorMessage(response: Response): Promise<string | null> {
+async function readResponseErrorMessage(response: Response, trpcRoute = false): Promise<string | null> {
   try {
     // 207 Multi-Status: a tRPC batch where some calls failed. Read only
     // as a tRPC body; any other 207 (WebDAV) stays a success.
     if (response.status < 400 && response.status !== 207) return null;
-    if (!(response.headers.get("content-type") ?? "").includes("json")) return null;
+    // tRPC answers some errors (a mixed query/mutation batch) as text/plain.
+    if (!trpcRoute && !(response.headers.get("content-type") ?? "").includes("json")) return null;
     if (Number(response.headers.get("content-length") ?? 0) > MAX_ERROR_BODY_LENGTH) return null;
     const text = await response.clone().text();
     if (!text || text.length > MAX_ERROR_BODY_LENGTH) return null;

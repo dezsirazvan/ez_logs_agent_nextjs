@@ -261,7 +261,7 @@ record shows by its id.
 
 | Source | What | Where it comes from |
 |---|---|---|
-| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207) is a failure. Known gap: with `httpBatchStreamLink` (create-t3-app's default) the response is a 200 stream, so a failed call inside it is recorded as success. A streamed response (tRPC's `httpBatchStreamLink`, AI SDK, SSE) is recorded when its body ends, with the DB writes made while it streamed | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
+| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207), or a failed call in an `httpBatchStreamLink` stream (create-t3-app's default, HTTP 200), is a failure. A streamed response (tRPC's `httpBatchStreamLink`, AI SDK, SSE) is recorded when its body ends, with the DB writes made while it streamed | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
 | Page views | Page loads (the browser loading a page's HTML). `<Link>` prefetches and client-side navigations are not page views: Next strips their markers before middleware runs, so the two can't be told apart there | `middleware.ts` / Next 16 `proxy.ts` (auto-wrapped) |
 | Server Actions | Action name, args, caller IP, outcome, and where a `redirect()` sent the user (`redirect_to`: same-origin path only, no query, token-like segments masked; external redirects are not recorded). A returned failure is a failure with its message: `{ success: false, error }`, `{ error: "…" }` (no truthy `success` / `ok`, no `data`), and a pure form state `{ errors: { field: [...] } \| [...], message? }` (Next.js `useActionState`), next-safe-action, zsa, Conform, zod `safeParse`. Stay successes: `{ message: "Saved" }`, a database row (`id` / `created_at` / `updatedAt` key) with an `error` column, a partial success like `{ imported: 97, errors: [...] }`. `redirect()` / `notFound()` are not failures | File-level + inline `"use server"` (auto-wrapped) |
 | Database | `model_class`, `operation`, full from→to diffs incl. json leaves (trigger path), record name | Postgres triggers, Prisma, Drizzle, supabase-js |
@@ -349,13 +349,15 @@ event. EZLogs is best-effort, not guaranteed delivery.
   by the agent before sending. DB values are dropped, not sent as
   `"[FILTERED]"` (that placeholder is for request params and job
   arguments).
-- **Retention of `ezlogs_audit_log`.** Rows are deleted as soon as the
-  agent sends them. Rows nobody claimed (untagged writes, or tagged
-  rows older than 5 minutes) are sent as their own actions by a
-  throttled sweep. Rows older than 24 hours are deleted unsent. The
-  agent's role needs `DELETE` on the table; without it the agent warns
-  once and you must schedule
-  `DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '24 hours'`.
+- **Retention of `ezlogs_audit_log`.** Rows are deleted when the agent
+  claims them, before it sends them (best-effort: a rejected token or a
+  full buffer loses them). Rows nobody claimed (untagged writes, or
+  tagged rows older than 5 minutes) are sent as their own actions by a
+  throttled sweep, up to 7 days old. Rows older than 7 days are deleted
+  unsent (one warning when a backlog remains). The agent's role needs
+  `DELETE` on the table; without it the agent warns once and you must
+  schedule
+  `DELETE FROM ezlogs_audit_log WHERE captured_at < now() - interval '7 days'`.
 - **Access to `ezlogs_audit_log`.** Row-level security is on and all
   privileges are revoked from `PUBLIC` and Supabase's `anon` /
   `authenticated`, so the table is not reachable through PostgREST.

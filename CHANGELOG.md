@@ -100,10 +100,9 @@ to `excludedPaths` if you don't want them.
   filtered); the `trpc` procedure param is kept. The reason names the
   failing procedure (`post.delete: Not allowed`), and a batch where
   some calls failed (HTTP 207 with a tRPC body) is now a failure; any
-  other 207 stays a success. **Known gap:** `httpBatchStreamLink`
-  answers 200 with a JSONL stream, so a failed call inside it is still
-  recorded as success (reading it would hold the stream until every
-  call finished).
+  other 207 stays a success. A tRPC error body sent as `text/plain`
+  (a batch mixing queries and mutations) keeps its reason instead of
+  `HTTP 400`.
 - **`install-triggers` ignored `.env`.** It now loads `.env`,
   `.env.local` and `.env.[mode]` like Next.js: the app's `@next/env`
   when present, else dotenv's grammar (quoted values with trailing
@@ -129,6 +128,24 @@ to `excludedPaths` if you don't want them.
   At runtime, trigger rows from a session-named table ship only when
   the row has none of those columns, so session stores tracked by an
   older install stay dropped.
+- **Failed calls in a tRPC `httpBatchStreamLink` batch were recorded
+  as success.** create-t3-app's default link answers 200 with a JSON
+  Lines stream; a failed call's error arrives in a later line. On tRPC
+  routes (a `trpc` param or a `[trpc]` route path) the agent now reads
+  the lines as they pass through (no buffering, no delay, one line of
+  at most 16 KB kept) and records the first failed call as a failure
+  (a call's own chunk, from the head line's chunk ids, or a rejected
+  promise / failed iterable; error-shaped data stays a success),
+  named after its procedure (`post.create: UNAUTHORIZED`). Needs the
+  body to be followed (see above); otherwise it stays a success.
+- **Audit rows older than 24 hours were deleted unsent.** The agent
+  pruned rows older than 24 hours, and the sweep skipped them, so rows
+  written while no request ran for a day (a cron, another process)
+  were lost. The cutoff is now 7 days for both: the sweep sends rows
+  up to 7 days old (100 per sweep, oldest first, timestamped with when
+  the write happened); older rows are still pruned unsent (2k rows
+  every 10 minutes per process), so the table stays bounded. A prune
+  that deletes a full batch logs one warning.
 
 ### Docs
 - `$extends(ezlogsPrisma())` is the recommended Prisma path, with or

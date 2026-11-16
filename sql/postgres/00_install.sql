@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS ezlogs_audit_log_correlation_idx
   WHERE correlation_id IS NOT NULL;
 
 -- Secondary index for the agent's retention sweep (rows older than
--- 5 minutes are drained, rows older than 24 hours are deleted).
+-- 5 minutes are drained, rows older than 7 days are deleted).
 CREATE INDEX IF NOT EXISTS ezlogs_audit_log_captured_at_idx
   ON public.ezlogs_audit_log (captured_at);
 
