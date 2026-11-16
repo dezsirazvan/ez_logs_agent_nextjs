@@ -3,6 +3,13 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [Unreleased]
+
+### Changed
+- **Startup line key hint** now matches the dashboard (Settings → API Keys):
+  `[ezlogs] capturing → <host> (key ezl_<first 8>…)`. Tokens not shaped
+  like `ezl_…` get no hint.
+
 ## [0.4.0] — 2026-11-16
 
 Wire format unchanged; one new optional `source_data` field

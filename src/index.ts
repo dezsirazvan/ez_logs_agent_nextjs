@@ -83,8 +83,9 @@ const STARTUP_ANNOUNCED_KEY = Symbol.for("ezlogs-nextjs:startupAnnounced");
 
 /**
  * One line per process at the default log level, so "is it on?" is
- * answerable from the terminal: where events go and which project
- * (last 4 token characters only). Missing config says so instead.
+ * answerable from the terminal: where events go and which key, shown
+ * the way the dashboard's Settings → API Keys shows it (`ezl_` + first
+ * 8 characters). Missing config says so instead.
  */
 function announceStartup(serverUrl: string | null, projectToken: string | null): void {
   const g = globalThis as Record<symbol, unknown>;
@@ -101,9 +102,9 @@ function announceStartup(serverUrl: string | null, projectToken: string | null):
   } catch {
     // keep the raw value; warnIfInsecureServerUrl covers malformed URLs
   }
-  // The suffix only identifies the project when the token is long
-  // enough that 4 characters reveal next to nothing of it.
-  const project = projectToken.length >= 12 ? ` (project …${projectToken.slice(-4)})` : "";
+  // Other token shapes get no hint: only the dashboard's own prefix is shown.
+  const project =
+    projectToken.startsWith("ezl_") && projectToken.length >= 24 ? ` (key ${projectToken.slice(0, 12)}…)` : "";
   logger.notice(`capturing → ${host}${project}`);
 }
 

@@ -118,7 +118,7 @@ Restart your dev server and look for this line in the terminal (one
 per server process, at the default log level):
 
 ```
-[ezlogs] capturing → app.ezlogs.io (project …1a2b)
+[ezlogs] capturing → app.ezlogs.io (key ezl_a1b2c3d4…)
 ```
 
 If `serverUrl` or `projectToken` is missing you get
