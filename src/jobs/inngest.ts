@@ -122,36 +122,37 @@ export function ezlogsInngestMiddleware(): unknown {
         // downstream function's onFunctionRun can read it back.
         onSendEvent() {
           return {
-            // Inngest awaits this hook (MaybePromise): the correlation id
-            // is stamped synchronously, the signed actor (async HMAC) after.
-            transformInput(args: InngestSendContext): Promise<void> | void {
+            // Inngest awaits this hook (MaybePromise) and sends the
+            // payloads it returns. Stamped copies: the caller's event
+            // objects are never written (one reused across requests
+            // would carry the first request's id and actor).
+            transformInput(
+              args: InngestSendContext,
+            ): Promise<InngestSendContext> | InngestSendContext | void {
               try {
                 const id = currentCorrelation();
                 if (!id) return;
                 if (!Array.isArray(args.payloads)) return;
                 const stamped: Array<Record<string, unknown>> = [];
-                for (const payload of args.payloads) {
-                  if (!payload || typeof payload !== "object") continue;
-                  const data = (payload.data ?? {}) as Record<string, unknown>;
+                const payloads = args.payloads.map((payload) => {
+                  if (!payload || typeof payload !== "object") return payload;
+                  const data = payload.data ?? {};
                   if (typeof data !== "object" || data === null || Array.isArray(data)) {
-                    continue;
+                    return payload;
                   }
-                  if (
-                    typeof (data as Record<string, unknown>).ezlogs_correlation_id ===
-                    "string"
-                  ) {
-                    continue;
+                  if (typeof (data as Record<string, unknown>).ezlogs_correlation_id === "string") {
+                    return payload;
                   }
-                  (data as Record<string, unknown>).ezlogs_correlation_id = id;
-                  if (!(ACTOR_PAYLOAD_KEY in data)) stamped.push(data);
-                  // Re-attach in case the data slot was newly created.
-                  (payload as Record<string, unknown>).data = data;
-                }
+                  const copy: Record<string, unknown> = { ...data, ezlogs_correlation_id: id };
+                  if (!(ACTOR_PAYLOAD_KEY in copy)) stamped.push(copy);
+                  return { ...payload, data: copy };
+                });
                 const pending = stamped.length > 0 ? signedActorToken(id) : null;
-                if (!pending) return;
+                if (!pending) return { payloads };
                 // The sender's human actor, verified by runInsideInngestCorrelation.
                 return pending.then((token) => {
                   if (token) for (const data of stamped) data[ACTOR_PAYLOAD_KEY] = token;
+                  return { payloads };
                 });
               } catch (error) {
                 logger.debug(`inngest send-stamp failed: ${describeError(error)}`);
@@ -191,7 +192,8 @@ export async function runInsideInngestCorrelation<T>(
       await flushJobAuditLog(startedAt);
     }
   };
-  return runWithCorrelation(id, () => (actor ? runWithActorScope(body, actor) : body()));
+  // Fresh actor scope: never the actor of the scope that called us.
+  return runWithCorrelation(id, () => runWithActorScope(body, actor));
 }
 
 function functionId(fn: InngestRunContext["fn"]): string | null {

@@ -115,10 +115,11 @@ async function runWithEzlogsCapture(
  *      call to the Trigger.dev API server, but only the receiving
  *      task's middleware sees that — not the payload's data slot),
  *      OR
- *   2. Call `stampPayloadForTrigger(payload)` themselves before
- *      invoking trigger().
+ *   2. Call `stampPayloadForTrigger(payload)` themselves and pass
+ *      the returned payload to trigger().
  *
- * This helper exists for case 2.
+ * This helper exists for case 2. It returns a stamped copy; the
+ * payload passed in is not modified.
  */
 export function stampPayloadForTrigger(payload: unknown): unknown {
   const id = currentCorrelation();
@@ -127,8 +128,7 @@ export function stampPayloadForTrigger(payload: unknown): unknown {
     return payload;
   }
   const obj = payload as Record<string, unknown>;
-  if (typeof obj.ezlogs_correlation_id !== "string" || !obj.ezlogs_correlation_id) {
-    obj.ezlogs_correlation_id = id;
-  }
-  return obj;
+  if (typeof obj.ezlogs_correlation_id === "string" && obj.ezlogs_correlation_id) return obj;
+  // A copy: the caller's object is never written.
+  return { ...obj, ezlogs_correlation_id: id };
 }

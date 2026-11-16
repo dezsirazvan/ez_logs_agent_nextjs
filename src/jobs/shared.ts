@@ -193,10 +193,9 @@ export async function runJobWithCapture<T>(
       throw error;
     }
   };
-  const actor = meta.actor;
-  return runWithCorrelation(correlationId, () =>
-    actor ? runWithActorScope(body, actor) : body(),
-  );
+  // Always a fresh actor scope: the job's actor is only the one it
+  // carried, never the scope its worker was created in.
+  return runWithCorrelation(correlationId, () => runWithActorScope(body, meta.actor ?? null));
 }
 
 // Clock skew allowance between the app and the database when matching
@@ -254,19 +253,22 @@ export function extractCorrelationFromPayload(
 }
 
 /**
- * Stamp the current correlation id into a payload object (mutating).
- * No-op if there's no active correlation scope or the payload already
- * carries one (caller intent wins, parity with Sidekiq client middleware).
+ * The payload with the current correlation id stamped, as a shallow
+ * copy: the caller's object is never written, so one reused across
+ * requests (a module constant) can't carry an earlier request's id.
+ * Returns the payload itself when there's no active correlation scope
+ * or it already carries an id (caller intent wins, parity with Sidekiq
+ * client middleware).
  */
-export function stampCorrelationOnPayload(
-  payload: Record<string, unknown> | null | undefined,
+export function stampCorrelationOnPayload<T extends Record<string, unknown> | null | undefined>(
+  payload: T,
   key: string = CORRELATION_PAYLOAD_KEY,
-): void {
-  if (!payload || typeof payload !== "object") return;
-  if (typeof payload[key] === "string" && payload[key]) return;
+): T {
+  if (!payload || typeof payload !== "object") return payload;
+  if (typeof payload[key] === "string" && payload[key]) return payload;
   const id = currentCorrelation();
-  if (!id) return;
-  payload[key] = id;
+  if (!id) return payload;
+  return { ...payload, [key]: id };
 }
 
 /**

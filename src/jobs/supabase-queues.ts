@@ -107,14 +107,17 @@ function stampPgmqMessage(
 ): Record<string, unknown> {
   // pgmq.send takes { queue_name, message, sleep_seconds? }
   // pgmq.send_batch takes { queue_name, messages, sleep_seconds? }
+  // Stamped copies: the caller's args and messages are never written.
   if ("message" in args && isPlainObject(args.message)) {
-    stampCorrelationOnPayload(args.message as Record<string, unknown>);
-  } else if (Array.isArray(args.messages)) {
-    for (const msg of args.messages) {
-      if (isPlainObject(msg)) {
-        stampCorrelationOnPayload(msg as Record<string, unknown>);
-      }
-    }
+    return { ...args, message: stampCorrelationOnPayload(args.message as Record<string, unknown>) };
+  }
+  if (Array.isArray(args.messages)) {
+    return {
+      ...args,
+      messages: args.messages.map((msg) =>
+        isPlainObject(msg) ? stampCorrelationOnPayload(msg as Record<string, unknown>) : msg,
+      ),
+    };
   }
   return args;
 }
@@ -157,12 +160,11 @@ export async function captureQueueMessage<T>(
 /**
  * Imperatively stamp the correlation id onto a pgmq message body
  * before passing it to a non-wrapped client. Available for users
- * who want explicit control.
+ * who want explicit control. Returns a stamped copy; send that one.
  */
 export function stampPgmqPayload(message: unknown): unknown {
   if (!isPlainObject(message)) return message;
-  stampCorrelationOnPayload(message as Record<string, unknown>);
-  return message;
+  return stampCorrelationOnPayload(message as Record<string, unknown>);
 }
 
 function isPlainObject(value: unknown): boolean {

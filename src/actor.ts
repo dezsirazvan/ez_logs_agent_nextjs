@@ -17,6 +17,7 @@
 import { logger } from "./logger.js";
 import { createScopedStorage } from "./edge-fallback.js";
 import { configuration, type ActorContext } from "./configuration.js";
+import { scopeExpired } from "./correlation.js";
 
 export type { ActorContext } from "./configuration.js";
 
@@ -30,6 +31,9 @@ const storage = createScopedStorage<ActorContext | null>(
  * been set yet (or the actorFromRequest hook returned null).
  */
 export function getCurrentActor(): ActorContext | null {
+  // Past its request's grace window the scope links nothing (see
+  // `endCorrelationScope`): no correlation id, so no actor either.
+  if (scopeExpired()) return null;
   return storage.read();
 }
 

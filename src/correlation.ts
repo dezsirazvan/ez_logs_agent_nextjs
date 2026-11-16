@@ -59,9 +59,25 @@ const PLATFORM_REQUEST_ID_HEADERS = [
 // in one chunk is invisible to a `current()` call in another, and DB
 // events ship with correlation_id=NONE despite running inside the
 // Server Action's scope.
-const storage = createScopedStorage<string>(
+// The scope is a mutable holder so the request can end it (see
+// `endCorrelationScope`).
+interface CorrelationScope {
+  id: string;
+  /** Epoch ms after which the scope no longer links anything. */
+  expiresAt: number;
+}
+const storage = createScopedStorage<CorrelationScope>(
   Symbol.for("ezlogs-nextjs:correlation-storage"),
 );
+
+/**
+ * How long a request's scope keeps linking work after the request's
+ * events were flushed: `after()` / `waitUntil` work finishes well
+ * within it. Anything later (a `setInterval` or long-lived object
+ * started inside the request) runs unlinked, never on that request.
+ */
+export const REQUEST_GRACE_MS = 60_000;
+let graceMs = REQUEST_GRACE_MS;
 
 /**
  * Generates a new correlation id.
@@ -187,7 +203,27 @@ function fnv1aHex(input: string): string {
  * active.
  */
 export function current(): string | null {
-  return storage.read();
+  const scope = storage.read();
+  return scope && Date.now() <= scope.expiresAt ? scope.id : null;
+}
+
+/**
+ * True when the current scope belonged to a request that ended more
+ * than the grace window ago. The actor is not read then either.
+ */
+export function scopeExpired(): boolean {
+  const scope = storage.read();
+  return scope !== null && Date.now() > scope.expiresAt;
+}
+
+/**
+ * Called by an HTTP entry point once its events are flushed: async
+ * work the request started keeps its correlation id (and actor) for
+ * `REQUEST_GRACE_MS`, then reads none.
+ */
+export function endCorrelationScope(): void {
+  const scope = storage.read();
+  if (scope && scope.expiresAt === Infinity) scope.expiresAt = Date.now() + graceMs;
 }
 
 /**
@@ -201,7 +237,12 @@ export function runWithCorrelation<R>(
   correlationId: string,
   callback: () => R,
 ): R {
-  return storage.run(correlationId, callback);
+  return storage.run({ id: correlationId, expiresAt: Infinity }, callback);
+}
+
+/** Test-only. Overrides `REQUEST_GRACE_MS` (pass nothing to restore). */
+export function _setRequestGraceMsForTests(ms: number = REQUEST_GRACE_MS): void {
+  graceMs = ms;
 }
 
 /** Test-only. Returns whether AsyncLocalStorage is in use. */

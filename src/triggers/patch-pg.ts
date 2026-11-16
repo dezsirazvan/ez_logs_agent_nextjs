@@ -92,6 +92,11 @@ type ClientTxState = {
   inTx: boolean;
   /** Have we already injected SET LOCAL into the current tx? */
   injected: boolean;
+  /**
+   * Settles when the agent's in-flight BEGIN..COMMIT wrap on this
+   * Client is done. Null when none is running.
+   */
+  busy: Promise<void> | null;
 };
 const txState = new WeakMap<object, ClientTxState>();
 
@@ -165,6 +170,30 @@ function runPatchedQuery(
   callback: unknown,
 ): unknown {
   const state = ensureState(client);
+
+  // One Client shared by concurrent callers: a wrap is several queries,
+  // so a query issued meanwhile would land inside the wrap's transaction
+  // and be tagged with its correlation id. Queue it behind the wrap, the
+  // way pg queues it behind any single query (same order, and decided
+  // when it runs, in its caller's context).
+  if (state.busy) {
+    const queued = state.busy.then(() =>
+      runPatchedQuery(client, original, config, values, callback),
+    );
+    // pg returns a submittable (cursor, stream) itself and submits it
+    // when the client is free; it reports its own errors.
+    if (isSubmittable(config)) {
+      queued.catch(() => {});
+      return config;
+    }
+    const cb = typeof callback === "function" ? callback : typeof values === "function" ? values : null;
+    if (cb) {
+      queued.catch((err) => (cb as (e: unknown) => void)(err));
+      return undefined;
+    }
+    return queued;
+  }
+
   const text = extractQueryText(config);
   const verb = leadingVerb(text);
 
@@ -363,6 +392,15 @@ function wrapInTx(
       },
     );
 
+  const done = wrapped.then(
+    () => {},
+    () => {},
+  );
+  state.busy = done;
+  void done.then(() => {
+    if (state.busy === done) state.busy = null;
+  });
+
   // Re-bridge to a callback if the caller used callback-style. Pool's
   // internal handler does this — firing the callback signals "release
   // the connection."
@@ -379,10 +417,14 @@ function wrapInTx(
 function ensureState(client: object): ClientTxState {
   let s = txState.get(client);
   if (!s) {
-    s = { inTx: false, injected: false };
+    s = { inTx: false, injected: false, busy: null };
     txState.set(client, s);
   }
   return s;
+}
+
+function isSubmittable(config: PgQueryArg): boolean {
+  return typeof config === "object" && config !== null && typeof config.submit === "function";
 }
 
 function extractQueryText(config: PgQueryArg): string {

@@ -12,7 +12,9 @@ below) so DB writes join their request. Optional: re-run
 `npx ezlogs-nextjs install-triggers` to start tracking session-named
 business tables the old name rule skipped. Behavior change: auth POSTs
 (sign-in, sign-up, sign-out, login, logout) are now captured; add them
-to `excludedPaths` if you don't want them.
+to `excludedPaths` if you don't want them. Behavior change:
+`stampPayloadForTrigger` and `stampPgmqPayload` return a stamped copy
+and no longer modify their argument; send the returned value.
 
 ### Added
 - **`wrapPostgresJs` (`ezlogs-nextjs/postgres`).** postgres.js writes
@@ -146,6 +148,35 @@ to `excludedPaths` if you don't want them.
   the write happened); older rows are still pruned unsent (2k rows
   every 10 minutes per process), so the table stays bounded. A prune
   that deletes a full batch logs one warning.
+- **Wrong request or actor on DB writes and jobs (correlation audit).**
+  Four cases put a write or a job on another request, or gave it
+  another actor. Each now links correctly or stays unlinked (its own
+  action, no actor):
+  - *One `pg.Client` shared by concurrent requests.* A tagged write is
+    BEGIN, set_config, the write and COMMIT; on a shared client
+    another request's queries ran in between, inside that
+    transaction, with its id and actor. A query issued on a client
+    while the agent's BEGIN..COMMIT runs there now waits for it, as pg
+    queues behind any single query (same order). Pools were not
+    affected.
+  - *A job with no carried actor got its worker's actor.* A BullMQ
+    `Worker` created inside a request gave every later job that
+    request's actor, and `setActor` in such a job changed the
+    request's actor. Every job runner (BullMQ, Inngest, Trigger.dev,
+    pgmq, Upstash Workflow) now runs the body in a fresh actor scope:
+    only the actor the job carried, or none.
+  - *A reused job payload kept the first request's id and actor.* The
+    agent wrote the correlation id and signed actor into the caller's
+    payload object, so a module-level constant enqueued from later
+    requests ran on the first one. BullMQ, Inngest, pgmq and the
+    Trigger.dev helper now stamp a copy; the caller's object is never
+    written. A correlation id the caller set is still kept.
+  - *Async work a request started kept its id forever.* A
+    `setInterval` or long-lived object started inside a request tagged
+    its writes (and enqueued jobs, outgoing fetches) with that request
+    long after it ended. A request's scope now links work for 60 s
+    after the request's events are flushed (`after()` / `waitUntil`
+    work stays linked); later work runs unlinked.
 
 ### Docs
 - `$extends(ezlogsPrisma())` is the recommended Prisma path, with or

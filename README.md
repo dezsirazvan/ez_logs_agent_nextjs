@@ -370,6 +370,12 @@ event. EZLogs is best-effort, not guaranteed delivery.
   exposes for supabase-js). Untagged writes show up as their own
   actions without an actor. An inbound `x-ezlogs-correlation-id` is
   honored only in the agent's own format and if under an hour old.
+- **Work that outlives a request.** Async work started inside a
+  request (`after()`, `waitUntil`, an un-awaited write) keeps its
+  correlation id and actor for 60 seconds after the request's events
+  are flushed. After that (a `setInterval`, a long-lived object
+  created lazily inside a request) its writes, jobs and fetches are
+  unlinked: their own actions, never the old request's.
 
 ## Wire-format parity
 

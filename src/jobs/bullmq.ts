@@ -305,19 +305,16 @@ function isOurs(data: unknown): boolean {
   return Boolean(id) && obj[CORRELATION_PAYLOAD_KEY] === id && !(ACTOR_PAYLOAD_KEY in obj);
 }
 
+// Copies, like stampPayload: the caller's object never gets the token.
 function withActor(data: unknown, token: string | null): unknown {
-  if (token) (data as Record<string, unknown>)[ACTOR_PAYLOAD_KEY] = token;
-  return data;
+  return token ? { ...(data as Record<string, unknown>), [ACTOR_PAYLOAD_KEY]: token } : data;
 }
 
 function stampPayload(data: unknown): unknown {
   if (data === null || typeof data !== "object" || Array.isArray(data)) {
     return data;
   }
-  const obj = data as Record<string, unknown>;
-  // Mutate in place to avoid breaking BullMQ's serialization paths.
-  stampCorrelationOnPayload(obj, CORRELATION_PAYLOAD_KEY);
-  return obj;
+  return stampCorrelationOnPayload(data as Record<string, unknown>, CORRELATION_PAYLOAD_KEY);
 }
 
 function describeError(error: unknown): string {

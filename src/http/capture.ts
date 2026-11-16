@@ -37,6 +37,7 @@ import {
 import { classifyUserAgent, type AgentDetection } from "../user-agent-detector.js";
 import {
   current as currentCorrelation,
+  endCorrelationScope,
   resolveCorrelation,
   runWithCorrelation,
 } from "../correlation.js";
@@ -187,6 +188,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
                 // never break the host request — flushNow already swallows
               });
             }
+            endCorrelationScope();
           };
 
           try {
@@ -371,7 +373,7 @@ export function withMiddlewareCapture<
           }
 
           return response;
-        }),
+        }).finally(endCorrelationScope),
       );
     } catch (preCaptureError) {
       if (middlewareInvoked) throw preCaptureError;
@@ -592,6 +594,7 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
             if (isServerless()) {
               await flushScheduler.flushNow().catch(() => undefined);
             }
+            endCorrelationScope();
           }
         }),
       );
@@ -754,6 +757,7 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
             if (isServerless()) {
               await flushScheduler.flushNow().catch(() => undefined);
             }
+            endCorrelationScope();
           }
         }),
       );
