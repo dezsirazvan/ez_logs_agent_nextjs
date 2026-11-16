@@ -140,7 +140,8 @@ need one more step, depending on your stack:
 | **Supabase** (supabase-js) | `npm i pg`, set `DATABASE_URL` to the Postgres connection string, run `npx ezlogs-nextjs install-triggers`. Nothing to wrap: the agent tags supabase-js requests and the trigger reads the tag. | Every write (`.from()`, `.rpc()`, bulk) with from→to diffs, linked to its request |
 | **Prisma** on Postgres | triggers (as above) + `new PrismaClient().$extends(ezlogsPrisma())` (below) | Same |
 | **Drizzle** (node-postgres) or raw **`pg`** | triggers (as above). With `DATABASE_URL` set, the agent patches `pg` itself; if your app loads its own copy of `pg` (monorepos), pass it: `ezlogs.init({ ..., patchDatabaseClient: pg })`. | Same |
-| postgres.js, Neon HTTP, scripts | triggers (as above) | Writes show up as their own actions, not linked to the request |
+| **postgres.js** or **Drizzle** on postgres-js | triggers (as above) + `wrapPostgresJs(postgres(url))` (below) | Same |
+| Neon HTTP, scripts | triggers (as above) | Writes show up as their own actions, not linked to the request |
 | MySQL, SQLite, PlanetScale, no trigger access | a per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)) | New values only, no before-values |
 
 ```bash
@@ -190,6 +191,29 @@ your own `prisma.$transaction(...)` are not tagged: they still show up,
 as separate actions without an actor. Without the extension, a plain
 PrismaClient's writes are never tagged.
 
+**postgres.js / Drizzle on postgres-js** (Vercel Postgres templates,
+`nextjs/saas-starter`): triggers **plus** wrap the `sql` instance once.
+
+```ts
+// lib/db.ts
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import { wrapPostgresJs } from "ezlogs-nextjs/postgres";
+
+export const sql = wrapPostgresJs(postgres(process.env.DATABASE_URL!));
+export const db = drizzle(sql); // Drizzle: pass the wrapped instance
+```
+
+Each write inside a captured request (``sql`insert …` ``, `sql.unsafe`,
+Drizzle inserts / updates / deletes) runs as BEGIN; set_config
+(correlation id, actor); your write; COMMIT on one pooled connection,
+and resolves after COMMIT. Inside your own `sql.begin` / Drizzle
+`db.transaction`, the setting is applied once at the start. Reads,
+cursors, `sql.file`, COPY and `sql.reserve()` connections are not
+tagged: those writes show up as their own actions. Each tagged write
+is its own transaction (4 round trips instead of 1), so write latency
+grows with your database round-trip time.
+
 **Background workers** (BullMQ and other job processes) are separate
 processes: call `ezlogs.init` there too and build the database client
 the same way (extension for Prisma), or the job's writes show up as
@@ -237,7 +261,8 @@ record shows by its id.
 
 | Source | What | Where it comes from |
 |---|---|---|
-| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207) is a failure. Known gap: with `httpBatchStreamLink` (create-t3-app's default) the response is a 200 stream, so a failed call inside it is recorded as success | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
+| HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207) is a failure. Known gap: with `httpBatchStreamLink` (create-t3-app's default) the response is a 200 stream, so a failed call inside it is recorded as success. A streamed response (tRPC's `httpBatchStreamLink`, AI SDK, SSE) is recorded when its body ends, with the DB writes made while it streamed | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
+| Page views | Page loads (the browser loading a page's HTML). `<Link>` prefetches and client-side navigations are not page views: Next strips their markers before middleware runs, so the two can't be told apart there | `middleware.ts` / Next 16 `proxy.ts` (auto-wrapped) |
 | Server Actions | Action name, args, caller IP, outcome, and where a `redirect()` sent the user (`redirect_to`: same-origin path only, no query, token-like segments masked; external redirects are not recorded). A returned failure is a failure with its message: `{ success: false, error }`, `{ error: "…" }` (no truthy `success` / `ok`, no `data`), and a pure form state `{ errors: { field: [...] } \| [...], message? }` (Next.js `useActionState`), next-safe-action, zsa, Conform, zod `safeParse`. Stay successes: `{ message: "Saved" }`, a database row (`id` / `created_at` / `updatedAt` key) with an `error` column, a partial success like `{ imported: 97, errors: [...] }`. `redirect()` / `notFound()` are not failures | File-level + inline `"use server"` (auto-wrapped) |
 | Database | `model_class`, `operation`, full from→to diffs incl. json leaves (trigger path), record name | Postgres triggers, Prisma, Drizzle, supabase-js |
 | Background jobs | `job_class`, `job_id`, `queue`, `retry_count`, sanitized `arguments`, plus the DB writes the job made | BullMQ, Inngest, Trigger.dev, pgmq, Upstash Workflow |

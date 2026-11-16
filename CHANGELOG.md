@@ -6,13 +6,69 @@ Earlier releases (0.1.x) were not tracked in a changelog.
 ## [0.4.0] — 2026-11-16
 
 Wire format unchanged; one new optional `source_data` field
-(`redirect_to`). **Upgrade steps:** none required. Optional: re-run
+(`redirect_to`). **Upgrade steps:** none required. postgres.js /
+Drizzle-on-postgres-js apps: wrap the `sql` instance (`wrapPostgresJs`,
+below) so DB writes join their request. Optional: re-run
 `npx ezlogs-nextjs install-triggers` to start tracking session-named
 business tables the old name rule skipped. Behavior change: auth POSTs
 (sign-in, sign-up, sign-out, login, logout) are now captured; add them
 to `excludedPaths` if you don't want them.
 
+### Added
+- **`wrapPostgresJs` (`ezlogs-nextjs/postgres`).** postgres.js writes
+  reached the audit log untagged, so each one became its own
+  actor-less action (0 of 56 linked in `nextjs/saas-starter`).
+  `wrapPostgresJs(postgres(url))`, also passed to Drizzle's
+  postgres-js driver, runs each write made inside a captured request
+  as BEGIN; set_config (correlation id, actor); write; COMMIT, and
+  applies the setting at the start of your own `sql.begin` /
+  `db.transaction`. The caller's query resolves after COMMIT (a COMMIT
+  error rejects it). Reads, cursors, COPY, `sql.file` and
+  `sql.reserve()` connections are left untagged (own actions, never on
+  another request). `query.cancel()` reaches the running statement.
+  Each tagged write is a transaction (BEGIN, set_config, write,
+  COMMIT): write latency grows with the database round trip.
+- **Next 16 `proxy.ts` is auto-wrapped** like `middleware.ts` (root or
+  `src/`, named `proxy` or default export), so page views and the
+  correlation seed work on Next 16. Only when the project's `next` is
+  16 or newer (before that `proxy.ts` is an ordinary module); other
+  files named `proxy.ts` are left alone.
+- **Startup line** at the default log level, once per process:
+  `[ezlogs] capturing → <host> (project …last4)` (the suffix only for
+  tokens of 12+ characters), or `[ezlogs] not capturing: … missing`.
+  The README verify step uses it.
+- **`redirect_to`** on Server Action events: the same-origin path a
+  `redirect()` sent the user to (no query; token-like segments,
+  emails and secrets masked). External redirects are not recorded.
+  Not used to reclassify.
+- **"Name your records"** README step: person names come only from
+  `displayNameFor` (e.g. `users: (row) => row.full_name ?? row.username`);
+  its function form may now return any value (stringified). The
+  installer points at it.
+
 ### Fixed
+- **Streamed responses lost their DB changes.** tRPC's default
+  `httpBatchStreamLink`, AI SDK and SSE routes do their work after the
+  handler returns; the agent drained audit rows at return, so the card
+  said "no data change" and the rows arrived 5+ minutes later without
+  an actor. A route's body is now passed through unchanged (chunk by
+  chunk, no buffering) and the request is recorded when the body ends,
+  errors (failure) or is cancelled, with the writes made while it
+  streamed and the actor. `duration_ms` stays the handler's time.
+  On serverless this needs the platform's
+  `waitUntil` (Vercel); without it the event ships before the
+  response, as before.
+- **`<Link>` prefetches were recorded as page views** (123 of 136
+  actions in one production app). Next strips its prefetch / RSC
+  markers before middleware runs; the agent now counts only page
+  loads (`Sec-Fetch-Mode: navigate`, or no Fetch Metadata), and drops
+  requests with `Next-Url`, `Sec-Purpose: prefetch`, or the router
+  headers. Client-side navigations are no longer page views either:
+  in middleware they can't be told apart from prefetches.
+- **Leftover audit rows waited for the next request.** The throttled
+  sweep (untagged rows, tagged rows older than 5 minutes) now also
+  runs on the flush timer for about 5 minutes after the last request,
+  so they ship within seconds; an idle app stops querying its database.
 - **Server Action failures recorded as success.** A returned
   `{ error: "Invalid email or password" }` (no truthy `success` / `ok`,
   no `data`) and the Next.js docs' form state `{ errors: { field: [...] },
@@ -73,20 +129,6 @@ to `excludedPaths` if you don't want them.
   At runtime, trigger rows from a session-named table ship only when
   the row has none of those columns, so session stores tracked by an
   older install stay dropped.
-
-### Added
-- **Startup line** at the default log level, once per process:
-  `[ezlogs] capturing → <host> (project …last4)` (the suffix only for
-  tokens of 12+ characters), or `[ezlogs] not capturing: … missing`.
-  The README verify step uses it.
-- **`redirect_to`** on Server Action events: the same-origin path a
-  `redirect()` sent the user to (no query; token-like segments,
-  emails and secrets masked). External redirects are not recorded.
-  Not used to reclassify.
-- **"Name your records"** README step: person names come only from
-  `displayNameFor` (e.g. `users: (row) => row.full_name ?? row.username`);
-  its function form may now return any value (stringified). The
-  installer points at it.
 
 ### Docs
 - `$extends(ezlogsPrisma())` is the recommended Prisma path, with or

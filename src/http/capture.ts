@@ -41,6 +41,7 @@ import {
   runWithCorrelation,
 } from "../correlation.js";
 import { flushAuditLog } from "../triggers/reader.js";
+import { makeAsyncContextCapture } from "../edge-fallback.js";
 import {
   isAuthActionName,
   isAuthPath,
@@ -154,15 +155,60 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
           let exception: Error | null = null;
           let graphqlErrorMessage: string | null = null;
           let responseErrorMessage: string | null = null;
+          // Set when the body is followed: the event is then emitted
+          // when the body has been sent, not when the handler returned.
+          let followed = false;
+          // duration_ms is the handler's time (as in Rails), even when
+          // the event waits for a streamed body.
+          let handlerMs: number | null = null;
+
+          const finish = async () => {
+            // Last chance to populate the actor — at this point any
+            // Supabase client constructed during the handler is
+            // registered, and its auth cookies have been read.
+            await maybeExtractSupabaseActor();
+
+            await emitEvent({
+              snapshot,
+              context,
+              statusCode,
+              exception,
+              graphqlErrorMessage,
+              responseErrorMessage,
+              durationMs: handlerMs ?? Date.now() - startMs,
+              startedAt: new Date(startMs),
+            });
+            // In serverless mode, the periodic flush scheduler can't be
+            // trusted (the process freezes between invocations). Drain
+            // synchronously here so this request's events ship before
+            // the function returns.
+            if (isServerless()) {
+              await flushScheduler.flushNow().catch(() => {
+                // never break the host request — flushNow already swallows
+              });
+            }
+          };
 
           try {
             response = await Promise.resolve(runHandler(...args));
+            handlerMs = Date.now() - startMs;
             statusCode = response.status;
 
             if (snapshot.graphqlBody !== null && response.status === 200) {
               graphqlErrorMessage = await readGraphqlErrors(response);
             }
             responseErrorMessage = await readResponseErrorMessage(response);
+            // Streamed bodies (tRPC's httpBatchStreamLink, AI SDK, SSE)
+            // do their work after the handler returns: drain the DB rows
+            // and emit once the body is done.
+            const followedResponse = followBody(response, snapshot.method, (streamError) => {
+              if (streamError) exception = streamError;
+              return finish();
+            });
+            if (followedResponse) {
+              followed = true;
+              return followedResponse;
+            }
             return response;
           } catch (e) {
             // redirect() / notFound() / permanentRedirect() thrown from a
@@ -178,30 +224,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             statusCode = 500;
             throw e;
           } finally {
-            // Last chance to populate the actor — at this point any
-            // Supabase client constructed during the handler is
-            // registered, and its auth cookies have been read.
-            await maybeExtractSupabaseActor();
-
-            await emitEvent({
-              snapshot,
-              context,
-              statusCode,
-              exception,
-              graphqlErrorMessage,
-              responseErrorMessage,
-              durationMs: Date.now() - startMs,
-              startedAt: new Date(startMs),
-            });
-            // In serverless mode, the periodic flush scheduler can't be
-            // trusted (the process freezes between invocations). Drain
-            // synchronously here so this request's events ship before
-            // the function returns.
-            if (isServerless()) {
-              await flushScheduler.flushNow().catch(() => {
-                // never break the host request — flushNow already swallows
-              });
-            }
+            if (!followed) await finish();
           }
         }),
       );
@@ -349,20 +372,38 @@ export function withMiddlewareCapture<
 
 /**
  * Should a middleware-intercepted request produce a page-navigation
- * event? Yes when:
+ * event? Only for a page load: the browser (or a non-browser client)
+ * loading the page's HTML. Yes when:
  *   - It's a GET (page renders are GETs; POST in middleware is a form
  *     submission that one of our other capturers will pick up).
  *   - It's NOT a Server Action invocation (`Next-Action` header).
- *   - It's NOT an RSC client-side fetch (`Next-Url` + RSC accept, or
- *     `?_rsc=...` query, or `RSC=1` header — Next sets these on
- *     client-side route transitions and they'd flood the timeline).
+ *   - It's NOT a router fetch: a `<Link>` prefetch or a client-side
+ *     navigation's RSC payload. Next 15/16 strip the markers (`RSC`,
+ *     `Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`,
+ *     `Next-Router-State-Tree`, `?_rsc=`) before middleware / proxy
+ *     runs, so the reliable signals left are `Next-Url` (sent on router
+ *     fetches) and the browser's Fetch Metadata: a page load has
+ *     `Sec-Fetch-Mode: navigate`; `fetch()` has cors / same-origin.
+ *     Prefetches and client-side navigations look the same here, so
+ *     neither counts as a page view (a prefetch is not a view; partial
+ *     beats wrong). The markers are still checked for setups that keep
+ *     them (`__NEXT_NO_MIDDLEWARE_URL_NORMALIZE`, edge rendering).
+ *   - It's NOT a browser prefetch / prerender (`Sec-Purpose`), nor a
+ *     Pages Router data or prefetch request.
  *   - The path isn't excluded (static assets, `_next/*`, etc.).
  */
 function shouldEmitPageNavigation(request: MiddlewareRequest): boolean {
   if (request.method !== "GET") return false;
-  if (request.headers.get("next-action")) return false;
-  if (request.headers.get("rsc")) return false;
-  if (request.headers.get("next-router-prefetch")) return false;
+  const headers = request.headers;
+  if (headers.get("next-action")) return false;
+  for (const marker of ROUTER_FETCH_HEADERS) {
+    if (headers.get(marker) !== null) return false;
+  }
+  if (/prefetch|prerender/i.test(headers.get("sec-purpose") ?? headers.get("purpose") ?? "")) {
+    return false;
+  }
+  const fetchMode = headers.get("sec-fetch-mode");
+  if (fetchMode !== null && fetchMode !== "navigate") return false;
 
   let url: URL;
   try {
@@ -380,6 +421,17 @@ function shouldEmitPageNavigation(request: MiddlewareRequest): boolean {
   if (url.pathname.startsWith("/api/")) return false;
   return true;
 }
+
+// Headers only Next's client router (or the Pages Router) sends.
+const ROUTER_FETCH_HEADERS = [
+  "rsc",
+  "next-router-prefetch",
+  "next-router-segment-prefetch",
+  "next-router-state-tree",
+  "next-url",
+  "x-middleware-prefetch",
+  "x-nextjs-data",
+] as const;
 
 async function emitPageNavigationEvent(input: {
   request: MiddlewareRequest;
@@ -1956,6 +2008,92 @@ async function emitEvent(input: EmitInput): Promise<void> {
     const cidLabel = cid ? ` (correlation_id=${cid})` : "";
     logger.error(`http capture emit failed${cidLabel}: ${describeError(error)}`);
   }
+}
+
+/**
+ * The same response with its body passed through chunk by chunk (no
+ * buffering), calling `onDone` once when the body has been fully read,
+ * cancelled (client gone: no error) or has errored. Each read runs in the
+ * request's async context, so a pull-based stream's work still sees the
+ * request's correlation id and actor. Null (caller keeps the original)
+ * when there is no body to follow: none, HEAD (Next never reads it), or
+ * no `AsyncLocalStorage.snapshot`. Serverless: followed only when the
+ * platform's `waitUntil` can keep the function alive until the event
+ * ships; otherwise the event ships before the response, as before.
+ */
+function followBody(
+  response: Response,
+  method: string,
+  onDone: (error: Error | null) => Promise<void>,
+): Response | null {
+  try {
+    if (!response.body || method === "HEAD" || response.bodyUsed) return null;
+    const capture = makeAsyncContextCapture();
+    if (!capture) return null;
+    const keepAlive = isServerless() ? platformWaitUntil() : null;
+    if (isServerless() && !keepAlive) return null;
+    const run = capture();
+    let settled!: () => void;
+    keepAlive?.(new Promise<void>((resolve) => (settled = resolve)));
+    const source = response.body;
+    // Locked only once Next starts sending, so a throw below leaves the
+    // original response intact.
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let finished = false;
+    const finish = (error: Error | null) => {
+      if (finished) return;
+      finished = true;
+      run(() => onDone(error))
+        .catch((e) => logger.debug(`streamed response capture failed: ${describeError(e)}`))
+        .finally(() => settled?.());
+    };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            const chunk = await run(() => (reader ??= source.getReader()).read());
+            if (chunk.done) {
+              controller.close();
+              finish(null);
+            } else {
+              controller.enqueue(chunk.value);
+            }
+          } catch (e) {
+            controller.error(e);
+            finish(e instanceof Error ? e : new Error(String(e)));
+          }
+        },
+        cancel(reason) {
+          finish(null);
+          return reader ? reader.cancel(reason) : source.cancel(reason);
+        },
+      },
+      // Read the source only when the consumer asks: nothing is buffered.
+      { highWaterMark: 0 },
+    );
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (e) {
+    logger.debug(`could not follow the response body: ${describeError(e)}`);
+    return null;
+  }
+}
+
+/** The hosting platform's `waitUntil` for this request (Vercel / Next request context). */
+function platformWaitUntil(): ((promise: Promise<unknown>) => void) | null {
+  for (const key of ["@next/request-context", "@vercel/request-context"]) {
+    try {
+      const holder = (globalThis as Record<symbol, { get?: () => unknown } | undefined>)[Symbol.for(key)];
+      const ctx = holder?.get?.() as { waitUntil?: (p: Promise<unknown>) => void } | undefined;
+      if (typeof ctx?.waitUntil === "function") return ctx.waitUntil.bind(ctx);
+    } catch {
+      // no request context here
+    }
+  }
+  return null;
 }
 
 function buildContext(): Record<string, unknown> | null {

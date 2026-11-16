@@ -24,6 +24,8 @@
 // it works without bundler magic.
 
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
@@ -137,7 +139,8 @@ export function withEzlogsConfig<T extends object = NextConfig>(userConfig?: T):
       if (!options.isServer) return merged;
       return installLoaders(merged, options);
     },
-    turbopack: mergeTurbopackConfig(nextConfig.turbopack, loaderPath),
+    // Next loads next.config from the project directory.
+    turbopack: mergeTurbopackConfig(nextConfig.turbopack, loaderPath, process.cwd()),
   } as NextConfig as T;
 }
 
@@ -153,7 +156,9 @@ function mergeServerExternalPackages(
 function mergeTurbopackConfig(
   userTurbopack: TurbopackConfig | undefined,
   loaderPath: string,
+  projectDir: string,
 ): TurbopackConfig {
+  const wrapProxy = nextMajorVersion(projectDir) >= 16;
   // Per-extension rules. Turbopack's `as` field is the loader-output's
   // file-type assertion — when set to "*.js" it skips TS parsing on
   // the output, which fails on TypeScript route handlers. The fix:
@@ -207,6 +212,25 @@ function mergeTurbopackConfig(
       ],
       as: `*.${ext}`,
     };
+    // Next 16 renamed middleware.ts to proxy.ts (export `proxy` or a
+    // default). `proxy.ts` is a common helper name, so the loader only
+    // rewrites the one at the project root or under src/. No `as`: with
+    // it Turbopack names the module `proxy.ts.ts`, Next 16.2 then no
+    // longer sees it as the proxy and every request 500s ("must export
+    // a function named `middleware`"). The rewrite only appends plain
+    // JS, so the file keeps its own TS / JS pipeline. Before Next 16
+    // `proxy.ts` is an ordinary user module: left alone.
+    if (wrapProxy) {
+      ezlogsRules[`**/proxy.${ext}`] = {
+        condition: { not: "browser" },
+        loaders: [
+          {
+            loader: loaderPath,
+            options: { kind: "proxy", projectDir },
+          },
+        ],
+      };
+    }
 
     // Server Actions live in user-conventional directories: `actions/`,
     // `app/actions/`, `src/actions/`, `src/app/actions/`. We scope the
@@ -355,6 +379,20 @@ function installLoaders(
     ],
   });
 
+  // Root proxy.ts (Next 16's name for middleware.ts), same anchoring.
+  // Before Next 16 `proxy.ts` is an ordinary user module: left alone.
+  if (nextMajorVersion(projectDir) >= 16) {
+    newRules.push({
+      test: new RegExp(`^${escapeRegex(projectDir)}[/\\\\](src[/\\\\])?proxy\\.(${extPattern})$`),
+      use: [
+        {
+          loader: loaderPath,
+          options: { kind: "proxy", projectDir },
+        },
+      ],
+    });
+  }
+
   // Server Actions — scoped to the conventional `actions/` directories.
   // Running on every file broke Turbopack import resolution (the `as`
   // hint doubled extensions on component imports). The loader fast-path
@@ -440,6 +478,17 @@ function resolveLoaderPath(): string {
       ? __dirname
       : dirname(fileURLToPath(import.meta.url));
   return resolve(here, "loader.cjs");
+}
+
+/** Major version of the `next` the project resolves; 0 when unknown. */
+function nextMajorVersion(projectDir: string): number {
+  try {
+    const req = createRequire(resolve(projectDir, "package.json"));
+    const pkg = JSON.parse(readFileSync(req.resolve("next/package.json"), "utf8")) as { version?: string };
+    return Number.parseInt(pkg.version ?? "", 10) || 0;
+  } catch {
+    return 0;
+  }
 }
 
 function escapeRegex(input: string): string {

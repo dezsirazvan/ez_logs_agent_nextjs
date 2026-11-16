@@ -86,6 +86,7 @@ const COLUMNS =
 
 /** Rows older than this are drained by the sweep even if tagged (their request never flushed). */
 const ORPHAN_AGE = "5 minutes";
+const ORPHAN_AGE_MS = 5 * 60_000;
 /** Rows older than this are deleted without emitting (and never swept). */
 const PRUNE_AGE = "24 hours";
 const SWEEP_BATCH = 100;
@@ -99,6 +100,10 @@ const PRUNE_INTERVAL_MS = 10 * 60_000;
 // an extra cheap sweep, never a double emit (claims are DELETEs).
 let lastSweepAt = 0;
 let lastPruneAt = 0;
+// Last request / job flush in this process. The timer sweep runs only
+// for a while after it, so an idle app doesn't query the database
+// forever (keeps Neon & co. asleep).
+let lastRequestFlushAt = 0;
 // DELETE denied (read-only reader role): fall back to SELECT and
 // leave retention to the customer.
 let deleteDenied = false;
@@ -390,12 +395,29 @@ export async function flushAuditLog(
   if (!exec) return;
   const correlationId = currentCorrelation();
   if (!correlationId) return;
+  lastRequestFlushAt = Date.now();
   const rows = await readAuditRows(exec, correlationId, options.since ?? null);
   await loadTableMeta(exec, rows);
   emitFresh(rows);
   if (rows.length > 0) taggedRowSeen = true;
   else await checkUntaggedWrites(exec, correlationId, options.since ?? null);
 
+  await maintainAuditLog(exec);
+}
+
+/**
+ * Flush-timer entry: the throttled prune + sweep, but only until
+ * ORPHAN_AGE (+ one sweep) after this process's last request flush, so
+ * that request's leftover rows (untagged, or tagged and orphaned) ship
+ * without waiting for another request, and an idle app stops querying.
+ */
+export async function maintainAuditLogAfterRequests(exec: SqlExecutor): Promise<void> {
+  if (Date.now() - lastRequestFlushAt >= ORPHAN_AGE_MS + SWEEP_INTERVAL_MS) return;
+  await maintainAuditLog(exec);
+}
+
+/** Throttled prune + sweep (end of each request, and the flush timer). */
+export async function maintainAuditLog(exec: SqlExecutor): Promise<void> {
   const now = Date.now();
   // Prune first, so the sweep never sees rows past the retention cap.
   if (now - lastPruneAt >= PRUNE_INTERVAL_MS) {
@@ -449,6 +471,8 @@ async function checkUntaggedWrites(
       "wrote them during these windows). Prisma: `new PrismaClient().$extends(ezlogsPrisma())` (from " +
       '"ezlogs-nextjs/prisma"). Drizzle / node-postgres: let the agent patch `pg` (set ' +
       "DATABASE_URL, or `ezlogs.init({ patchDatabaseClient: pg })` with your app's `pg`). " +
+      "postgres.js / Drizzle postgres-js: `wrapPostgresJs(postgres(url))` (from " +
+      '"ezlogs-nextjs/postgres"). ' +
       "In a worker process (BullMQ, …), call `ezlogs.init` there too and build the client " +
       "the same way. Writes inside your own `prisma.$transaction(...)` stay untagged " +
       'either way. See README, "Database changes".',
@@ -459,6 +483,11 @@ async function checkUntaggedWrites(
 export function _setUntaggedCheckTimingForTests(intervalMs: number, minSpanMs: number): void {
   untaggedCheckIntervalMs = intervalMs;
   untaggedMinSpanMs = minSpanMs;
+}
+
+/** Test-only: pretend this process's last request flush happened at `at`. */
+export function _setLastRequestFlushForTests(at: number): void {
+  lastRequestFlushAt = at;
 }
 
 /** Test-only. */
@@ -473,6 +502,7 @@ export function _resetAuditReaderForTests(): void {
   untaggedMinSpanMs = 2 * 60_000;
   lastSweepAt = 0;
   lastPruneAt = 0;
+  lastRequestFlushAt = 0;
   deleteDenied = false;
   txCorrelation.clear();
   tableMeta.clear();

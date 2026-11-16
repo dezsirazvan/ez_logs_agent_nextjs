@@ -16,6 +16,7 @@ import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
 import { drainEvents } from "./buffer.js";
 import { retrySender } from "./retry-sender.js";
+import { maintainAuditLogAfterRequests } from "../triggers/reader.js";
 
 const GLOBAL_KEY = Symbol.for("ezlogs-nextjs:flush-scheduler-state");
 
@@ -82,8 +83,16 @@ async function tick(): Promise<void> {
   s.inFlight = true;
   try {
     const events = drainEvents();
-    if (events.length === 0) return;
-    await retrySender.send(events);
+    if (events.length > 0) await retrySender.send(events);
+    // Leftover audit rows of recent requests ship on the timer too;
+    // after the send, so a slow database never holds up events. Swept
+    // rows are already claimed (deleted), so they ship in this tick.
+    // Throttled, errors swallowed inside.
+    const reader = configuration().databaseReader;
+    if (!reader) return;
+    await maintainAuditLogAfterRequests(reader);
+    const swept = drainEvents();
+    if (swept.length > 0) await retrySender.send(swept);
   } catch (error) {
     logger.error(`FlushScheduler tick failed: ${describeError(error)}`);
   } finally {

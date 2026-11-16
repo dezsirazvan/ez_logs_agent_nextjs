@@ -23,7 +23,7 @@
 // auto-instrumented; users wrap manually with captureRoute() if they
 // need it.
 
-import { sep } from "node:path";
+import { relative, sep } from "node:path";
 
 // Sucrase's deep parser entry point has no published types and lives
 // at an internal path that could move in a future sucrase release.
@@ -85,6 +85,7 @@ interface PitchContext {
   data?: Record<string, unknown>;
   emitWarning?: (warning: Error | string) => void;
   getOptions?: () => Record<string, unknown>;
+  rootContext?: string;
 }
 
 const HTTP_METHOD_NAMES = [
@@ -168,6 +169,11 @@ function loaderImpl(this: PitchContext, source: string): string {
   }
   if (kind === "middleware") {
     return rewriteMiddleware(source);
+  }
+  if (kind === "proxy") {
+    const root =
+      (options.projectDir as string | undefined) ?? this.rootContext ?? process.cwd();
+    return isRootProxyFile(this.resourcePath, root) ? rewriteMiddleware(source, "proxy") : source;
   }
   if (kind === "server-action") {
     // The server-action loader also handles supabase factory wrapping
@@ -970,14 +976,14 @@ function hasFileLevelUseServer(source: string): boolean {
  * The `export const config = { matcher: ... }` named export is left
  * untouched so Next still picks up the matcher metadata.
  */
-function rewriteMiddleware(source: string): string {
-  const namedRenamed = renameExport(source, "middleware");
+function rewriteMiddleware(source: string, name: "middleware" | "proxy" = "middleware"): string {
+  const namedRenamed = renameExport(source, name);
   if (namedRenamed.changed) {
     const wrapperBlock = [
       "",
       "// --- ezlogs-nextjs auto-wrap middleware (build-time) ---",
       `import { withMiddlewareCapture as __ezlogs_with_mw } from "${PACKAGE_NAME}";`,
-      `export const middleware = __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}middleware);`,
+      `export const ${name} = __ezlogs_with_mw(${ALREADY_WRAPPED_MARKER}${name});`,
       "// --- end ezlogs-nextjs auto-wrap middleware ---",
       "",
     ].join("\n");
@@ -998,6 +1004,12 @@ function rewriteMiddleware(source: string): string {
   }
 
   return source;
+}
+
+/** `<root>/proxy.<ext>` or `<root>/src/proxy.<ext>` (Next's only proxy locations). */
+function isRootProxyFile(resourcePath: string, root: string): boolean {
+  const rel = relative(root, resourcePath).split(sep).join("/");
+  return /^(?:src\/)?proxy\.[cm]?[jt]sx?$/.test(rel);
 }
 
 function rewritePagesApi(source: string, routeModulePath: string): string {

@@ -106,6 +106,7 @@ at build time. Both Webpack and Turbopack are supported.
 | `app/**/route.{ts,tsx,js,jsx}` | `app-route-handler` | App Router route handlers (GET / POST / …): `export async function GET`, `export const GET =`, `export { handler as GET }` and `export const { GET, POST } = handlers` (Auth.js v5) |
 | `pages/api/**/*.{ts,tsx,js,jsx}` | `pages-api` | Pages Router API routes |
 | `middleware.{ts,tsx,js,jsx}` (root + `src/`) | `middleware` | Your `middleware.ts` (correlation seeding) |
+| `proxy.{ts,tsx,js,jsx}` (root + `src/` only) | `proxy` | Next 16's `proxy.ts` (`export function proxy` or a default export), same as middleware |
 | `actions/**/*`, `app/**/actions.{ts,tsx}`, `app/**/actions/**/*` | `server-action` | File-level `"use server"` modules |
 | `app/**/{page,layout,template,loading,error,default,not-found}.{ts,tsx,js,jsx}` | `inline-server-action` | Inline `"use server"` actions inside RSC components |
 | `lib/supabase/**`, `utils/supabase/**` (+ `src/` variants) | `supabase-factory` | Rewrites Supabase factory imports to auto-instrument every client |

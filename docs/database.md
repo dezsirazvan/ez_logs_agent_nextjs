@@ -273,7 +273,7 @@ redacts at ingest as a backstop.
   PostgREST's `request.headers` (`x-correlation-id`, injected by the
   agent into every outgoing fetch) for supabase-js. Only the agent's
   own id format is trusted.
-- Untagged rows (Prisma without `ezlogsPrisma()` or inside your own `$transaction`, postgres.js, scripts) are
+- Untagged rows (Prisma without `ezlogsPrisma()` or inside your own `$transaction`, postgres.js without `wrapPostgresJs`, scripts) are
   never attributed to an unrelated request. They are sent as their own
   actions, one per database transaction, without an actor. 0.1.x's
   `databaseSnapshotMode` guessed instead and was removed (the option is
