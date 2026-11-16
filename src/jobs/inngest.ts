@@ -29,7 +29,11 @@ import {
   emitJobEvent,
   extractCorrelationFromPayload,
   flushJobAuditLog,
+  signedActorToken,
+  readActorToken,
+  ACTOR_PAYLOAD_KEY,
 } from "./shared.js";
+import { runWithActorScope } from "../actor.js";
 import {
   current as currentCorrelation,
   runWithCorrelation,
@@ -118,11 +122,14 @@ export function ezlogsInngestMiddleware(): unknown {
         // downstream function's onFunctionRun can read it back.
         onSendEvent() {
           return {
-            transformInput(args: InngestSendContext) {
+            // Inngest awaits this hook (MaybePromise): the correlation id
+            // is stamped synchronously, the signed actor (async HMAC) after.
+            transformInput(args: InngestSendContext): Promise<void> | void {
               try {
                 const id = currentCorrelation();
                 if (!id) return;
                 if (!Array.isArray(args.payloads)) return;
+                const stamped: Array<Record<string, unknown>> = [];
                 for (const payload of args.payloads) {
                   if (!payload || typeof payload !== "object") continue;
                   const data = (payload.data ?? {}) as Record<string, unknown>;
@@ -136,9 +143,16 @@ export function ezlogsInngestMiddleware(): unknown {
                     continue;
                   }
                   (data as Record<string, unknown>).ezlogs_correlation_id = id;
+                  if (!(ACTOR_PAYLOAD_KEY in data)) stamped.push(data);
                   // Re-attach in case the data slot was newly created.
                   (payload as Record<string, unknown>).data = data;
                 }
+                const pending = stamped.length > 0 ? signedActorToken(id) : null;
+                if (!pending) return;
+                // The sender's human actor, verified by runInsideInngestCorrelation.
+                return pending.then((token) => {
+                  if (token) for (const data of stamped) data[ACTOR_PAYLOAD_KEY] = token;
+                });
               } catch (error) {
                 logger.debug(`inngest send-stamp failed: ${describeError(error)}`);
               }
@@ -164,15 +178,20 @@ export async function runInsideInngestCorrelation<T>(
   event: { data?: unknown } | undefined,
   callback: () => Promise<T>,
 ): Promise<T> {
-  const id = extractCorrelationFromPayload(event?.data) ?? generateCorrelation();
+  const carried = extractCorrelationFromPayload(event?.data);
+  const id = carried ?? generateCorrelation();
+  // The sending request's human actor, when its signed token verifies.
+  const token = (event?.data as Record<string, unknown> | null | undefined)?.[ACTOR_PAYLOAD_KEY];
+  const actor = carried && token !== undefined ? await readActorToken(token, carried) : null;
   const startedAt = new Date();
-  return runWithCorrelation(id, async () => {
+  const body = async () => {
     try {
       return await callback();
     } finally {
       await flushJobAuditLog(startedAt);
     }
-  });
+  };
+  return runWithCorrelation(id, () => (actor ? runWithActorScope(body, actor) : body()));
 }
 
 function functionId(fn: InngestRunContext["fn"]): string | null {

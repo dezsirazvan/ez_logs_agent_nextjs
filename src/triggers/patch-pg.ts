@@ -46,6 +46,7 @@ import type { ActorContext } from "../configuration.js";
 import { getCurrentActor } from "../actor.js";
 import { current as currentCorrelation } from "../correlation.js";
 import { logger } from "../logger.js";
+import { makeAsyncContextCapture } from "../edge-fallback.js";
 
 interface PgQueryConfig {
   text?: string;
@@ -76,8 +77,14 @@ interface PgClientCtor {
   prototype: { query: PgClientQuery; _ezlogsPatched?: boolean };
 }
 
+interface PgPoolCtor {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  prototype: { connect?: Function; _ezlogsPoolPatched?: boolean };
+}
+
 interface PgModule {
   Client: PgClientCtor;
+  Pool?: PgPoolCtor;
 }
 
 /** Per-Client tx state, keyed by the Client instance. */
@@ -102,6 +109,7 @@ export function patchPgClient(pgModule: PgModule): void {
     logger.debug("patchPgClient: not a recognized pg module shape, skipping");
     return;
   }
+  patchPgPool(pgModule.Pool);
   const proto = pgModule.Client.prototype;
   if (proto._ezlogsPatched) return;
 
@@ -116,6 +124,37 @@ export function patchPgClient(pgModule: PgModule): void {
     );
   } as PgClientQuery;
   proto._ezlogsPatched = true;
+}
+
+/**
+ * Run each `Pool.connect(callback)` callback in its caller's async
+ * context. When every client is busy, pg-pool queues the callback and
+ * calls it from whichever request releases a client, so `pool.query`
+ * (Drizzle node-postgres, `@prisma/adapter-pg`) would run, and be
+ * tagged, under that other request's correlation id. The promise form
+ * needs nothing: an `await` resumes in the awaiting context. No-op
+ * without `AsyncLocalStorage.snapshot`; a failed capture calls the
+ * callback unbound (the old behavior).
+ */
+function patchPgPool(Pool: PgPoolCtor | undefined): void {
+  const proto = Pool?.prototype;
+  if (!proto || typeof proto.connect !== "function" || proto._ezlogsPoolPatched) return;
+  const captureAndRun = makeAsyncContextCapture();
+  if (!captureAndRun) return;
+  const originalConnect = proto.connect;
+  proto.connect = function patchedConnect(this: unknown, ...args: unknown[]) {
+    const cb = args[0];
+    if (typeof cb === "function") {
+      try {
+        const run = captureAndRun();
+        args[0] = (...cbArgs: unknown[]) => run(() => cb(...cbArgs));
+      } catch {
+        // fail open: the callback runs unbound, as before
+      }
+    }
+    return originalConnect.apply(this, args);
+  };
+  proto._ezlogsPoolPatched = true;
 }
 
 function runPatchedQuery(

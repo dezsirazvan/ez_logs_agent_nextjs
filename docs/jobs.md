@@ -44,6 +44,14 @@ pass a client). If a future BullMQ changes the Worker internals the
 wrapper relies on, it falls back to job events only (no linked DB
 writes) and logs that once at debug level.
 
+Actor (0.3.3): when a person enqueues the job (including a user found
+late through the Supabase fallback), `wrapBullQueue` also adds
+`ezlogs_actor` to `data`: their id, signed with your project token
+and bound to the correlation id. The worker runs the job as that person
+only when the signature verifies (so the worker needs the same
+`EZLOGS_PROJECT_TOKEN`). Agents, actors with a principal, and ids over
+64 bytes are not carried; those jobs' writes have no actor, as before.
+
 ## Inngest
 
 ```ts
@@ -68,6 +76,10 @@ inngest.createFunction({ id: "send-invoice" }, { event: "invoice/created" },
   }),
 );
 ```
+
+The middleware also signs the sender's actor into `event.data`
+(`ezlogs_actor`, same rules as BullMQ above), so the body's DB writes
+keep the person who sent the event.
 
 ## Trigger.dev
 

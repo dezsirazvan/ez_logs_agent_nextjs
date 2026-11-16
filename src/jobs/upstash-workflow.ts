@@ -61,16 +61,14 @@
 
 import { logger } from "../logger.js";
 import {
+  actorToken,
   emitJobEvent,
+  readActorToken,
   runJobWithCapture,
+  toHex,
 } from "./shared.js";
 import { current as currentCorrelation } from "../correlation.js";
-import { configuration } from "../configuration.js";
-import {
-  getCurrentActor,
-  maybeExtractSupabaseActor,
-  type ActorContext,
-} from "../actor.js";
+import { maybeExtractSupabaseActor } from "../actor.js";
 
 // QStash forwards any header with this prefix to the destination URL.
 const FORWARD_PREFIX = "upstash-forward-";
@@ -95,14 +93,6 @@ const AGENT_CORRELATION_ID = /^ezl_(\d{13})_[0-9a-f]{8}$/;
 const AGENT_RUN_ID = /^wfr_(ezl_\d{13}_[0-9a-f]{8})_[0-9a-f]{24}(?:_(a[0-9a-f]{2,128}_[0-9a-f]{16}))?$/;
 // Header carrying the actor token next to the correlation id.
 const ACTOR_HEADER = "x-ezlogs-actor";
-// `a<hex of the actor id>_<HMAC tag>`. The tag (HMAC-SHA256 keyed with
-// the project token over correlation id + actor id, 64 bits) means a
-// forged delivery can't name an actor. Hex keeps the run id in
-// [a-z0-9_] like the rest of it.
-const ACTOR_TOKEN = /^a([0-9a-f]{2,128})_([0-9a-f]{16})$/;
-// Longer actor ids are not carried (the run id would get long); their
-// post-response writes keep an empty actor, as before.
-const ACTOR_ID_MAX_BYTES = 64;
 const RUN_ID_SUFFIX_BYTES = 12;
 const STEP_ID_MAX_AGE_MS = 24 * 60 * 60_000;
 const STEP_ID_MAX_SKEW_MS = 5 * 60_000;
@@ -241,67 +231,6 @@ async function stampPublishRequest(
 }
 
 /**
- * The current actor's id as a signed token for post-response work
- * (workflow steps, QStash deliveries), bound to `correlationId`.
- * Callers first run the late Supabase actor fallback, so a run started
- * before the request's end still gets the actor the request resolves.
- * Null when there is no actor, the actor is not a plain human (kind or
- * principal can't travel), no project token, or the id is too long.
- * Never throws.
- */
-async function actorToken(correlationId: string): Promise<string | null> {
-  try {
-    const actor = getCurrentActor();
-    // Only the id travels: an agent / hybrid actor or one with a
-    // principal would arrive looking human, so it is not carried.
-    if (!actor || (actor.kind && actor.kind !== "human") || actor.principal) return null;
-    const actorId = actor.id;
-    const key = configuration().projectToken;
-    if (!actorId || !key) return null;
-    const bytes = new TextEncoder().encode(actorId);
-    if (bytes.length > ACTOR_ID_MAX_BYTES) return null;
-    return `a${toHex(bytes)}_${await actorTag(key, correlationId, actorId)}`;
-  } catch (error) {
-    logger.debug(`upstash actor stamp failed: ${describeError(error)}`);
-    return null;
-  }
-}
-
-/** The actor a verified token names, or null. Never throws. */
-async function readActorToken(
-  token: string | null | undefined,
-  correlationId: string,
-): Promise<ActorContext | null> {
-  try {
-    const match = token ? ACTOR_TOKEN.exec(token) : null;
-    const key = configuration().projectToken;
-    if (!match || !key || match[1]!.length % 2 !== 0) return null;
-    const bytes = new Uint8Array(match[1]!.match(/../g)!.map((h) => parseInt(h, 16)));
-    const actorId = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    if (!actorId) return null;
-    const expected = await actorTag(key, correlationId, actorId);
-    let diff = 0;
-    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ match[2]!.charCodeAt(i);
-    return diff === 0 ? { id: actorId } : null;
-  } catch {
-    return null;
-  }
-}
-
-async function actorTag(key: string, correlationId: string, actorId: string): Promise<string> {
-  const enc = new TextEncoder();
-  const hmacKey = await globalThis.crypto.subtle.importKey(
-    "raw",
-    enc.encode(key),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const mac = await globalThis.crypto.subtle.sign("HMAC", hmacKey, enc.encode(`${correlationId}\n${actorId}`));
-  return toHex(new Uint8Array(mac).subarray(0, 8));
-}
-
-/**
  * Worker-side capture for a single Upstash Workflow step / QStash
  * delivery. Wraps your handler body so each invocation produces
  * one background_job event.
@@ -390,10 +319,6 @@ function randomHex(bytes: number): string {
   const buf = new Uint8Array(bytes);
   globalThis.crypto.getRandomValues(buf);
   return toHex(buf);
-}
-
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function readHeader(headers: Headers, name: string): string | null {

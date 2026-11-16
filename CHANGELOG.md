@@ -3,6 +3,37 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.3.3] — 2026-11-16
+
+Wire format unchanged. **Upgrade steps:** none (no SQL changed, no
+usage change). BullMQ / Inngest workers need the same
+`EZLOGS_PROJECT_TOKEN` as the app to verify the actor.
+
+### Added
+- **Actor for BullMQ jobs and Inngest functions.** The signed actor
+  token Upstash Workflow uses since 0.3.2 now also travels in BullMQ
+  `job.data` and Inngest `event.data` (`ezlogs_actor`), after the late
+  Supabase actor fallback, and the worker runs the body as that person
+  only when it verifies. Human actors only; stripped from the job's
+  `arguments`. BullMQ adds on a queue keep their call order.
+
+### Fixed
+- **Pooled `pg` writes could carry another request's correlation.**
+  With every pool client busy, pg-pool ran a queued `pool.query` from
+  the request that released a client, so the write was tagged with
+  that request's correlation id and actor (Drizzle node-postgres,
+  `@prisma/adapter-pg`). `Pool.connect` callbacks now run in their
+  caller's async context.
+- **"Validation error" hid the real reason.** A 4xx body or a Server
+  Action result like `{ error: "Validation error", details: [...] }`
+  now reports the first specific message (zod / valibot issues,
+  `fieldErrors`, `formErrors`) as `"name: Name is required"`. A thrown
+  ZodError reports its first issue, or "Validation failed", never the
+  raw JSON issue list. Messages only, never input values: quoted
+  `received` values are masked, issues on sensitive-looking fields and
+  field-less messages naming a secret are skipped; masked and capped at
+  200 characters.
+
 ## [0.3.2] — 2026-11-16
 
 Wire format unchanged. **Upgrade steps:** none (no SQL changed, no

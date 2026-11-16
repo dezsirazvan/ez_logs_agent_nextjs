@@ -28,7 +28,12 @@ import {
 import { configuration } from "../configuration.js";
 import { sanitizeArgs } from "../http/sanitize.js";
 import { flushAuditLog } from "../triggers/reader.js";
-import { runWithActorScope, type ActorContext } from "../actor.js";
+import {
+  getCurrentActor,
+  maybeExtractSupabaseActor,
+  runWithActorScope,
+  type ActorContext,
+} from "../actor.js";
 
 /**
  * Stable key for embedding the correlation id in a job payload. All
@@ -36,6 +41,21 @@ import { runWithActorScope, type ActorContext } from "../actor.js";
  * regardless of runner.
  */
 export const CORRELATION_PAYLOAD_KEY = "ezlogs_correlation_id";
+
+/**
+ * Payload key for the signed actor token (BullMQ `job.data`, Inngest
+ * `event.data`), next to the correlation id. See `actorToken`.
+ */
+export const ACTOR_PAYLOAD_KEY = "ezlogs_actor";
+
+// `a<hex of the actor id>_<HMAC tag>`. The tag (HMAC-SHA256 keyed with
+// the project token over correlation id + actor id, 64 bits) means a
+// forged delivery can't name an actor. Hex keeps an Upstash run id in
+// [a-z0-9_] like the rest of it.
+const ACTOR_TOKEN = /^a([0-9a-f]{2,128})_([0-9a-f]{16})$/;
+// Longer actor ids are not carried (an Upstash run id would get long);
+// their post-response writes keep an empty actor.
+const ACTOR_ID_MAX_BYTES = 64;
 
 export interface JobSourceData {
   job_class: string;
@@ -212,6 +232,7 @@ function jobArguments(payload: unknown): unknown {
   if (typeof payload === "object" && Object.getPrototypeOf(payload) === Object.prototype) {
     const rest: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
     delete rest[CORRELATION_PAYLOAD_KEY];
+    delete rest[ACTOR_PAYLOAD_KEY];
     if (Object.keys(rest).length === 0) return null;
     return (sanitizeArgs([rest], patterns) as unknown[])[0];
   }
@@ -265,4 +286,104 @@ function compactJobSourceData(data: JobSourceData): JobSourceData {
 function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
+}
+
+/**
+ * The current actor's id as a signed token for work that runs after
+ * the request (workflow steps, QStash deliveries, BullMQ jobs, Inngest
+ * functions), bound to `correlationId`. Null (synchronously) when there
+ * is no actor, the actor is not a plain human (kind or principal can't
+ * travel), no project token, or the id is too long. Same correlation +
+ * actor share one pending promise, so callers awaiting it in order
+ * resume in order (BullMQ `add` keeps its enqueue order). Never throws.
+ */
+export function pendingActorToken(correlationId: string): Promise<string | null> | null {
+  try {
+    const actor = getCurrentActor();
+    // Only the id travels: an agent / hybrid actor or one with a
+    // principal would arrive looking human, so it is not carried.
+    if (!actor || (actor.kind && actor.kind !== "human") || actor.principal) return null;
+    const actorId = actor.id;
+    const key = configuration().projectToken;
+    if (!actorId || !key) return null;
+    const bytes = new TextEncoder().encode(actorId);
+    if (bytes.length > ACTOR_ID_MAX_BYTES) return null;
+    const memoKey = `${key}\n${correlationId}\n${actorId}`;
+    let pending = tokenMemo.get(memoKey);
+    if (!pending) {
+      if (tokenMemo.size >= 1000) tokenMemo.clear();
+      pending = actorTag(key, correlationId, actorId).then(
+        (tag) => `a${toHex(bytes)}_${tag}`,
+        (error) => {
+          logger.debug(`actor stamp failed: ${describeError(error)}`);
+          return null;
+        },
+      );
+      tokenMemo.set(memoKey, pending);
+    }
+    return pending;
+  } catch (error) {
+    logger.debug(`actor stamp failed: ${describeError(error)}`);
+    return null;
+  }
+}
+
+const tokenMemo = new Map<string, Promise<string | null>>();
+
+/**
+ * `pendingActorToken` after the late Supabase actor fallback (as the
+ * Upstash wrappers do), so a job enqueued before the request resolved
+ * its user still carries it. Null (synchronously) when no actor can
+ * appear: one is already set, or the fallback is off.
+ */
+export function signedActorToken(correlationId: string): Promise<string | null> | null {
+  const now = pendingActorToken(correlationId);
+  if (now || getCurrentActor() || !configuration().actorFromSupabase) return now;
+  return maybeExtractSupabaseActor().then(
+    () => pendingActorToken(correlationId),
+    () => null,
+  );
+}
+
+/** `pendingActorToken`, awaited. */
+export async function actorToken(correlationId: string): Promise<string | null> {
+  return (await pendingActorToken(correlationId)) ?? null;
+}
+
+/** The actor a verified token names, or null. Never throws. */
+export async function readActorToken(
+  token: unknown,
+  correlationId: string,
+): Promise<ActorContext | null> {
+  try {
+    const match = typeof token === "string" ? ACTOR_TOKEN.exec(token) : null;
+    const key = configuration().projectToken;
+    if (!match || !key || match[1]!.length % 2 !== 0) return null;
+    const bytes = new Uint8Array(match[1]!.match(/../g)!.map((h) => parseInt(h, 16)));
+    const actorId = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (!actorId) return null;
+    const expected = await actorTag(key, correlationId, actorId);
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ match[2]!.charCodeAt(i);
+    return diff === 0 ? { id: actorId } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function actorTag(key: string, correlationId: string, actorId: string): Promise<string> {
+  const enc = new TextEncoder();
+  const hmacKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    enc.encode(key),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await globalThis.crypto.subtle.sign("HMAC", hmacKey, enc.encode(`${correlationId}\n${actorId}`));
+  return toHex(new Uint8Array(mac).subarray(0, 8));
+}
+
+export function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

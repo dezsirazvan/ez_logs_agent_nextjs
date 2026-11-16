@@ -47,7 +47,11 @@ import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
 import {
   buildHttpSourceData,
+  capErrorText,
   determineOutcome,
+  isGenericErrorText,
+  issueMessage,
+  specificErrorMessage,
   type GraphqlMetadata,
 } from "./source-data.js";
 import {
@@ -860,7 +864,7 @@ function classifyServerActionResult(
 
     // (7) Existing Phase 3 fallback.
     if (r.success === false && typeof r.error === "string" && r.error.length > 0) {
-      return { errorMessage: truncate(r.error) };
+      return { errorMessage: specificOrOwn(r, r.error) };
     }
   }
 
@@ -876,7 +880,7 @@ function defaultErrorMessage(result: unknown): string {
       return truncate(r.serverError);
     }
     const err = r.error;
-    if (typeof err === "string" && err.length > 0) return truncate(err);
+    if (typeof err === "string" && err.length > 0) return specificOrOwn(r, err);
     if (isZsaError(err)) return truncate((err as { message: string }).message);
     if (isZodErrorLike(err)) {
       return formatZodIssues((err as { issues: unknown[] }).issues);
@@ -894,6 +898,14 @@ function defaultErrorMessage(result: unknown): string {
 }
 
 const MAX_ERROR_MESSAGE_LENGTH = 200;
+
+/** `error` itself, or the specific reason beside it when `error` is a placeholder. */
+function specificOrOwn(result: Record<string, unknown>, error: string): string {
+  const specific = isGenericErrorText(error)
+    ? specificErrorMessage(result, configuration().excludedGraphqlVariableKeys)
+    : null;
+  return specific ? capErrorText(specific) : truncate(error);
+}
 
 function truncate(value: string): string {
   if (value.length <= MAX_ERROR_MESSAGE_LENGTH) return value;
@@ -914,17 +926,17 @@ function isZodErrorLike(value: unknown): value is { issues: unknown[] } {
 
 function formatZodIssues(issues: unknown[]): string {
   // ZodIssue shape: `{ path: (string|number)[], message: string, ... }`.
-  // Concatenate up to a few messages for actionability without flood.
+  // Up to a few messages for actionability without flood; unsafe ones
+  // (sensitive field, secret-naming message) are skipped.
+  const patterns = configuration().excludedGraphqlVariableKeys;
   const messages: string[] = [];
   for (const issue of issues) {
-    if (issue && typeof issue === "object") {
-      const m = (issue as { message?: unknown }).message;
-      if (typeof m === "string" && m.length > 0) messages.push(m);
-    }
+    const m = issueMessage(issue, patterns);
+    if (m) messages.push(m);
     if (messages.length >= 3) break;
   }
   if (messages.length === 0) return "Validation failed";
-  return truncate(messages.join("; "));
+  return capErrorText(messages.join("; "));
 }
 
 function hasNonEmptyValidationError(
@@ -1938,6 +1950,12 @@ async function readResponseErrorMessage(response: Response): Promise<string | nu
     const raw = [body.error, body.message, nested?.message].find(
       (v): v is string => typeof v === "string" && v.trim().length > 0,
     );
+    // `{ error: "Validation error", details: [...] }`: the issue says why.
+    const specific =
+      !raw || isGenericErrorText(raw)
+        ? specificErrorMessage(body, configuration().excludedGraphqlVariableKeys)
+        : null;
+    if (specific) return capErrorText(specific);
     return raw ? truncate(scrubSecretsInText(raw.trim(), { emails: true })) : null;
   } catch {
     return null;

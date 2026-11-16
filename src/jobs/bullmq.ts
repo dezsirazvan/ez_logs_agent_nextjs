@@ -21,11 +21,16 @@
 // Both wrappers are idempotent.
 
 import { logger } from "../logger.js";
+import { current as currentCorrelation } from "../correlation.js";
+import type { ActorContext } from "../actor.js";
 import {
   emitJobEvent,
   extractCorrelationFromPayload,
+  readActorToken,
+  signedActorToken,
   runJobWithCapture,
   stampCorrelationOnPayload,
+  ACTOR_PAYLOAD_KEY,
   CORRELATION_PAYLOAD_KEY,
 } from "./shared.js";
 
@@ -96,8 +101,30 @@ export function wrapBullQueue<T extends BullQueueLike>(queue: T): T {
   if ((queue as unknown as Record<string, unknown>)[WRAPPED_FLAG]) return queue;
 
   const originalAdd = queue.add.bind(queue);
+  // Resolves once the last deferred add (waiting on a signature) has
+  // been handed to BullMQ; later adds queue behind it to keep order.
+  let pending: Promise<void> | null = null;
+  const inOrder = <R>(token: Promise<string | null> | null, issue: (t: string | null) => R): R | Promise<R> => {
+    // Nothing to sign and nothing ahead: enqueue synchronously as before.
+    if (!token && !pending) return issue(null);
+    let issued!: () => void;
+    const done = new Promise<void>((resolve) => (issued = resolve));
+    const result = Promise.all([pending, token]).then(([, t]) => {
+      try {
+        return issue(t ?? null);
+      } finally {
+        issued();
+      }
+    });
+    pending = done;
+    void done.then(() => {
+      if (pending === done) pending = null;
+    });
+    return result;
+  };
   queue.add = ((name: string, data: unknown, opts?: unknown) => {
-    return originalAdd(name, stampPayload(data), opts);
+    const stamped = stampPayload(data);
+    return inOrder(pendingActorTokenFor(stamped), (t) => originalAdd(name, withActor(stamped, t), opts));
   }) as T["add"];
 
   if (typeof queue.addBulk === "function") {
@@ -108,8 +135,14 @@ export function wrapBullQueue<T extends BullQueueLike>(queue: T): T {
     type BulkJob = { name: string; data: unknown; opts?: unknown };
     type BulkFn = (jobs: BulkJob[]) => Promise<unknown>;
     const originalAddBulk = (queue.addBulk as BulkFn).bind(queue);
-    const wrappedAddBulk: BulkFn = (jobs: BulkJob[]) =>
-      originalAddBulk(jobs.map((j) => ({ ...j, data: stampPayload(j.data) })));
+    const wrappedAddBulk: BulkFn = (jobs: BulkJob[]) => {
+      const stamped = jobs.map((j) => ({ ...j, data: stampPayload(j.data) }));
+      const ours = stamped.map((j) => isOurs(j.data));
+      const token = ours.includes(true) ? signedActorToken(currentCorrelation()!) : null;
+      return inOrder(token, (t) =>
+        originalAddBulk(stamped.map((j, i) => (ours[i] ? { ...j, data: withActor(j.data, t) } : j))),
+      );
+    };
     (queue as unknown as { addBulk?: BulkFn }).addBulk = wrappedAddBulk;
   }
 
@@ -153,19 +186,26 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
     worker.processFn = function ezlogsProcess(this: unknown, ...args: unknown[]) {
       const job = (args[0] ?? {}) as BullJobLike;
       if (typeof args[0] === "object" && args[0] !== null) reported.add(args[0]);
-      return runJobWithCapture(
-        {
-          jobClass: job.name ?? worker.name ?? "BullMQJob",
-          jobId: job.id !== undefined && job.id !== null ? String(job.id) : null,
-          queue: job.queueName ?? worker.name ?? null,
-          // attemptsMade counts finished attempts: 0 on the first run.
-          retryCount: typeof job.attemptsMade === "number" ? job.attemptsMade : null,
-          correlationId: extractCorrelationFromPayload(job.data),
-          payload: job.data,
-          isControlFlow: isBullControlFlow,
-        },
-        () => Promise.resolve(original.apply(this, args)),
-      );
+      const correlationId = extractCorrelationFromPayload(job.data);
+      const run = (actor: ActorContext | null) =>
+        runJobWithCapture(
+          {
+            jobClass: job.name ?? worker.name ?? "BullMQJob",
+            jobId: job.id !== undefined && job.id !== null ? String(job.id) : null,
+            queue: job.queueName ?? worker.name ?? null,
+            // attemptsMade counts finished attempts: 0 on the first run.
+            retryCount: typeof job.attemptsMade === "number" ? job.attemptsMade : null,
+            correlationId,
+            // The enqueuing request's human actor, only when its token verifies.
+            actor,
+            payload: job.data,
+            isControlFlow: isBullControlFlow,
+          },
+          () => Promise.resolve(original.apply(this, args)),
+        );
+      const token = (job.data as Record<string, unknown> | null | undefined)?.[ACTOR_PAYLOAD_KEY];
+      if (!correlationId || token === undefined) return run(null);
+      return readActorToken(token, correlationId).then(run);
     };
     // Failures where the processor never ran (a job started more than
     // `maxStartedAttempts`, a deferred failure) only show up here.
@@ -247,6 +287,27 @@ function captureJob(
   } catch (error) {
     logger.debug(`bullmq capture failed: ${describeError(error)}`);
   }
+}
+
+/**
+ * The pending actor token for a stamped payload, or null when there is
+ * nothing to sign: not an object, a caller-chosen correlation id (the
+ * token is bound to ours), a caller-set actor key, or no human actor.
+ */
+function pendingActorTokenFor(data: unknown): Promise<string | null> | null {
+  return isOurs(data) ? signedActorToken(currentCorrelation()!) : null;
+}
+
+function isOurs(data: unknown): boolean {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return false;
+  const obj = data as Record<string, unknown>;
+  const id = currentCorrelation();
+  return Boolean(id) && obj[CORRELATION_PAYLOAD_KEY] === id && !(ACTOR_PAYLOAD_KEY in obj);
+}
+
+function withActor(data: unknown, token: string | null): unknown {
+  if (token) (data as Record<string, unknown>)[ACTOR_PAYLOAD_KEY] = token;
+  return data;
 }
 
 function stampPayload(data: unknown): unknown {

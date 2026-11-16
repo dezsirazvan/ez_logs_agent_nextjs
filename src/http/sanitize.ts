@@ -279,7 +279,8 @@ function sanitizeArrayItem(
   return "[Object]";
 }
 
-function isSensitiveKey(key: string, userPatterns: readonly string[]): boolean {
+/** A request-param key that must never travel (built-in list + user patterns). */
+export function isSensitiveKey(key: string, userPatterns: readonly string[] = []): boolean {
   if (matchesSensitiveKey(key, SENSITIVE_VARIABLE_PATTERNS)) return true;
   const lower = key.toLowerCase();
   return userPatterns.some((p) => lower.includes(p.toLowerCase()));

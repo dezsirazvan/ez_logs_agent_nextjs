@@ -12,7 +12,7 @@
  * contains values that were actually known at capture time.
  */
 
-import { sanitizeRequestParams } from "./sanitize.js";
+import { isSensitiveKey, sanitizeRequestParams, scrubSecretsInText } from "./sanitize.js";
 
 export interface HttpCaptureInput {
   method: string;
@@ -279,9 +279,16 @@ export function determineOutcome(
   responseError: string | null = null,
 ): { outcome: "success" | "failure"; error_message: string | null } {
   if (exception) {
+    // A thrown ZodError's message is the JSON issue list (it can echo
+    // enum input); ValiError's is its first issue. Use the issue text.
+    // Never the raw JSON: when every issue is unsafe, a fixed text.
+    const issues = (exception as { issues?: unknown }).issues;
+    const message = Array.isArray(issues)
+      ? capErrorText(specificErrorMessage({ issues }) ?? "Validation failed")
+      : exception.message;
     return {
       outcome: "failure",
-      error_message: `${exception.name}: ${exception.message}`,
+      error_message: `${exception.name}: ${message}`,
     };
   }
   if (statusCode !== null && statusCode >= 400) {
@@ -291,4 +298,99 @@ export function determineOutcome(
     return { outcome: "failure", error_message: graphqlResponseErrors };
   }
   return { outcome: "success", error_message: null };
+}
+
+const MAX_SPECIFIC_ERROR_LENGTH = 200;
+
+/** Mask secrets and emails in an extracted reason, cap its length. */
+export function capErrorText(text: string): string {
+  const out = scrubSecretsInText(text, { emails: true });
+  return out.length <= MAX_SPECIFIC_ERROR_LENGTH ? out : `${out.slice(0, MAX_SPECIFIC_ERROR_LENGTH - 1)}…`;
+}
+
+// Placeholder refusals a validation wrapper answers with while the
+// real reason sits beside it (`{ error: "Validation error", details }`).
+const GENERIC_ERROR_TEXT =
+  /^(?:validation(?: error| failed)?|invalid (?:input|request|data|body|payload|params|parameters|arguments)|bad request|unprocessable(?: entity| content)?|error|failed|request failed)[.!]?$/i;
+
+/** True for a placeholder error text such as "Validation error". */
+export function isGenericErrorText(text: string): boolean {
+  return GENERIC_ERROR_TEXT.test(text.trim());
+}
+
+/**
+ * The most specific human-readable reason in an error body, or null:
+ * the first zod / valibot issue (`details`, `issues`, `errors`,
+ * `error.issues`, `error.details`) or the first `fieldErrors` /
+ * `formErrors` entry (zod `flatten()`), as "<field>: <message>".
+ * Only `message` texts are read, never input values; an issue on a
+ * sensitive-looking field (password, token, …) is skipped, since a
+ * custom message there may echo the value. Callers mask and cap it.
+ */
+export function specificErrorMessage(
+  body: unknown,
+  userPatterns: readonly string[] = [],
+): string | null {
+  if (!isRecord(body)) return null;
+  const error = isRecord(body.error) ? body.error : {};
+  const details = isRecord(body.details) ? body.details : {};
+  for (const list of [body.details, body.issues, body.errors, error.issues, error.details]) {
+    if (!Array.isArray(list)) continue;
+    for (const issue of list) {
+      const found = issueMessage(issue, userPatterns);
+      if (found) return found;
+    }
+  }
+  for (const flat of [body, details, error]) {
+    const fields = isRecord(flat.fieldErrors) ? flat.fieldErrors : null;
+    for (const [field, value] of Object.entries(fields ?? {})) {
+      const found = fieldMessage([field], firstString(value), userPatterns);
+      if (found) return found;
+    }
+    const form = fieldMessage([], firstString(flat.formErrors), userPatterns);
+    if (form) return form;
+  }
+  return null;
+}
+
+/** One zod / valibot issue as "<field>: <message>", or null when unsafe / empty. */
+export function issueMessage(issue: unknown, userPatterns: readonly string[] = []): string | null {
+  if (!isRecord(issue) || typeof issue.message !== "string") return null;
+  const path = Array.isArray(issue.path) ? issue.path.map(pathKey) : [];
+  return fieldMessage(path, issue.message, userPatterns);
+}
+
+function fieldMessage(
+  path: ReadonlyArray<string | null>,
+  message: string | null,
+  userPatterns: readonly string[],
+): string | null {
+  const text = message
+    ?.replace(/\s+/g, " ")
+    .trim()
+    // zod: `Invalid enum value. Expected 'a' | 'b', received 'hunter2'`
+    .replace(/received\s+("[^"]*"|'[^']*'|`[^`]*`)/gi, "received [FILTERED]");
+  if (!text) return null;
+  const keys = path.filter((k): k is string => k !== null && k !== "");
+  if (keys.some((k) => isSensitiveKey(k, userPatterns))) return null;
+  if (keys.length > 0) return `${keys.join(".")}: ${text}`;
+  // No field to judge by: skip a message that names a secret ("Password and confirmation differ").
+  return text.split(/[^A-Za-z0-9_]+/).some((w) => w !== "" && isSensitiveKey(w, userPatterns)) ? null : text;
+}
+
+// zod: "name" / 0; valibot: { key: "name", … }. Array indexes are dropped.
+function pathKey(segment: unknown): string | null {
+  if (typeof segment === "string") return segment;
+  if (isRecord(segment) && typeof segment.key === "string") return segment.key;
+  return null;
+}
+
+function firstString(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && typeof value[0] === "string") return value[0];
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

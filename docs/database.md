@@ -254,7 +254,10 @@ redacts at ingest as a backstop.
 - Rows are deleted when sent. A sweep (≤ once per 10 s per process)
   sends untagged rows and tagged rows older than 5 minutes, but only
   rows under 24 hours old, timestamped with when the write happened;
-  rows older than 24 hours are deleted unsent.
+  rows older than 24 hours are deleted unsent. The audit log does not record which EZLogs
+  project a row belongs to: rows left over from before a token switch
+  or a restored snapshot are sent by whichever project reads next. Use
+  one project per database.
 - **Upgrading:** run `npx ezlogs-nextjs install-triggers --tables=none`
   before deploying a new agent version (functions + `ezlogs_audit_log`
   only; a brief lock on that table, none on yours). A plain re-run also
