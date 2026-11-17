@@ -243,7 +243,8 @@ function parseServerActionName(name: string): {
 function stripTrailingS(entity: string): string {
   if (entity.length <= 1) return entity;
   if (entity.endsWith("ies")) return `${entity.slice(0, -3)}y`;
-  if (entity.endsWith("s") && !entity.endsWith("ss")) return entity.slice(0, -1);
+  // Status, Bonus, Analysis are singular: skip -ss, -us, -sis (Apis/Kpis still singularize).
+  if (entity.endsWith("s") && !/(ss|us|sis)$/i.test(entity)) return entity.slice(0, -1);
   return entity;
 }
 

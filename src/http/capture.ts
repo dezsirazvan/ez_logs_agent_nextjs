@@ -1698,7 +1698,9 @@ async function maybeRunActorHookFromPages(req: PagesApiReq): Promise<void> {
   let hookResult: unknown = null;
   if (hook) {
     try {
-      hookResult = await Promise.resolve(hook(req));
+      // The hook reads `headers.get(...)`; Node's req.headers is a plain object.
+      const headers = req.headers instanceof Headers ? req.headers : toWebHeaders(req.headers);
+      hookResult = await Promise.resolve(hook({ headers }));
     } catch (error) {
       logger.debug(`actorFromRequest hook (pages) failed: ${describeError(error)}`);
     }
@@ -1923,6 +1925,20 @@ async function tryLoadNextHeadersModule(): Promise<NextHeadersMod | null> {
  * a full Headers object. Pages req.headers is a plain object with
  * lowercased keys (Node http server normalization).
  */
+function toWebHeaders(raw: Record<string, string | string[] | undefined>): Headers {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(raw ?? {})) {
+    for (const v of Array.isArray(value) ? value : value === undefined ? [] : [value]) {
+      try {
+        headers.append(name, v);
+      } catch {
+        // A name / value the Headers class rejects: skip that header.
+      }
+    }
+  }
+  return headers;
+}
+
 function readPagesHeader(req: PagesApiReq, name: string): string | null {
   const raw = req.headers;
   if (raw instanceof Headers) return raw.get(name);

@@ -3,10 +3,23 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
-## [0.4.0] — 2026-11-16
+## [0.4.1] — 2026-11-17
+
+0.4.0 was tagged but never published to npm; 0.4.1 is the first release of
+this line. Everything below (0.4.0 notes) applies, plus the late fixes merged
+before publishing: the Upstash Workflow `serve` route is no longer
+auto-wrapped, audit rows keep the actor stored at write time,
+`actorFromRequest` / `wrapBullWorker` typings, and entity names ending in
+-us/-ss/-sis.
+
+## [0.4.0] — 2026-11-16 (not published)
 
 Wire format unchanged; one new optional `source_data` field
-(`redirect_to`). **Upgrade steps:** none from 0.2.x / 0.3.x. From
+(`redirect_to`). **Behavior change:** on the Pages Router,
+`actorFromRequest` now receives `{ headers }` (Web `Headers`) instead of
+the raw Node `req`; a custom hook that read `req.cookies` /
+`req.headers.cookie` must switch to `request.headers.get("cookie")`.
+**Upgrade steps:** none from 0.2.x / 0.3.x beyond that. From
 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
 **before** deploying the new agent, deploy right after, and later
 re-run `npx ezlogs-nextjs install-triggers` at a quiet moment (details
@@ -221,6 +234,21 @@ and no longer modify their argument; send the returned value.
   with no actor (callers that carry one, like job runners, set it
   inside). Every agent entry point already did this; the guard is now
   in `runWithCorrelation` itself.
+- **The documented `actorFromRequest` hook did not compile.** The
+  hook's argument was typed `unknown`, so `request.headers.get(...)`
+  (docs/auth.md) failed under `strict`. It is now `{ headers: Headers }`,
+  which `Request` and `NextRequest` satisfy. On Pages Router API
+  routes the hook now gets `{ headers }` as Web `Headers` built from
+  `req.headers` (it got the Node `req`, where `headers.get` threw):
+  a Pages hook that read `req.headers.cookie` or `req.cookies` must
+  read `request.headers.get("cookie")`. `label` may be `undefined`
+  (`exactOptionalPropertyTypes`).
+- **`wrapBullWorker(new Worker(...))` did not compile with BullMQ 5**
+  (`processFn` is protected on its `Worker`). It compiles with BullMQ
+  5 and 6 and returns the caller's `Worker` type.
+- **Server Action entity names lost a final "s" from singular words.**
+  `bulkUpdateEmployeeStatusAction` named the entity `EmployeeStatu`.
+  Words ending in `-us` and `-is` (like `-ss`) are kept.
 
 ### Docs
 - Don't share one `pg.Client` across concurrent requests (use a
@@ -237,6 +265,9 @@ and no longer modify their argument; send the returned value.
   `next.config` (next-intl, Sentry).
 - Supabase `auth.*` / `storage.*` are not tracked; browser-side
   Supabase writes can't be linked to a server request.
+- A sign-in has no actor: `actorFromRequest` runs before the handler,
+  and the new session cookie exists only in the response (Rails reads
+  the actor after the request).
 
 ## [0.3.4] — 2026-11-16
 

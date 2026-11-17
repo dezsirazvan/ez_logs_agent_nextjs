@@ -20,7 +20,7 @@ export interface ActorContext {
   /** Stable identifier for the user (e.g. `user.id`). REQUIRED. */
   id: string;
   /** Human-readable label (e.g. `user.email`). Optional. */
-  label?: string;
+  label?: string | undefined;
   /** Category of actor. Optional — the server stamps `human` when
    *  absent. Auto-detection from the User-Agent fills this when the
    *  request looks like it came from an LLM client. */
@@ -46,16 +46,22 @@ export interface ActorPrincipal {
 }
 
 /**
- * Minimal request-shape contract for `actorFromRequest`. We don't import
- * Next.js types here to keep the package framework-light; users pass
- * whatever request object they're given by the runtime.
- *
+ * What `actorFromRequest` receives: the route's `Request` (App Router),
+ * or a request-like object whose `headers` is a Web `Headers` (Server
+ * Actions, Pages Router). Read headers only. `Request` and
+ * `NextRequest` both satisfy it.
+ */
+export interface ActorRequest {
+  readonly headers: Headers;
+}
+
+/**
  * The hook may return a value or a Promise — Phase 4 actor extractors
  * (Clerk, NextAuth, Auth.js) are async because they call into the
  * framework's auth helpers, which lazy-import the SDK.
  */
 export type ActorFromRequest = (
-  request: unknown,
+  request: ActorRequest,
 ) =>
   | ActorContext
   | null

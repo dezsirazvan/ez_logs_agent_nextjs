@@ -70,10 +70,18 @@ interface BullWorkerLike {
   // eslint-disable-next-line @typescript-eslint/ban-types
   off?: Function;
   name?: string;
-  /** BullMQ internal: the processor `callProcessJob` invokes. */
+}
+
+/**
+ * BullMQ internals the wrap patches. Kept out of `BullWorkerLike`:
+ * `processFn` is `protected` on BullMQ 5's Worker, so a public member
+ * here would reject `wrapBullWorker(new Worker(...))`.
+ */
+interface BullWorkerInternals {
+  /** The processor `callProcessJob` invokes. */
   // eslint-disable-next-line @typescript-eslint/ban-types
   processFn?: Function;
-  /** BullMQ internal: calls `this.processFn(job, token, signal)`. */
+  /** Calls `this.processFn(job, token, signal)`. */
   // eslint-disable-next-line @typescript-eslint/ban-types
   callProcessJob?: Function;
 }
@@ -170,8 +178,9 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
   // version stops doing that, fall back to `completed` / `failed`
   // listeners (job events only, the 0.2.x behavior) instead of
   // patching something BullMQ no longer calls.
+  const internals = worker as unknown as BullWorkerInternals;
   const canWrapProcessor =
-    typeof worker.processFn === "function" && typeof worker.callProcessJob === "function";
+    typeof internals.processFn === "function" && typeof internals.callProcessJob === "function";
   if (!canWrapProcessor && !warnedNoProcessor) {
     warnedNoProcessor = true;
     logger.debug(
@@ -180,10 +189,10 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
     );
   }
   if (canWrapProcessor) {
-    const original = worker.processFn!;
+    const original = internals.processFn!;
     // Jobs whose outcome the processor wrap already reported.
     const reported = new WeakSet<object>();
-    worker.processFn = function ezlogsProcess(this: unknown, ...args: unknown[]) {
+    internals.processFn = function ezlogsProcess(this: unknown, ...args: unknown[]) {
       const job = (args[0] ?? {}) as BullJobLike;
       if (typeof args[0] === "object" && args[0] !== null) reported.add(args[0]);
       const correlationId = extractCorrelationFromPayload(job.data);

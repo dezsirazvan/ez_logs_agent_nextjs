@@ -51,8 +51,9 @@ automatically once any Supabase client is wrapped. Disable via
 
 For your own session cookie or `Authorization: Bearer …` header,
 verify the token in the hook and return the user. The hook receives a
-`Request` (route handlers) or a request-like object with `headers`
-(Server Actions), so read headers only:
+`Request` (route handlers) or an object with Web `Headers` as
+`headers` (Server Actions, Pages Router API routes), so read headers
+only:
 
 ```ts
 import { jwtVerify } from "jose";
@@ -84,6 +85,9 @@ ezlogs.init({
   default (redacted) share links and embeds.
 - Return `null` when there is no valid session. Never decode a token
   without verifying it.
+- The hook runs before your route or Server Action. A sign-in sets
+  the session cookie in its response, so the sign-in itself has no
+  actor; the requests after it do.
 
 ## Custom / composing
 
