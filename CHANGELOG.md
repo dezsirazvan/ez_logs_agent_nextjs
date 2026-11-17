@@ -3,6 +3,18 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.4] — 2026-11-17
+
+No code changes.
+
+### Fixed
+- The package now ships `THIRD_PARTY_LICENSES.md` with the MIT notice of
+  sucrase, whose parser is bundled into the Next.js plugin loader.
+
+### Docs
+- README: install with your coding AI (one prompt) or by hand in short
+  steps; database changes and background jobs are part of the main setup.
+
 ## [0.4.3] — 2026-11-17
 
 ### Fixed

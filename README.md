@@ -24,21 +24,39 @@ Status: Completed successfully
 
 ---
 
-## Install
+## Install: paste the prompt into your coding AI, or do it by hand
+
+**1. Fastest: let your coding AI do it.** Paste this into Cursor,
+Claude Code, v0, Replit or any coding AI:
+
+```text
+Install EZLogs in this app by following https://app.ezlogs.io/install/nextjs.md
+```
+
+The AI does every step below (package, `instrumentation.ts`, config,
+key, database, jobs) and then checks that capture works. It asks you for
+your API key. Signed in at [app.ezlogs.io](https://app.ezlogs.io), the
+prompt shown under a new key in **Settings → API keys** already has your
+key in it.
+
+**2. By hand:** follow the [quick start](#quick-start-by-hand) below.
+Steps 1-4 take a few minutes; steps 5-7 depend on your stack.
+
+## Quick start (by hand)
+
+Requires Node 18.17+ and Next.js 14+.
+
+### 1. Install the package
 
 ```bash
 npm install ezlogs-nextjs
 # or: pnpm add ezlogs-nextjs / bun add ezlogs-nextjs
 ```
 
-Requires Node 18.17+ and Next.js 14+.
+### 2. Add `instrumentation.ts`
 
-## Quick start
-
-### 1. Create `instrumentation.ts`
-
-At your project root (or `src/instrumentation.ts` if you use the
-`src/` layout):
+Starts the agent when your server boots. Put it at the project root
+(or `src/instrumentation.ts` if you use the `src/` layout):
 
 ```ts
 import { ezlogs } from "ezlogs-nextjs";
@@ -55,19 +73,14 @@ export async function register() {
 `serverUrl` is optional: it defaults to `process.env.EZLOGS_SERVER_URL`
 if set, otherwise `https://app.ezlogs.io`. Set it only if you self-host.
 
-### 2. Wrap your Next config
+### 3. Wrap your Next config
 
-`withEzlogsConfig(...)` is a transparent wrapper around your existing
-config object. It doesn't add EZLogs-specific settings to your Next
-config — every EZLogs option goes in `ezlogs.init({...})`. The wrapper
-just registers the build-time loaders that auto-wrap your routes and
-Server Actions.
-
-Pick the snippet matching your config file:
-
-**`next.config.ts`** (TypeScript — Next 14+ default):
+Registers the build-time loaders that auto-wrap your routes and Server
+Actions. It adds no EZLogs settings to your config; every EZLogs option
+goes in `ezlogs.init({...})`.
 
 ```ts
+// next.config.ts
 import type { NextConfig } from "next";
 import { withEzlogsConfig } from "ezlogs-nextjs/plugin";
 
@@ -78,8 +91,8 @@ const nextConfig: NextConfig = {
 export default withEzlogsConfig(nextConfig);
 ```
 
-**`next.config.mjs`** / ESM **`next.config.js`** (also type-checks
-under `checkJs`, e.g. create-t3-app):
+<details>
+<summary><code>next.config.mjs</code> / ESM <code>next.config.js</code> (also type-checks under <code>checkJs</code>, e.g. create-t3-app)</summary>
 
 ```js
 import { withEzlogsConfig } from "ezlogs-nextjs/plugin";
@@ -89,15 +102,22 @@ const nextConfig = { /* your options */ };
 export default withEzlogsConfig(nextConfig);
 ```
 
-**`next.config.js`** (CommonJS):
+</details>
+
+<details>
+<summary><code>next.config.js</code> (CommonJS)</summary>
 
 ```js
 const { withEzlogsConfig } = require("ezlogs-nextjs/plugin");
 module.exports = withEzlogsConfig({ /* your options */ });
 ```
 
-**Already have an `instrumentation.ts` or a wrapped config?** Keep
-yours and add to it:
+</details>
+
+<details>
+<summary>Already have an <code>instrumentation.ts</code> or a wrapped config?</summary>
+
+Keep yours and add to it:
 
 - `instrumentation.ts`: put the `ezlogs.init({...})` call inside your
   existing `register()`, in the `NEXT_RUNTIME === "nodejs"` branch
@@ -108,19 +128,29 @@ yours and add to it:
   `export default withNextIntl(withEzlogsConfig(nextConfig))` or
   `withSentryConfig(withEzlogsConfig(nextConfig), { ... })`.
 
-### 3. Set env vars, restart, verify
+</details>
+
+### 4. Add your key, restart, check
 
 ```bash
 # .env.local
 EZLOGS_PROJECT_TOKEN=ezl_your_api_key_here
 ```
 
-Restart your dev server and look for this line in the terminal (one
-per server process, at the default log level):
+Restart your dev server. The terminal shows this line once per server
+process:
 
 ```
 [ezlogs] capturing → app.ezlogs.io (key ezl_a1b2c3d4…)
 ```
+
+Call an API route or submit a Server Action; events appear in your
+EZLogs dashboard within a few seconds. Opening a page is not a reliable
+check: page views are recorded only when the app has a `middleware.ts`
+(or `proxy.ts` on Next 16).
+
+<details>
+<summary>Not seeing the line?</summary>
 
 If `projectToken` is missing you get this instead:
 
@@ -128,61 +158,82 @@ If `projectToken` is missing you get this instead:
 [ezlogs] not capturing: projectToken missing in ezlogs.init() (check EZLOGS_PROJECT_TOKEN)
 ```
 
-Call an API route or submit a Server Action; events appear in your
-EZLogs dashboard within a few seconds. Page views are only recorded when
-the app has a `middleware.ts` (or `proxy.ts` on Next 16), so opening a
-page is not a reliable check.
-
 Sending to a local EZLogs server over plain `http://` (development)?
 Events are still sent, but the agent warns on every start; pass
 `allowInsecureTransport: true` to `ezlogs.init` to silence it. Keep
 `https://` in production.
 
-### 4. Database changes
+More in [docs/troubleshooting.md](./docs/troubleshooting.md).
 
-Steps 1-3 capture requests, Server Actions and jobs. Database changes
-need one more step, depending on your stack:
+</details>
 
-| Your app writes with | Do this | You get |
-|---|---|---|
-| **Supabase** (supabase-js) | `npm i pg`, set `DATABASE_URL` to the Postgres connection string, run `npx ezlogs-nextjs install-triggers`. Nothing to wrap: the agent tags supabase-js requests and the trigger reads the tag. | Every write (`.from()`, `.rpc()`, bulk) with from→to diffs, linked to its request |
-| **Prisma** on Postgres | triggers (as above) + `new PrismaClient().$extends(ezlogsPrisma())` (below) | Same |
-| **Drizzle** (node-postgres) or raw **`pg`** | triggers (as above). With `DATABASE_URL` set, the agent patches `pg` itself; if your app loads its own copy of `pg` (monorepos), pass it: `ezlogs.init({ ..., patchDatabaseClient: pg })`. | Same |
-| **postgres.js** or **Drizzle** on postgres-js | triggers (as above) + `wrapPostgresJs(postgres(url))` (below) | Same |
-| Neon HTTP, scripts | triggers (as above) | Writes show up as their own actions, not linked to the request |
-| MySQL, SQLite, PlanetScale, no trigger access | a per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)) | New values only, no before-values |
+### 5. Capture database changes
+
+Steps 1-4 capture requests and Server Actions. This step adds what
+changed in your database: which record, each column from → to, and the
+request and person that made the change. Pick your stack:
+
+| Your app writes with | Do this |
+|---|---|
+| **Supabase** (supabase-js), **Drizzle** on node-postgres, raw **`pg`** | [Triggers](#triggers) only |
+| **Prisma** on Postgres | [Triggers](#triggers) + [Prisma extension](#prisma) |
+| **postgres.js**, or **Drizzle** on postgres-js | [Triggers](#triggers) + [wrap `sql`](#postgresjs) |
+| Neon HTTP, scripts | [Triggers](#triggers) (writes show up as their own actions, not linked to the request) |
+| MySQL, SQLite, PlanetScale, no trigger access | A per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)). New values only, no before-values |
+
+#### Triggers
+
+Set `DATABASE_URL` (or `POSTGRES_URL`) to your Postgres connection
+string, then run this once from your app's directory:
 
 ```bash
 npm i pg                          # the trigger installer and reader need it
 npx ezlogs-nextjs install-triggers
 ```
 
-Run it from your app's directory with the package installed there
-(with bun: `bunx ezlogs-nextjs install-triggers` or
-`./node_modules/.bin/ezlogs-nextjs install-triggers`); if the package
-isn't installed locally, npx / bunx download whatever version is
-published, and the CLI warns. They also download it when your
-lockfile's bin entries predate 0.3.0 (seen with bun and a `file:`
-dependency); the CLI then prints the command that runs your project's
-copy: `node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`.
-The CLI reads `DATABASE_URL` / `POSTGRES_URL` from your shell or from
-`.env`, `.env.local` and `.env.[mode]` (loaded the way Next.js loads
-them, incl. `${VAR}` expansion; a variable already set in the shell
-wins). Migration tables, database internals, the agent's own audit
-table, verification-token tables and session stores (a
-`session(s)`-style name **and** a token, expiry, `sess`, `data`,
-`payload` or `last_activity` column: Auth.js, Lucia, Rails, Laravel,
-connect-pg-simple) are skipped; the output lists each skipped table
-with the reason. A `session` table without such columns (analytics
-visits, bookings) is tracked. If `pg` or the
-audit table is missing at runtime, the agent logs one warning at
-startup and leaves the trigger path off.
+Supabase, Drizzle on node-postgres and raw `pg` need nothing else: the
+agent tags their writes itself, and the triggers record every write
+(supabase-js `.from()`, `.rpc()`, bulk) linked to its request.
 
-**Recommended setup for Prisma** (plain `new PrismaClient()`, or with
-a driver adapter such as `@prisma/adapter-pg`): triggers **plus** the
-extension, which tags each write with the request so DB changes join
-the right action and actor. (`patchPrismaPgAdapter` /
-`patchPrismaClient` are legacy; see [docs/database.md](./docs/database.md).)
+<details>
+<summary>Trigger details: bun, monorepos, which tables are skipped</summary>
+
+- **Monorepos:** with `DATABASE_URL` set, the agent patches `pg`
+  itself. If your app loads its own copy of `pg`, pass it:
+  `ezlogs.init({ ..., patchDatabaseClient: pg })`.
+- **Run it where the package is installed.** With bun:
+  `bunx ezlogs-nextjs install-triggers` or
+  `./node_modules/.bin/ezlogs-nextjs install-triggers`. If the package
+  isn't installed locally, npx / bunx download whatever version is
+  published, and the CLI warns. They also download it when your
+  lockfile's bin entries predate 0.3.0 (seen with bun and a `file:`
+  dependency); the CLI then prints the command that runs your project's
+  copy: `node node_modules/ezlogs-nextjs/bin/install-triggers.cjs install-triggers`.
+- **Env files:** the CLI reads `DATABASE_URL` / `POSTGRES_URL` from your
+  shell or from `.env`, `.env.local` and `.env.[mode]` (loaded the way
+  Next.js loads them, incl. `${VAR}` expansion; a variable already set
+  in the shell wins).
+- **Skipped tables:** migration tables, database internals, the agent's
+  own audit table, verification-token tables and session stores (a
+  `session(s)`-style name **and** a token, expiry, `sess`, `data`,
+  `payload` or `last_activity` column: Auth.js, Lucia, Rails, Laravel,
+  connect-pg-simple). The output lists each skipped table with the
+  reason. A `session` table without such columns (analytics visits,
+  bookings) is tracked.
+- If `pg` or the audit table is missing at runtime, the agent logs one
+  warning at startup and leaves the trigger path off.
+- **Self-check:** if writes made while requests or jobs run in a
+  process keep arriving untagged, and that process has never sent a
+  tagged row, the agent logs one warning naming the fix. It never
+  guesses which request an untagged row belongs to.
+
+</details>
+
+#### Prisma
+
+Triggers **plus** this extension (plain `new PrismaClient()`, or with a
+driver adapter such as `@prisma/adapter-pg`). It tags each write with
+the request, so the change joins the right action and person.
 
 ```ts
 // lib/prisma.ts
@@ -192,6 +243,9 @@ import { ezlogsPrisma } from "ezlogs-nextjs/prisma";
 export const prisma = new PrismaClient().$extends(ezlogsPrisma());
 ```
 
+<details>
+<summary>How the Prisma extension works</summary>
+
 Each write inside a captured request runs as
 `$transaction([set_config(correlation id, actor id), your query])` (Prisma's
 documented RLS-extension pattern); reads are untouched. Writes inside
@@ -199,7 +253,19 @@ your own `prisma.$transaction(...)` are not tagged: they still show up,
 as separate actions without an actor. Without the extension, a plain
 PrismaClient's writes are never tagged.
 
-**postgres.js / Drizzle on postgres-js** (Vercel Postgres templates,
+Without triggers, the extension still sends Prisma writes itself (new
+values only — Prisma doesn't expose the old row). With triggers it
+sends nothing for tracked tables; the trigger rows are the single
+source, so there are no duplicates (also for `@@map`-ed models).
+
+`patchPrismaPgAdapter` / `patchPrismaClient` are legacy; see
+[docs/database.md](./docs/database.md).
+
+</details>
+
+#### postgres.js
+
+For postgres.js and Drizzle on postgres-js (Vercel Postgres templates,
 `nextjs/saas-starter`): triggers **plus** wrap the `sql` instance once.
 
 ```ts
@@ -212,6 +278,9 @@ export const sql = wrapPostgresJs(postgres(process.env.DATABASE_URL!));
 export const db = drizzle(sql); // Drizzle: pass the wrapped instance
 ```
 
+<details>
+<summary>How the postgres.js wrapper works (and its latency cost)</summary>
+
 Each write inside a captured request (``sql`insert …` ``, `sql.unsafe`,
 Drizzle inserts / updates / deletes) runs as BEGIN; set_config
 (correlation id, actor); your write; COMMIT on one pooled connection,
@@ -222,28 +291,50 @@ tagged: those writes show up as their own actions. Each tagged write
 is its own transaction (4 round trips instead of 1), so write latency
 grows with your database round-trip time.
 
-**Background workers** (BullMQ and other job processes) are separate
-processes: call `ezlogs.init` there too and build the database client
-the same way (extension for Prisma), or the job's writes show up as
-separate actions without an actor.
+</details>
 
-**Self-check:** if writes made while requests or jobs run in a process
-keep arriving untagged, and that process has never sent a tagged row,
-the agent logs one warning naming the fix. It never guesses which
-request an untagged row belongs to.
+<details>
+<summary>Upgrading from an older version</summary>
 
-Without triggers, the extension still sends Prisma writes itself (new
-values only — Prisma doesn't expose the old row). With triggers it
-sends nothing for tracked tables; the trigger rows are the single
-source, so there are no duplicates (also for `@@map`-ed models).
-
-**Upgrading:** from 0.2.x or 0.3.x there is nothing to re-run before
-deploying. From 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
+From 0.2.x or 0.3.x there is nothing to re-run before deploying. From
+0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
 **before** deploying the new agent (functions only, no table locks),
 deploy right after, and later re-run `npx ezlogs-nextjs install-triggers`
 at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
 
-### 5. Name your records
+</details>
+
+### 6. Capture background jobs
+
+Only if you use a job runner. Wrap it once, and each job shows up in the
+same action as the request that started it, with the database changes
+the job made:
+
+| Runner | Add (snippets in [docs/jobs.md](./docs/jobs.md)) |
+|---|---|
+| BullMQ | `wrapBullQueue` + `wrapBullWorker` from `ezlogs-nextjs/bullmq` |
+| Inngest (v3) | `ezlogsInngestMiddleware()` from `ezlogs-nextjs/inngest`, + `runInsideInngestCorrelation` around the body to link its writes |
+| Trigger.dev | `registerTriggerHooks(tasks)` from `ezlogs-nextjs/trigger` |
+| Supabase Queues (pgmq) | `wrapSupabaseQueueClient` + `captureQueueMessage` from `ezlogs-nextjs/supabase-queues` |
+| Upstash Workflow / QStash | `wrapWorkflowClient` / `wrapQStashClient` + `captureWorkflowRequest` from `ezlogs-nextjs/upstash-workflow` |
+
+**Jobs that run in a separate worker process** (for example a BullMQ
+worker you start with `node worker.js`) don't load `instrumentation.ts`.
+In that worker's entry file, start the agent before the worker starts,
+and create the database client the same way as in step 5:
+
+```ts
+// worker.ts (your worker's entry file)
+import { ezlogs } from "ezlogs-nextjs";
+
+ezlogs.init({ projectToken: process.env.EZLOGS_PROJECT_TOKEN! });
+// ...then create your Worker as usual
+```
+
+Otherwise the job's database changes show up as separate actions,
+without who made them.
+
+### 7. Name your records
 
 Database changes are titled with the record's `name`, `title`,
 `number` or `label` column. Records of people (users, members,
