@@ -6,7 +6,9 @@
 // problem with `process.on("beforeExit")` — Lambda doesn't fire it.
 //
 // Solution: detect serverless at init, and have the HTTP capture
-// flush synchronously after each handler resolves. The periodic
+// flush after each handler resolves, through the platform's waitUntil
+// when there is one, else inline with a short time bound (see
+// flushOnServerless in http/capture.ts). The periodic
 // scheduler still runs (in case multiple requests share a warm
 // process), but it's no longer the only safety net.
 //

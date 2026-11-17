@@ -317,8 +317,14 @@ The agent is designed to be **invisible** to your application.
 
 - **Never throws** into the host — every public surface wraps its work
   in `try/catch`.
-- **Never blocks** requests — sending is asynchronous on a background
-  flush scheduler.
+- **Doesn't hold up responses** — on a long-running server, events are
+  sent by a background flush scheduler, never on the request path. On
+  serverless hosts (Vercel, AWS Lambda, Netlify, Cloudflare Pages) the
+  function can freeze once the response is sent, so each request's
+  events are sent as it finishes: through the platform's `waitUntil`
+  when there is one (Vercel, and Next.js runtimes that provide it), after the response; without
+  it, the request waits at most 2 seconds, and events not sent by then
+  are best-effort (sent only if the function stays warm).
 - **Build-safe** — the build-time loader wraps every transform in
   try/catch and returns source unchanged on any error, so a regression
   in the loader can't break `next build`.

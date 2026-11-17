@@ -3,6 +3,20 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.3] — 2026-11-17
+
+### Fixed
+- **Serverless: a slow or down EZLogs server no longer slows your
+  responses.** On Vercel, AWS Lambda, Netlify and Cloudflare Pages,
+  captured routes, Pages API routes and Server Actions used to await
+  the full send (with retries, up to ~40s) before returning. The send
+  is now handed to the platform's `waitUntil` when the request has one
+  (Vercel, and Next.js runtimes that provide it) and runs after the response. Without
+  `waitUntil` the request waits at most 2 seconds; events not sent by
+  then are best-effort. Long-running servers are unchanged (background
+  flush). Wire format unchanged.
+- Overlapping requests on one instance (e.g. Vercel Fluid compute) no longer leave events unsent: a flush that arrives while another send is running queues one more drain behind it, shared by every caller meanwhile.
+
 ## [0.4.2] — 2026-11-17
 
 ### Changed

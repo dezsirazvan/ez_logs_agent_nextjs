@@ -179,15 +179,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
               durationMs: handlerMs ?? Date.now() - startMs,
               startedAt: new Date(startMs),
             });
-            // In serverless mode, the periodic flush scheduler can't be
-            // trusted (the process freezes between invocations). Drain
-            // synchronously here so this request's events ship before
-            // the function returns.
-            if (isServerless()) {
-              await flushScheduler.flushNow().catch(() => {
-                // never break the host request — flushNow already swallows
-              });
-            }
+            await flushOnServerless();
             endCorrelationScope();
           };
 
@@ -591,9 +583,7 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
               durationMs: Date.now() - startMs,
               startedAt: new Date(startMs),
             });
-            if (isServerless()) {
-              await flushScheduler.flushNow().catch(() => undefined);
-            }
+            await flushOnServerless();
             endCorrelationScope();
           }
         }),
@@ -754,9 +744,7 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
             });
             throw e;
           } finally {
-            if (isServerless()) {
-              await flushScheduler.flushNow().catch(() => undefined);
-            }
+            await flushOnServerless();
             endCorrelationScope();
           }
         }),
@@ -2119,6 +2107,44 @@ function followBody(
   } catch (e) {
     logger.debug(`could not follow the response body: ${describeError(e)}`);
     return null;
+  }
+}
+
+/** Longest a serverless request waits for its events to ship when the platform has no `waitUntil`. */
+export const SERVERLESS_INLINE_FLUSH_MS = 2_000;
+
+/**
+ * Serverless only: ship this request's events without holding up the
+ * response. The process may freeze once the response is sent, so the
+ * periodic scheduler can't be trusted. With the platform's `waitUntil`
+ * (Vercel, Next 15+ request context) the send runs after the response.
+ * Without it the request waits at most SERVERLESS_INLINE_FLUSH_MS;
+ * whatever has not shipped by then is best-effort (sent only if the
+ * process stays warm). Never throws.
+ */
+async function flushOnServerless(): Promise<void> {
+  if (!isServerless()) return;
+  try {
+    const waitUntil = platformWaitUntil();
+    if (waitUntil) {
+      waitUntil(flushScheduler.flushNow());
+      return;
+    }
+  } catch (e) {
+    logger.debug(`waitUntil unavailable, flushing inline: ${describeError(e)}`);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      flushScheduler.flushNow(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, SERVERLESS_INLINE_FLUSH_MS);
+      }),
+    ]);
+  } catch {
+    // flushNow swallows its own errors; never break the host request
+  } finally {
+    clearTimeout(timer);
   }
 }
 

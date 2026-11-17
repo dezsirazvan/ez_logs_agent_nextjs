@@ -9,7 +9,8 @@
  *
  * Note on serverless: this scheduler is the long-lived-process model.
  * Vercel functions and Lambda freeze between requests, killing the
- * timer. Serverless mode disables the scheduler and uses sync flush.
+ * timer. Serverless mode also flushes at the end of each request
+ * (flushOnServerless in http/capture.ts).
  */
 
 import { configuration } from "../configuration.js";
@@ -23,6 +24,10 @@ const GLOBAL_KEY = Symbol.for("ezlogs-nextjs:flush-scheduler-state");
 interface SchedulerState {
   timer: ReturnType<typeof setInterval> | null;
   inFlight: boolean;
+  /** The running tick, so a caller arriving mid-send can queue after it. */
+  current: Promise<void> | null;
+  /** One follow-up drain queued behind `current`, shared by every caller that arrives meanwhile. */
+  followUp: Promise<void> | null;
 }
 
 interface GlobalWithScheduler {
@@ -32,7 +37,7 @@ interface GlobalWithScheduler {
 function state(): SchedulerState {
   const g = globalThis as unknown as GlobalWithScheduler;
   if (!g[GLOBAL_KEY]) {
-    g[GLOBAL_KEY] = { timer: null, inFlight: false };
+    g[GLOBAL_KEY] = { timer: null, inFlight: false, current: null, followUp: null };
   }
   return g[GLOBAL_KEY]!;
 }
@@ -69,18 +74,42 @@ export const flushScheduler = {
     return state().timer !== null;
   },
 
-  /** Force a single drain-and-send cycle. Used by serverless flush + tests. */
-  async flushNow(): Promise<void> {
-    await tick();
+  /**
+   * Drain and send now; resolves once this caller's events are sent (or
+   * dropped). If a send is already running, one more drain is queued after
+   * it, so events buffered since that send started are covered too: on
+   * serverless, overlapping requests each hand this promise to waitUntil.
+   * Concurrent callers share that single follow-up, so a slow server never
+   * builds a queue.
+   */
+  flushNow(): Promise<void> {
+    const s = state();
+    if (!s.inFlight || !s.current) return tick();
+    if (!s.followUp) {
+      s.followUp = s.current.then(() => {
+        s.followUp = null;
+        return tick();
+      });
+    }
+    return s.followUp;
   },
 };
 
-async function tick(): Promise<void> {
+function tick(): Promise<void> {
   const s = state();
   // Skip if a previous tick is still in flight — prevents stampede when
-  // sendInterval is short and the network is slow.
-  if (s.inFlight) return;
+  // sendInterval is short and the network is slow. (flushNow queues a
+  // follow-up instead of skipping.)
+  if (s.inFlight && s.current) return s.current;
   s.inFlight = true;
+  s.current = runTick().finally(() => {
+    s.inFlight = false;
+    s.current = null;
+  });
+  return s.current;
+}
+
+async function runTick(): Promise<void> {
   try {
     const events = drainEvents();
     if (events.length > 0) await retrySender.send(events);
@@ -95,8 +124,6 @@ async function tick(): Promise<void> {
     if (swept.length > 0) await retrySender.send(swept);
   } catch (error) {
     logger.error(`FlushScheduler tick failed: ${describeError(error)}`);
-  } finally {
-    s.inFlight = false;
   }
 }
 
