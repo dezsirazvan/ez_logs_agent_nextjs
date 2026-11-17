@@ -113,7 +113,8 @@ export type ServerActionErrorClassifier = (
 ) => boolean | { errorMessage: string } | null | undefined;
 
 export interface InitOptions {
-  serverUrl: string;
+  /** Default: `process.env.EZLOGS_SERVER_URL`, else `"https://app.ezlogs.io"`. Set only if you self-host. */
+  serverUrl?: string;
   projectToken: string;
   captureHttp?: boolean;
   captureDb?: boolean;
@@ -340,6 +341,9 @@ export const DEFAULT_EXCLUDED_JOB_CLASSES: readonly string[] = Object.freeze([])
 export const DEFAULT_EXCLUDED_GRAPHQL_OPERATIONS: readonly string[] =
   Object.freeze(["IntrospectionQuery", "__*"]);
 
+// SaaS endpoint, the same for every customer (tenants are told apart by projectToken).
+export const DEFAULT_SERVER_URL = "https://app.ezlogs.io";
+
 export class Configuration {
   serverUrl: string | null = null;
   projectToken: string | null = null;
@@ -384,7 +388,10 @@ export class Configuration {
   triggerTrackedTables: Set<string> | null = null;
 
   apply(options: InitOptions): void {
-    this.serverUrl = options.serverUrl;
+    this.serverUrl =
+      options.serverUrl ||
+      (typeof process !== "undefined" ? process.env?.EZLOGS_SERVER_URL : undefined) ||
+      DEFAULT_SERVER_URL;
     this.projectToken = options.projectToken;
     if (options.captureHttp !== undefined) this.captureHttp = options.captureHttp;
     if (options.captureDb !== undefined) this.captureDb = options.captureDb;

@@ -44,7 +44,6 @@ export async function register() {
   const pg = await import("pg");
   const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
   ezlogs.init({
-    serverUrl: process.env.EZLOGS_SERVER_URL!,
     projectToken: process.env.EZLOGS_PROJECT_TOKEN!,
     databaseReader: (sql, params) => pool.query(sql, params),
     patchDatabaseClient: pg, // auto-injects SET LOCAL on every query

@@ -1,13 +1,13 @@
 # Configuration reference
 
-All options have sensible defaults. **Only `serverUrl` and `projectToken`
-are required.**
+All options have sensible defaults. **Only `projectToken` is required.**
+`serverUrl` defaults to `process.env.EZLOGS_SERVER_URL` if set, otherwise
+`https://app.ezlogs.io`.
 
 ## Minimal
 
 ```ts
 ezlogs.init({
-  serverUrl: "https://your-ezlogs-server.com",
   projectToken: "ezl_your_api_key_here",
 });
 ```
@@ -19,8 +19,11 @@ ezlogs.init({
   // ==========================================
   // Required
   // ==========================================
-  serverUrl: "https://your-ezlogs-server.com",
   projectToken: "ezl_your_api_key_here",
+
+  // Optional. Default: process.env.EZLOGS_SERVER_URL, else
+  // "https://app.ezlogs.io". Set only if you self-host.
+  serverUrl: "https://your-ezlogs-server.com",
 
   // ==========================================
   // Event capture toggles (all default true)

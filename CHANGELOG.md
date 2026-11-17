@@ -3,6 +3,17 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.2] — 2026-11-17
+
+### Changed
+- **`serverUrl` is optional in `ezlogs.init()`.** It defaults to
+  `process.env.EZLOGS_SERVER_URL` if set, otherwise
+  `https://app.ezlogs.io`, so `projectToken` is the only required
+  option. An explicit `serverUrl` still wins, and the "not HTTPS"
+  warning still applies. The "not capturing" startup warning now only
+  reports a missing `projectToken`. Existing `init()` calls that pass
+  `serverUrl` keep working unchanged.
+
 ## [0.4.1] — 2026-11-17
 
 0.4.0 was tagged but never published to npm; 0.4.1 is the first release of

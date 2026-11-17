@@ -46,12 +46,14 @@ import { ezlogs } from "ezlogs-nextjs";
 export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs") {
     ezlogs.init({
-      serverUrl: process.env.EZLOGS_SERVER_URL!,
       projectToken: process.env.EZLOGS_PROJECT_TOKEN!,
     });
   }
 }
 ```
+
+`serverUrl` is optional: it defaults to `process.env.EZLOGS_SERVER_URL`
+if set, otherwise `https://app.ezlogs.io`. Set it only if you self-host.
 
 ### 2. Wrap your Next config
 
@@ -110,7 +112,6 @@ yours and add to it:
 
 ```bash
 # .env.local
-EZLOGS_SERVER_URL=https://app.ezlogs.io
 EZLOGS_PROJECT_TOKEN=ezl_your_api_key_here
 ```
 
@@ -121,12 +122,16 @@ per server process, at the default log level):
 [ezlogs] capturing → app.ezlogs.io (key ezl_a1b2c3d4…)
 ```
 
-If `serverUrl` or `projectToken` is missing you get
-`[ezlogs] not capturing: … missing` instead. Call an API route or
-submit a Server Action; events appear in your EZLogs dashboard within a
-few seconds. Page views are only recorded when the app has a
-`middleware.ts` (or `proxy.ts` on Next 16), so opening a page is not a
-reliable check.
+If `projectToken` is missing you get this instead:
+
+```
+[ezlogs] not capturing: projectToken missing in ezlogs.init() (check EZLOGS_PROJECT_TOKEN)
+```
+
+Call an API route or submit a Server Action; events appear in your
+EZLogs dashboard within a few seconds. Page views are only recorded when
+the app has a `middleware.ts` (or `proxy.ts` on Next 16), so opening a
+page is not a reliable check.
 
 Sending to a local EZLogs server over plain `http://` (development)?
 Events are still sent, but the agent warns on every start; pass

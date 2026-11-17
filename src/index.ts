@@ -92,8 +92,7 @@ function announceStartup(serverUrl: string | null, projectToken: string | null):
   if (g[STARTUP_ANNOUNCED_KEY]) return;
   g[STARTUP_ANNOUNCED_KEY] = true;
   if (!serverUrl || !projectToken) {
-    const missing = [!serverUrl && "serverUrl", !projectToken && "projectToken"].filter(Boolean).join(" and ");
-    logger.warn(`not capturing: ${missing} missing in ezlogs.init() (check EZLOGS_SERVER_URL / EZLOGS_PROJECT_TOKEN)`);
+    logger.warn("not capturing: projectToken missing in ezlogs.init() (check EZLOGS_PROJECT_TOKEN)");
     return;
   }
   let host = serverUrl;
