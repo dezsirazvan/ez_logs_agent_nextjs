@@ -54,6 +54,9 @@ only when the signature verifies (so the worker needs the same
 
 ## Inngest
 
+Inngest v3. On Inngest v4 the middleware does nothing (its middleware
+API changed) and logs one warning; Inngest jobs aren't captured there.
+
 ```ts
 import { Inngest } from "inngest";
 import { ezlogsInngestMiddleware } from "ezlogs-nextjs/inngest";

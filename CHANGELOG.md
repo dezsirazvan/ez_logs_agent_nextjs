@@ -3,17 +3,14 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
-## [Unreleased]
-
-### Changed
-- **Startup line key hint** now matches the dashboard (Settings → API Keys):
-  `[ezlogs] capturing → <host> (key ezl_<first 8>…)`. Tokens not shaped
-  like `ezl_…` get no hint.
-
 ## [0.4.0] — 2026-11-16
 
 Wire format unchanged; one new optional `source_data` field
-(`redirect_to`). **Upgrade steps:** none required. postgres.js /
+(`redirect_to`). **Upgrade steps:** none from 0.2.x / 0.3.x. From
+0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
+**before** deploying the new agent, deploy right after, and later
+re-run `npx ezlogs-nextjs install-triggers` at a quiet moment (details
+under 0.2.0 below). postgres.js /
 Drizzle-on-postgres-js apps: wrap the `sql` instance (`wrapPostgresJs`,
 below) so DB writes join their request. Optional: re-run
 `npx ezlogs-nextjs install-triggers` to start tracking session-named
@@ -43,9 +40,10 @@ and no longer modify their argument; send the returned value.
   16 or newer (before that `proxy.ts` is an ordinary module); other
   files named `proxy.ts` are left alone.
 - **Startup line** at the default log level, once per process:
-  `[ezlogs] capturing → <host> (project …last4)` (the suffix only for
-  tokens of 12+ characters), or `[ezlogs] not capturing: … missing`.
-  The README verify step uses it.
+  `[ezlogs] capturing → <host> (key ezl_<first 8>…)`, matching the
+  dashboard (Settings → API Keys); tokens not shaped like `ezl_…` get
+  no hint. Or `[ezlogs] not capturing: … missing`. The README verify
+  step uses it.
 - **`redirect_to`** on Server Action events: the same-origin path a
   `redirect()` sent the user to (no query; token-like segments,
   emails and secrets masked). External redirects are not recorded.
@@ -56,6 +54,26 @@ and no longer modify their argument; send the returned value.
   installer points at it.
 
 ### Fixed
+- **Upstash Workflow steps became separate actions.** The new
+  destructured-export auto-wrap also wrapped
+  `export const { POST } = serve(...)`, so each step delivery after the
+  first was recorded as its own actor-less request (the correlation
+  header reaches the first delivery only). The loader now leaves a
+  destructured export alone when its initializer is `serve` imported
+  from `@upstash/workflow` (any subpath); `captureWorkflowRequest`
+  records each delivery as a job event on the run's action, as in 0.3.x.
+- **DB rows took the actor of whichever scope claimed them.** Several
+  scopes can share one correlation id (a job and its request, workflow
+  steps, an inbound `x-ezlogs-correlation-id`), and a flush claims every
+  row with that id, so a row written by one user could ship with
+  another user's actor. Each row now carries the actor id its writer
+  stored (`ezlogs.actor_id`, set by the patched `pg`, `wrapPostgresJs`
+  and now also `ezlogsPrisma()`); the claimer only adds its label /
+  kind when it is the same id. A row with no stored actor ships with
+  none. Behavior change: supabase-js writes (PostgREST can't set
+  `ezlogs.actor_id`) and writes made before the request's actor was
+  known no longer get a per-row actor; the request's own event still
+  has it.
 - **Streamed responses lost their DB changes.** tRPC's default
   `httpBatchStreamLink`, AI SDK and SSE routes do their work after the
   handler returns; the agent drained audit rows at return, so the card
@@ -184,8 +202,31 @@ and no longer modify their argument; send the returned value.
     long after it ended. A request's scope now links work for 60 s
     after the request's events are flushed (`after()` / `waitUntil`
     work stays linked); later work runs unlinked.
+- **pg cursors and streams broke inside a request.** With
+  `patchPgClient`, `client.query(new Cursor(...))` /
+  `new QueryStream(...)` / COPY streams / `new pg.Query(...)` on an
+  idle client inside a request returned a Promise instead of the
+  object, so `.read`, `.pipe` and `.on` failed (since the patch
+  shipped, 0.1.x). Submittables are now passed to pg untouched and
+  returned, in every state; a write made through one is untagged.
+- **`inngest.send` threw "Cls is not a constructor" on Inngest v4.**
+  Inngest v3 is supported; the peer range stays `>=3` so v4 apps can still install. On v4,
+  `ezlogsInngestMiddleware()` does nothing and logs one warning
+  (Inngest jobs aren't captured) instead of crashing the app.
+- **Job scopes never ended.** A timer or long-lived object started
+  inside a job stayed linked to that job forever. A job's scope now
+  ends like a request's: 60 s after the job body finishes.
+- **A new correlation scope could read an outer scope's actor.** A
+  correlation scope opened inside an expired request now always starts
+  with no actor (callers that carry one, like job runners, set it
+  inside). Every agent entry point already did this; the guard is now
+  in `runWithCorrelation` itself.
 
 ### Docs
+- Don't share one `pg.Client` across concurrent requests (use a
+  `pg.Pool`): while one request has its own transaction open on it,
+  another request's write runs inside that transaction and is
+  recorded under the first request. Not fixable in the agent.
 - `$extends(ezlogsPrisma())` is the recommended Prisma path, with or
   without a driver adapter; `patchPrismaPgAdapter` is marked legacy.
 - `next.config` type fixture: CI checks a typedef mirroring Next's

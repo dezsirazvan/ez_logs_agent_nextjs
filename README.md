@@ -122,8 +122,11 @@ per server process, at the default log level):
 ```
 
 If `serverUrl` or `projectToken` is missing you get
-`[ezlogs] not capturing: … missing` instead. Hit any route; events
-appear in your EZLogs dashboard within a few seconds.
+`[ezlogs] not capturing: … missing` instead. Call an API route or
+submit a Server Action; events appear in your EZLogs dashboard within a
+few seconds. Page views are only recorded when the app has a
+`middleware.ts` (or `proxy.ts` on Next 16), so opening a page is not a
+reliable check.
 
 Sending to a local EZLogs server over plain `http://` (development)?
 Events are still sent, but the agent warns on every start; pass
@@ -185,7 +188,7 @@ export const prisma = new PrismaClient().$extends(ezlogsPrisma());
 ```
 
 Each write inside a captured request runs as
-`$transaction([set_config(correlation id), your query])` (Prisma's
+`$transaction([set_config(correlation id, actor id), your query])` (Prisma's
 documented RLS-extension pattern); reads are untouched. Writes inside
 your own `prisma.$transaction(...)` are not tagged: they still show up,
 as separate actions without an actor. Without the extension, a plain
@@ -229,8 +232,8 @@ values only — Prisma doesn't expose the old row). With triggers it
 sends nothing for tracked tables; the trigger rows are the single
 source, so there are no duplicates (also for `@@map`-ed models).
 
-**Upgrading:** from 0.2.x to 0.3.0 there is nothing to re-run (no SQL
-changes). From 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
+**Upgrading:** from 0.2.x or 0.3.x there is nothing to re-run before
+deploying. From 0.1.x, run `npx ezlogs-nextjs install-triggers --tables=none`
 **before** deploying the new agent (functions only, no table locks),
 deploy right after, and later re-run `npx ezlogs-nextjs install-triggers`
 at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
@@ -370,12 +373,25 @@ event. EZLogs is best-effort, not guaranteed delivery.
   exposes for supabase-js). Untagged writes show up as their own
   actions without an actor. An inbound `x-ezlogs-correlation-id` is
   honored only in the agent's own format and if under an hour old.
+- **A DB change's actor is the one its writer stored.** The agent sets
+  the actor id next to the correlation id on tagged writes (`pg`,
+  postgres.js, Prisma), so a row keeps its writer's actor even when
+  another scope with the same correlation id sends it. supabase-js
+  writes store no actor: they join their request, and the request's
+  own event carries the actor.
 - **Work that outlives a request.** Async work started inside a
   request (`after()`, `waitUntil`, an un-awaited write) keeps its
   correlation id and actor for 60 seconds after the request's events
   are flushed. After that (a `setInterval`, a long-lived object
   created lazily inside a request) its writes, jobs and fetches are
-  unlinked: their own actions, never the old request's.
+  unlinked: their own actions, never the old request's. Work a
+  background job started ends the same way, 60 seconds after the job.
+- **Don't share one `pg.Client` across concurrent requests.** Use a
+  `pg.Pool`. While one request has its own transaction open on a
+  shared client, another request's write on it runs inside that
+  transaction in Postgres and is recorded under the first request.
+- **Cursors and streams** (`pg-cursor`, `pg-query-stream`, COPY) are
+  passed to `pg` untouched; writes made through them are untagged.
 
 ## Wire-format parity
 

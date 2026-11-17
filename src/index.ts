@@ -368,7 +368,7 @@ function runTriggerTrackedTablesDetection(): void {
     .then((tables) => {
       if (tables === null) {
         logger.debug(
-          "[ezlogs] trigger-tracked-table detection failed; falling back " +
+          "trigger-tracked-table detection failed; falling back " +
             "to suppress-all on `databaseReader` paths. Untracked tables " +
             "will not appear in the dashboard until detection succeeds " +
             "or the table is added with `SELECT ezlogs_track('table_name')`.",
@@ -377,7 +377,7 @@ function runTriggerTrackedTablesDetection(): void {
       }
       config.triggerTrackedTables = tables;
       logger.debug(
-        `[ezlogs] trigger-tracked tables: ${
+        `trigger-tracked tables: ${
           tables.size === 0 ? "(none)" : Array.from(tables).sort().join(", ")
         }`,
       );

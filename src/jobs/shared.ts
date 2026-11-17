@@ -22,6 +22,7 @@ import { build as buildEvent } from "../event-builder.js";
 import { pushEvent } from "../pipeline/buffer.js";
 import {
   current as currentCorrelation,
+  endCorrelationScope,
   generate as generateCorrelation,
   runWithCorrelation,
 } from "../correlation.js";
@@ -194,8 +195,11 @@ export async function runJobWithCapture<T>(
     }
   };
   // Always a fresh actor scope: the job's actor is only the one it
-  // carried, never the scope its worker was created in.
-  return runWithCorrelation(correlationId, () => runWithActorScope(body, meta.actor ?? null));
+  // carried, never the scope its worker was created in. The scope ends
+  // like a request's: work the job started keeps its id for the grace
+  // window, then runs unlinked.
+  const scoped = () => body().finally(endCorrelationScope);
+  return runWithCorrelation(correlationId, () => runWithActorScope(scoped, meta.actor ?? null));
 }
 
 // Clock skew allowance between the app and the database when matching

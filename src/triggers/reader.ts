@@ -41,7 +41,7 @@ import {
   generate as generateCorrelation,
   runWithCorrelation,
 } from "../correlation.js";
-import { runWithActorScope } from "../actor.js";
+import { getCurrentActor, runWithActorScope } from "../actor.js";
 import { currentEmittedAuditIds } from "./emit-dedup.js";
 import type { SqlExecutor } from "./context.js";
 
@@ -68,6 +68,8 @@ export interface AuditRow {
   txid?: string | null;
   /** When the trigger fired — becomes the event timestamp. */
   captured_at?: Date | null;
+  /** Actor id the writer set (`ezlogs.actor_id`), null when none. */
+  actor_id?: string | null;
 }
 
 /**
@@ -83,7 +85,7 @@ type ExecResult =
   | undefined;
 
 const COLUMNS =
-  "id, table_name, op, old_row, new_row, resource_id, correlation_id, txid, captured_at";
+  "id, table_name, op, old_row, new_row, resource_id, correlation_id, txid, captured_at, actor_id";
 
 /** Rows older than this are drained by the sweep even if tagged (their request never flushed). */
 const ORPHAN_AGE = "5 minutes";
@@ -231,9 +233,7 @@ export async function sweepAuditLog(exec: SqlExecutor): Promise<number> {
     await loadTableMeta(exec, rows);
     for (const row of rows) {
       const correlationId = row.correlation_id ?? correlationForTx(row.txid);
-      runWithCorrelation(correlationId, () =>
-        runWithActorScope(() => emitOne(row)),
-      );
+      runWithCorrelation(correlationId, () => emitWithRowActor(row));
     }
     return rows.length;
   } catch (err) {
@@ -391,8 +391,22 @@ export async function detectTriggerTrackedTables(
  */
 export function emitAuditRows(rows: ReadonlyArray<AuditRow>): void {
   for (const row of rows) {
-    emitOne(row);
+    emitWithRowActor(row);
   }
+}
+
+/**
+ * Emit a row as the actor its writer stored, never the claiming
+ * scope's: several scopes can share a correlation id (a job, workflow
+ * steps, an inbound header), and a claim takes every row with that id.
+ * The claimer's actor only adds its label / kind when it is the same
+ * id. A row with no stored actor gets none (who wrote it is unknown).
+ */
+function emitWithRowActor(row: AuditRow): void {
+  const stored = row.actor_id || null;
+  const claimer = getCurrentActor();
+  const actor = stored ? (claimer?.id === stored ? claimer : { id: stored }) : null;
+  runWithActorScope(() => emitOne(row), actor);
 }
 
 /**
@@ -841,6 +855,7 @@ function normalizeAuditRow(raw: unknown): AuditRow {
     correlation_id: r.correlation_id == null ? null : String(r.correlation_id),
     txid: r.txid == null ? null : String(r.txid),
     captured_at: toDate(r.captured_at),
+    actor_id: r.actor_id == null ? null : String(r.actor_id),
   };
 }
 

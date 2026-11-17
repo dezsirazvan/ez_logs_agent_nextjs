@@ -194,6 +194,12 @@ function runPatchedQuery(
     return queued;
   }
 
+  // Submittables (pg-cursor, pg-query-stream, pg-copy-streams, pg.Query)
+  // are used through the object pg returns (`.read`, `.pipe`, `.on`), so
+  // they are never wrapped: pg gets them untouched and the caller gets
+  // them back. A write made this way is untagged (its own action).
+  if (isSubmittable(config)) return original.call(client, config, values, callback);
+
   const text = extractQueryText(config);
   const verb = leadingVerb(text);
 

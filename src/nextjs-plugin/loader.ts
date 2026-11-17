@@ -359,20 +359,41 @@ function rewriteLocalAliasedRouteExports(
  * so `rewriteAppRoute` can append the wrapped exports. Every statement
  * in the file is handled; one with a non-method name (`{ GET, auth }`)
  * is left alone.
+ *
+ * Also left alone: `export const { POST } = serve(...)` with `serve`
+ * imported from `@upstash/workflow` (any subpath). Every workflow step
+ * is a QStash delivery to that route; captureWorkflowRequest records it
+ * as a job event, and an HTTP event per delivery would be an extra
+ * actor-less card.
  */
 function renameDestructuredExports(source: string): { source: string; methods: HttpMethodName[] } {
   const methodSet = new Set<string>(HTTP_METHOD_NAMES);
+  const workflowServe = upstashWorkflowServeNames(source);
   const methods: HttpMethodName[] = [];
   const out = source.replace(
     /(^|\n)([ \t]*)export\s+const\s*\{([^}]+)\}\s*=/g,
-    (full, lead: string, indent: string, list: string) => {
+    (full, lead: string, indent: string, list: string, offset: number) => {
       const names = list.split(",").map((n) => n.trim()).filter(Boolean);
       if (names.length === 0 || !names.every((n) => methodSet.has(n))) return full;
+      const callee = /^\s*([A-Za-z_$][\w$]*)\s*[<(]/.exec(source.slice(offset + full.length))?.[1];
+      if (callee && workflowServe.has(callee)) return full;
       methods.push(...(names as HttpMethodName[]));
       return `${lead}${indent}const { ${names.map((n) => `${n}: ${ALREADY_WRAPPED_MARKER}${n}`).join(", ")} } =`;
     },
   );
   return { source: out, methods };
+}
+
+/** Local names of `serve` in `import { serve [as x] } from "@upstash/workflow[/…]"`. */
+function upstashWorkflowServeNames(source: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*["']@upstash\/workflow(?:\/[^"']*)?["']/g)) {
+    for (const spec of m[1]!.split(",")) {
+      const [imported, local] = spec.trim().split(/\s+as\s+/);
+      if (imported === "serve") names.add((local ?? imported).trim());
+    }
+  }
+  return names;
 }
 
 /**

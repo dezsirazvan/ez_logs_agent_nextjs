@@ -36,6 +36,7 @@ import {
 import { runWithActorScope } from "../actor.js";
 import {
   current as currentCorrelation,
+  endCorrelationScope,
   runWithCorrelation,
   generate as generateCorrelation,
 } from "../correlation.js";
@@ -55,16 +56,32 @@ interface InngestSendContext {
   payloads?: Array<{ name?: string; data?: unknown }>;
 }
 
+let warnedUnsupported = false;
+
 /**
- * Returns an Inngest middleware object. Pass it via:
+ * Returns an Inngest v3 middleware. Pass it via:
  *   new Inngest({ middleware: [ezlogsInngestMiddleware()] })
  *
  * Returned `unknown` because Inngest's `Middleware` type is parameterized
  * over the client and we don't want to take a hard type dep.
+ *
+ * Inngest v4 has a different middleware API (a class it calls `new`
+ * on) that this adapter doesn't support. There the middleware does
+ * nothing and warns once, instead of crashing `inngest.send`.
  */
 export function ezlogsInngestMiddleware(): unknown {
-  return {
-    name: "ezlogs-nextjs",
+  const middleware = function ezlogsInngestV4() {
+    if (!warnedUnsupported) {
+      warnedUnsupported = true;
+      logger.warn(
+        "ezlogsInngestMiddleware supports Inngest v3 only; on this Inngest version it does nothing (jobs are not captured)",
+      );
+    }
+    return {};
+  };
+  // v3 reads `name` and calls `init()`.
+  Object.defineProperty(middleware, "name", { value: "ezlogs-nextjs" });
+  return Object.assign(middleware, {
     init() {
       return {
         // Hook called once per function run (e.g. one trigger fires
@@ -162,7 +179,7 @@ export function ezlogsInngestMiddleware(): unknown {
         },
       };
     },
-  };
+  });
 }
 
 /**
@@ -193,7 +210,9 @@ export async function runInsideInngestCorrelation<T>(
     }
   };
   // Fresh actor scope: never the actor of the scope that called us.
-  return runWithCorrelation(id, () => runWithActorScope(body, actor));
+  // Ended after the body, like a job's (see runJobWithCapture).
+  const scoped = () => body().finally(endCorrelationScope);
+  return runWithCorrelation(id, () => runWithActorScope(scoped, actor));
 }
 
 function functionId(fn: InngestRunContext["fn"]): string | null {

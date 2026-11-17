@@ -25,6 +25,7 @@
 import { logger } from "../logger.js";
 import { makeAsyncContextCapture } from "../edge-fallback.js";
 import { current as currentCorrelation } from "../correlation.js";
+import { getCurrentActor } from "../actor.js";
 import { configuration } from "../configuration.js";
 import {
   emitDbEvent,
@@ -167,7 +168,10 @@ export function buildPrismaExtension(
   };
 }
 
-const SET_CORRELATION_SQL = "SELECT set_config('ezlogs.correlation_id', $1, TRUE)";
+// The actor id is stored on the audit row, so a row keeps its writer's
+// actor whichever scope claims it ('' = none; the trigger reads it as NULL).
+const SET_CONTEXT_SQL =
+  "SELECT set_config('ezlogs.correlation_id', $1, TRUE), set_config('ezlogs.actor_id', $2, TRUE)";
 
 async function runTagged(
   client: TaggingClient | null,
@@ -176,7 +180,7 @@ async function runTagged(
   if (!shouldTag(client, ctx)) return ctx.query(ctx.args);
   try {
     const results = await client!.$transaction([
-      client!.$executeRawUnsafe(SET_CORRELATION_SQL, currentCorrelation()),
+      client!.$executeRawUnsafe(SET_CONTEXT_SQL, currentCorrelation(), getCurrentActor()?.id ?? ""),
       ctx.query(ctx.args),
     ]);
     return results[1];

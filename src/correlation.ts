@@ -23,6 +23,9 @@
 // id → 8-hex derivation we use FNV-1a (non-crypto, but the goal
 // is deterministic grouping, not collision resistance).
 import { createScopedStorage } from "./edge-fallback.js";
+// Cycle with actor.ts (it reads `scopeExpired`): both only call each
+// other's functions at run time, never at module load.
+import { runWithActorScope } from "./actor.js";
 
 /**
  * HTTP header carrying the agent's correlation id between hops.
@@ -232,12 +235,16 @@ export function endCorrelationScope(): void {
  * inside the callback (and any awaited work) sees the new id via
  * `current()`. After the callback resolves, the previous context is
  * restored.
+ *
+ * Also a fresh, empty actor scope: a new correlation scope never reads
+ * the actor of the scope it was opened in (e.g. an expired request's).
+ * Callers that carry an actor open their own actor scope inside.
  */
 export function runWithCorrelation<R>(
   correlationId: string,
   callback: () => R,
 ): R {
-  return storage.run({ id: correlationId, expiresAt: Infinity }, callback);
+  return storage.run({ id: correlationId, expiresAt: Infinity }, () => runWithActorScope(callback));
 }
 
 /** Test-only. Overrides `REQUEST_GRACE_MS` (pass nothing to restore). */

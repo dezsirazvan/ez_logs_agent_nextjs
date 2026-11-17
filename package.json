@@ -152,6 +152,8 @@
     "bullmq": "^5.76.10",
     "drizzle-orm": "^0.43.1",
     "pg": "^8.20.0",
+    "pg-cursor": "^2.22.1",
+    "pg-query-stream": "^4.17.1",
     "postgres": "^3.4.9",
     "prisma": "^5.22.0",
     "sucrase": "^3.35.0",
