@@ -164,7 +164,7 @@ export const { POST } = serve(async (context) => {
 ```
 
 With the plugin, the route needs none of this: `serve` captures every
-step (named by the route's path) and `new WorkflowClient(...)` /
+step (named by the route's path, plus the `context.run` step each delivery ran) and `new WorkflowClient(...)` /
 `new QStashClient(...)` are the wrapped clients. A step delivery is one
 job event; the POST that carried it (including QStash callbacks that run
 no step) sends no HTTP event of its own. Only requests QStash signed

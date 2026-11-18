@@ -66,6 +66,12 @@ export interface JobSourceData {
   queue?: string | null;
   /** 0-indexed retry count. Sidekiq's "retry_count": 0, 1, 2, ... */
   retry_count?: number | null;
+  /**
+   * The step of a multi-step job this run executed (an Upstash Workflow
+   * `context.run` / Inngest `step.run` name). Optional; absent when the run
+   * executed none (the call that ends a run) or the runner has no steps.
+   */
+  step?: string | null;
   /** Sanitized job payload (Rails gem `arguments`). */
   arguments?: unknown;
 }
@@ -74,6 +80,7 @@ export interface JobEmitInput {
   jobClass: string;
   jobId?: string | null;
   queue?: string | null;
+  step?: string | null;
   retryCount?: number | null;
   /** Correlation id for the event. If null, the current scope's id is used. */
   correlationId?: string | null;
@@ -100,6 +107,7 @@ export function emitJobEvent(input: JobEmitInput): void {
       job_id: input.jobId ?? null,
       queue: input.queue ?? null,
       retry_count: input.retryCount ?? null,
+      step: input.step ?? null,
       arguments: jobArguments(input.payload),
     });
 
@@ -133,8 +141,9 @@ export async function runJobWithCapture<T>(
   meta: {
     jobClass: string;
     jobId?: string | null;
-    /** The queue, or a function read when the job ends (a workflow step known only once it ran). */
-    queue?: string | null | (() => string | null);
+    queue?: string | null;
+    /** The step this run executed, or a function read when it ends (known only once it ran). */
+    step?: string | null | (() => string | null);
     retryCount?: number | null;
     correlationId: string | null;
     /**
@@ -166,12 +175,14 @@ export async function runJobWithCapture<T>(
   const body = async (): Promise<T> => {
     const startedAt = new Date();
     const startMs = startedAt.getTime();
-    const queue = meta.queue;
+    const step = meta.step;
     const baseMeta = {
       jobClass: meta.jobClass,
       jobId: meta.jobId ?? null,
-      get queue() {
-        return (typeof queue === "function" ? queue() : queue) ?? null;
+      queue: meta.queue ?? null,
+      // Read when the event is built (after the run): the step it executed.
+      get step() {
+        return (typeof step === "function" ? step() : step) ?? null;
       },
       retryCount: meta.retryCount ?? null,
       correlationId,

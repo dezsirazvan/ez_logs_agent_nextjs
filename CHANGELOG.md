@@ -29,11 +29,12 @@ Earlier releases (0.1.x) were not tracked in a changelog.
   The same holds for Inngest function runs. Routes that serve a workflow
   are wrapped like any other route; the skip for `serve()` route files
   is gone.
-- **Steps are named by their route and step.** An instrumented `serve()`
-  records each delivery under its route path (`job_class`,
-  `/api/workflows/export`) and the `context.run` step it ran (`queue`,
-  `generate-and-upload`), the field `captureWorkflowRequest({ stepName })`
-  already used; a delivery that ran no step keeps the route path. A manual
+- **Every multi-step job names the step it ran.** A new optional
+  `source_data.step` on background_job events: the Upstash Workflow
+  `context.run` step a delivery ran (an instrumented `serve()` records it
+  under its route path, `/api/workflows/export`), and the Inngest
+  `step.run` step an execution ran. Absent on the call that ends a run
+  and for runners without steps; nothing else in the event changes. A manual
   `captureWorkflowRequest({ workflowName })` inside it no longer adds a
   second capture, so its name is not used; drop the manual call.
 - **What every client now carries.** Each BullMQ job's data gets

@@ -112,17 +112,23 @@ export function ezlogsInngestMiddleware(): unknown {
           return {
             // Inngest calls this once after the function body returns
             // (success) or throws (failure surfaces via result.error).
-            transformOutput(args: { result?: { data?: unknown; error?: unknown } }) {
+            // `step`: the step this execution ran (none on the one where the function returns).
+            transformOutput(args: {
+              result?: { data?: unknown; error?: unknown };
+              step?: { name?: unknown; displayName?: unknown };
+            }) {
               try {
                 const result = args.result;
                 const error = result?.error;
                 const outcome: "success" | "failure" = error ? "failure" : "success";
                 const errorMessage = error ? formatError(error) : null;
 
+                const ranStep = args.step?.displayName ?? args.step?.name;
                 emitJobEvent({
                   jobClass: fnId,
                   jobId: runId,
                   queue: eventName,
+                  step: typeof ranStep === "string" && ranStep ? ranStep : null,
                   retryCount: attempt,
                   correlationId,
                   outcome,

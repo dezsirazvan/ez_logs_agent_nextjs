@@ -308,7 +308,8 @@ export async function captureWorkflowRequest<T>(
     {
       jobClass: meta.workflowName,
       jobId: runId,
-      queue: () => meta.ranStep?.() ?? meta.stepName ?? meta.workflowName,
+      queue: meta.stepName ?? meta.workflowName,
+      step: () => meta.ranStep?.() ?? meta.stepName ?? null,
       retryCount: retried,
       correlationId,
       actor,
