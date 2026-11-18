@@ -74,6 +74,48 @@ const storage = createScopedStorage<CorrelationScope>(
   Symbol.for("ezlogs-nextjs:correlation-storage"),
 );
 
+// Set while the app handles a request on an excluded path (configuration
+// `excludedPaths` or a built-in one): the orphan DB events (no correlation
+// id) its handler emits are not sent. They could never join an action:
+// never shown, yet still stored. Same rule as the Ruby agent. The mark ends when the
+// handler settles, so a socket or timer created inside it never carries it
+// into other requests' work. Without AsyncLocalStorage (some Edge setups)
+// it does not survive an await: those events are sent as before.
+interface ExcludedScope {
+  active: boolean;
+}
+const excludedStorage = createScopedStorage<ExcludedScope>(
+  Symbol.for("ezlogs-nextjs:excluded-request-storage"),
+);
+
+export function runExcluded<R>(callback: () => R): R {
+  const scope: ExcludedScope = { active: true };
+  let result: R;
+  try {
+    result = excludedStorage.run(scope, callback);
+  } catch (error) {
+    scope.active = false;
+    throw error;
+  }
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    (result as unknown as Promise<unknown>).then(
+      () => { scope.active = false; },
+      () => { scope.active = false; },
+    );
+  } else {
+    scope.active = false;
+  }
+  return result;
+}
+
+export function isExcluded(): boolean {
+  try {
+    return excludedStorage.read()?.active === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * How long a request's scope keeps linking work after the request's
  * events were flushed: `after()` / `waitUntil` work finishes well

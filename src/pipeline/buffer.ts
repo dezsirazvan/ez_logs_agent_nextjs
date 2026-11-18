@@ -12,6 +12,7 @@
 import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
 import type { Event } from "../event-builder.js";
+import { isExcluded } from "../correlation.js";
 
 const GLOBAL_QUEUE_KEY = Symbol.for("ezlogs-nextjs:buffer-queue");
 
@@ -25,8 +26,17 @@ function getQueue(): Event[] {
   return g[GLOBAL_QUEUE_KEY]!;
 }
 
+function isOrphanDbEvent(event: Event): boolean {
+  const e = event as { source_type?: unknown; correlation_id?: unknown };
+  return (e.source_type === "database_callback" || e.source_type === "bulk_database") && !e.correlation_id;
+}
+
 export function pushEvent(event: Event): void {
   try {
+    // Inside an excluded request only orphan DB events are dropped (no correlation
+    // id). A job run there (an excluded Inngest serve route) has its own
+    // correlation and keeps all its events.
+    if (isOrphanDbEvent(event) && isExcluded()) return;
     const queue = getQueue();
     const max = maxSize();
     if (queue.length >= max) {

@@ -3,6 +3,27 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.8] — 2026-11-18
+
+### Fixed
+- **Excluded paths drop the orphan DB writes made inside them.** A request
+  on an `excludedPaths` path (or a built-in one) was not captured, but the
+  DB writes its handler made still were, with no correlation id. They could
+  never join an action, so they never showed anywhere and still took up
+  storage. Now, with HTTP capture on, the DB events with no correlation id
+  that an App Router route handler or Pages Router API route emits while it
+  runs on an excluded path are not sent, as in the Ruby agent. A job run
+  there (an excluded Inngest serve route) keeps its events: on Inngest v4
+  its body has its own correlation; on v3 only with
+  `runInsideInngestCorrelation` (without it those writes were already sent
+  with no correlation and never shown). The exclusion ends when the handler settles, so work it
+  leaves behind is not affected. Not covered, sent as before: Server
+  Actions and RSC renders on an excluded page, writes made while a streamed
+  response body is sent, a Pages handler that ends the response from a
+  callback after returning, rows the Postgres trigger reader finds, and
+  Edge setups without AsyncLocalStorage (there it ends at the first
+  `await`).
+
 ## [0.4.7] — 2026-11-18
 
 ### Added

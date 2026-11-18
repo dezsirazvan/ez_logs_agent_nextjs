@@ -40,6 +40,7 @@ import {
   endCorrelationScope,
   resolveCorrelation,
   runWithCorrelation,
+  runExcluded,
 } from "../correlation.js";
 import { flushAuditLog } from "../triggers/reader.js";
 import { makeAsyncContextCapture } from "../edge-fallback.js";
@@ -131,7 +132,11 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
       }
 
       const snapshot = await snapshotRequest(request as Request);
-      if (snapshot === null) return Promise.resolve(runHandler(...args)); // excluded
+      // Excluded path: nothing the handler emits is sent either (its DB writes included).
+      if (snapshot === null) {
+        const excluded = pathExcluded((request as Request).url, (request as Request).method);
+        return Promise.resolve(excluded ? runExcluded(() => runHandler(...args)) : runHandler(...args));
+      }
       // App Router passes `{ params }` (a Promise since Next 15) as the
       // second argument: `[id]` from the route template, like Rails'
       // path params in `filtered_parameters`.
@@ -574,7 +579,11 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
       if (!req || !res) return Promise.resolve(runHandler(...args));
 
       const snapshot = snapshotPagesRequest(req);
-      if (snapshot === null) return Promise.resolve(runHandler(...args)); // excluded
+      // Excluded path: nothing the handler emits is sent either (its DB writes included).
+      if (snapshot === null) {
+        const excluded = pathExcluded(req.url ?? "/", req.method);
+        return Promise.resolve(excluded ? runExcluded(() => runHandler(...args)) : runHandler(...args));
+      }
 
       // Pages Router gives us a plain headers object, not a Headers
       // instance. Adapt to the same get-shape the resolver expects, then
@@ -2340,6 +2349,15 @@ function runWithActorAndAuditScope<R>(callback: () => Promise<R>): Promise<R> {
     return runWithActorScope(callback);
   }
   return runWithActorScope(() => runWithEmittedAuditIdsScope(callback));
+}
+
+// The request URL (absolute, or path-relative for the Pages Router) is on an excluded path.
+function pathExcluded(url: string, method?: string | null): boolean {
+  try {
+    return isExcludedPath(new URL(url, "http://internal.localhost").pathname, method);
+  } catch {
+    return false;
+  }
 }
 
 function isExcludedPath(path: string, method?: string | null): boolean {

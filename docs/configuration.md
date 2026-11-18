@@ -43,6 +43,9 @@ ezlogs.init({
   // ==========================================
   // Exclusion lists (MERGED with built-in defaults)
   // ==========================================
+  // A request on an excluded path is not captured, and (with captureHttp on)
+  // neither are the orphan DB writes its route handler makes while it runs;
+  // a job run there keeps its events.
   excludedPaths: ["/admin/preview*", "/internal/*"],
   excludedTables: ["audit_logs", "versions"],
   excludedJobClasses: ["app/internal/heartbeat"],
