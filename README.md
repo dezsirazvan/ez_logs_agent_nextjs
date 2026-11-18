@@ -73,6 +73,20 @@ export async function register() {
 `serverUrl` is optional: it defaults to `process.env.EZLOGS_SERVER_URL`
 if set, otherwise `https://app.ezlogs.io`. Set it only if you self-host.
 
+**Who did it.** Every action shows the signed-in person. With Supabase
+Auth there is nothing to add. Otherwise add one line to `ezlogs.init`:
+
+| Your sign-in | Add to `ezlogs.init({ … })` |
+|---|---|
+| Auth.js (NextAuth v5) | `actorFromRequest: authJsActor({ auth })` (your `auth` from `auth.ts`) |
+| NextAuth v4 | `actorFromRequest: nextAuthActor({ authOptions })` |
+| Clerk | `actorFromRequest: clerkActor()` |
+| Your own session or JWT | a small function, see [docs/auth.md](./docs/auth.md) |
+
+```ts
+import { authJsActor } from "ezlogs-nextjs/actors"; // or nextAuthActor / clerkActor
+```
+
 ### 3. Wrap your Next config
 
 Registers the build-time loaders that auto-wrap your routes and Server
@@ -158,10 +172,14 @@ If `projectToken` is missing you get this instead:
 [ezlogs] not capturing: projectToken missing in ezlogs.init() (check EZLOGS_PROJECT_TOKEN)
 ```
 
-Sending to a local EZLogs server over plain `http://` (development)?
-Events are still sent, but the agent warns on every start; pass
+Sending to a local EZLogs server over a non-localhost plain `http://`
+address? Events are still sent, but the agent warns on every start; pass
 `allowInsecureTransport: true` to `ezlogs.init` to silence it. Keep
 `https://` in production.
+
+`next dev` keeps reloading the page after you installed or upgraded the
+agent? Stop it, delete the `.next` folder, and start it again: a dev
+cache built before the change can keep invalidating itself.
 
 More in [docs/troubleshooting.md](./docs/troubleshooting.md).
 
@@ -190,6 +208,9 @@ string, then run this once from your app's directory:
 npm i pg                          # the trigger installer and reader need it
 npx ezlogs-nextjs install-triggers
 ```
+
+The trigger path needs Postgres 10 or newer (Supabase, Neon, RDS and
+every currently supported Postgres qualify).
 
 Supabase, Drizzle on node-postgres and raw `pg` need nothing else: the
 agent tags their writes itself, and the triggers record every write
@@ -233,7 +254,9 @@ agent tags their writes itself, and the triggers record every write
 
 Triggers **plus** this extension (plain `new PrismaClient()`, or with a
 driver adapter such as `@prisma/adapter-pg`). It tags each write with
-the request, so the change joins the right action and person.
+the request, so the change joins the right action and person. Add
+`.$extends(ezlogsPrisma())` where your app creates its client, and keep
+your own import path (T3 apps import from `generated/prisma`).
 
 ```ts
 // lib/prisma.ts
@@ -380,7 +403,9 @@ logout / sign-in / sign-out / signin / signout / `/session*` path
 **Auth events are captured:** `POST`s to sign-in, sign-up, sign-out,
 login and logout routes (NextAuth / Auth.js `/api/auth/*`, custom
 `/api/login`, …) and auth Server Actions, including failed attempts
-(a 4xx response or a returned error). Passwords, tokens and other
+(a 4xx response, a returned error, or a redirect whose target carries
+`error=`, which is how Auth.js and NextAuth report a failed sign-in
+from their API routes). Passwords, tokens and other
 sensitive params are sent as `"[FILTERED]"`; on auth routes and auth
 Server Actions (`signIn`, `verifyOtp`, …) one-time codes and OAuth
 state are too (`code`, `state`, `verification_code`, `otp*`, `pin`,

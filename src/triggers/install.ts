@@ -229,6 +229,12 @@ SELECT t.table_name,
 FROM information_schema.tables t
 WHERE t.table_schema = 'public'
   AND t.table_type = 'BASE TABLE'
+  -- A partition gets its parent's trigger cloned onto it; track the parent only.
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_class pc
+    JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+    WHERE pn.nspname = t.table_schema AND pc.relname = t.table_name AND pc.relispartition
+  )
 ORDER BY t.table_name
 `.trim();
 

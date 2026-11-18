@@ -150,6 +150,11 @@ export async function runJobWithCapture<T>(
      * event, since the job did not finish.
      */
     isControlFlow?: (error: unknown) => boolean;
+    /**
+     * Thrown when the body finished normally (Upstash Workflow ends each
+     * step by throwing WorkflowAbort): recorded as success, re-thrown.
+     */
+    isSuccessfulExit?: (error: unknown) => boolean;
   },
   work: () => Promise<T>,
 ): Promise<T> {
@@ -185,6 +190,10 @@ export async function runJobWithCapture<T>(
           : String(error);
       await flushJobAuditLog(startedAt);
       if (meta.isControlFlow?.(error)) throw error;
+      if (meta.isSuccessfulExit?.(error)) {
+        emitJobEvent({ ...baseMeta, outcome: "success", durationMs: Date.now() - startMs });
+        throw error;
+      }
       emitJobEvent({
         ...baseMeta,
         outcome: "failure",

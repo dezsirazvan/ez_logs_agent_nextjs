@@ -143,7 +143,7 @@ export const qstash = wrapQStashClient(
 
 export const { POST } = serve(async (context) => {
   await captureWorkflowRequest(
-    { request: context.request, workflowName: "send-welcome" },
+    { context, workflowName: "send-welcome" },
     async () => {
       await context.run("send-email", async () => {
         /* ... */

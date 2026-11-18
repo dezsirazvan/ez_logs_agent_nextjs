@@ -20,6 +20,7 @@
 
 import { current as currentCorrelation } from "../correlation.js";
 import { logger } from "../logger.js";
+import { loadNodeBuiltin } from "../node-builtin.js";
 
 const HEADER = "x-correlation-id";
 
@@ -48,6 +49,64 @@ export function patchGlobalFetch(): void {
 
   globalThis.fetch = wrapped;
   patched = true;
+  subscribeUndiciRequests();
+}
+
+// `next dev` saves the original fetch before instrumentation runs and
+// puts it back on every recompile, which silently drops the wrapper
+// above. Node's own fetch (undici) announces every request on a
+// diagnostics channel, whoever replaced `globalThis.fetch`, so the
+// header is also added there. The wrapper stays for runtimes without
+// that channel; whichever runs first sets the header, the other sees
+// it and leaves it alone.
+let subscribed = false;
+
+function subscribeUndiciRequests(): void {
+  if (subscribed) return;
+  const channel = loadDiagnosticsChannel();
+  if (!channel) return;
+  channel.subscribe("undici:request:create", onUndiciRequest);
+  subscribed = true;
+}
+
+interface UndiciRequestLike {
+  headers?: unknown;
+  addHeader?: (name: string, value: string) => unknown;
+}
+
+function onUndiciRequest(message: unknown): void {
+  try {
+    const request = (message as { request?: UndiciRequestLike } | null)?.request;
+    if (!request || typeof request.addHeader !== "function") return;
+    const id = currentCorrelation();
+    if (!id || hasCorrelationHeader(request.headers)) return;
+    request.addHeader(HEADER, id);
+  } catch (error) {
+    logger.debug(`outgoing request header injection failed: ${describeError(error)}`);
+  }
+}
+
+// undici keeps request headers as a flat [name, value, ...] array
+// (v6+) or a raw "name: value\r\n" string (v5).
+function hasCorrelationHeader(headers: unknown): boolean {
+  if (Array.isArray(headers)) {
+    for (let i = 0; i < headers.length; i += 2) {
+      if (String(headers[i]).toLowerCase() === HEADER) return true;
+    }
+    return false;
+  }
+  if (typeof headers === "string") return headers.toLowerCase().includes(`${HEADER}:`);
+  return false;
+}
+
+interface DiagnosticsChannelModule {
+  subscribe(name: string, onMessage: (message: unknown, name: string | symbol) => void): void;
+  unsubscribe(name: string, onMessage: (message: unknown, name: string | symbol) => void): boolean;
+}
+
+function loadDiagnosticsChannel(): DiagnosticsChannelModule | null {
+  const mod = loadNodeBuiltin<DiagnosticsChannelModule>(["diagnostics", "channel"].join("_"));
+  return typeof mod?.subscribe === "function" ? mod : null;
 }
 
 export function unpatchGlobalFetch(): void {
@@ -55,6 +114,10 @@ export function unpatchGlobalFetch(): void {
   globalThis.fetch = originalFetch;
   originalFetch = null;
   patched = false;
+  if (subscribed) {
+    loadDiagnosticsChannel()?.unsubscribe("undici:request:create", onUndiciRequest);
+    subscribed = false;
+  }
 }
 
 export function isPatched(): boolean {

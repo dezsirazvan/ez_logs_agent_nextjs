@@ -3,6 +3,45 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.5] — 2026-11-18
+
+Found by installing the agent into a large real Next.js 16 app (App
+Router, Server Actions, supabase-js, Upstash Workflow, partitioned
+Postgres tables) and using it.
+
+### Fixed
+- **Database changes joined their request again in `next dev`.** Next
+  restores its original `fetch` on every recompile, which silently
+  removed the wrapper that adds the request's correlation id to outgoing
+  calls. supabase-js / PostgREST writes then arrived as separate actions
+  with no actor. The header is now also added from Node's own fetch
+  (`undici:request:create`), whoever wrapped `globalThis.fetch`.
+- **No database round trip on your response.** Every captured request
+  and Server Action waited for the trigger audit-log read before
+  returning (one or two queries; 10-50 ms on a remote database). The
+  read now runs after the response (kept alive with `waitUntil` on
+  serverless).
+- **Upstash Workflow: every step joins the request that started the
+  run, and the SDK's own control flow is not a failure.** Capture inside
+  `serve()` with `captureWorkflowRequest({ context, workflowName }, …)`:
+  the run id now comes from `context.workflowRunId` (`context.headers`
+  only holds the triggering request's headers). `WorkflowAbort` (a step
+  ran) records a success, `WorkflowAuthError` (signature probe) records
+  nothing. The previously documented `context.request` does not exist
+  on the context and broke every step; `captureWorkflowRequest` now
+  runs the step uncaptured (and warns once) instead of throwing when it
+  gets no headers.
+- **Partitioned tables show under the parent's name**
+  (`analytics_events`, not `analytics_events_2026_11`). Re-run
+  `npx ezlogs-nextjs install-triggers` once to update existing triggers.
+- **A failed Auth.js / NextAuth sign-in is a failure.** They answer it
+  with a redirect to `…?error=CredentialsSignin`; on an auth route
+  (App Router route handler or Pages Router API route) that redirect now
+  records a failed action with that reason (it read as a success).
+- **Server Action names with connector words:** `createAndSwitchToCompany`
+  is about a Company, `addMemberToTeam` about a Member (it read
+  "And switch to company creation failed").
+
 ## [0.4.4] — 2026-11-17
 
 No code changes.

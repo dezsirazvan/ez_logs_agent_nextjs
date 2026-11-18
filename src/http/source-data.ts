@@ -232,13 +232,33 @@ function parseServerActionName(name: string): {
   const canonical = KNOWN_VERBS.get(leading);
   if (!canonical) return { verb: null, entity: null };
 
-  // Everything after the consumed leading verb tokens is the entity.
-  const entityTokens = tokens.slice(entityStart);
+  // The entity is the noun right after the verb, up to the first
+  // connector: addMemberToTeam -> Member, updateUserWithRole -> User.
+  // A compound name continues with And/Or/Then + a second verb; its
+  // object follows that verb: saveAndPublishPost -> Post,
+  // createAndSwitchToCompany -> Company (after the last connector).
+  let rest = tokens.slice(entityStart);
+  const isConnector = (t: string) => CONNECTORS.has(t.toLowerCase());
+  if (rest.length > 0 && COMPOUND.has(rest[0]!.toLowerCase())) {
+    rest = rest.slice(2);
+    if (rest.length > 0 && isConnector(rest[0]!)) {
+      rest = rest.slice(rest.map(isConnector).lastIndexOf(true) + 1);
+    }
+  }
+  // A connector-first rest (moveToTrash, deleteFromCart) has no noun we can trust: null.
+  const firstConnector = rest.findIndex(isConnector);
+  const entityTokens = firstConnector === -1 ? rest : rest.slice(0, firstConnector);
   if (entityTokens.length === 0) return { verb: canonical, entity: null };
 
   const entity = entityTokens.join("");
   return { verb: canonical, entity: stripTrailingS(entity) || entity };
 }
+
+const COMPOUND = new Set(["and", "or", "then"]);
+const CONNECTORS = new Set([
+  ...COMPOUND,
+  "to", "with", "without", "for", "from", "by", "in", "into", "on", "of", "via", "using", "as", "at",
+]);
 
 function stripTrailingS(entity: string): string {
   if (entity.length <= 1) return entity;

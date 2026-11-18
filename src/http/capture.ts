@@ -192,7 +192,9 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
               graphqlErrorMessage = await readGraphqlErrors(response);
             }
             const trpcRoute = isTrpcRoute(snapshot.rawParams, context.routeModulePath ?? null);
-            responseErrorMessage = await readResponseErrorMessage(response, trpcRoute);
+            responseErrorMessage =
+              (await readResponseErrorMessage(response, trpcRoute)) ??
+              authRedirectError(snapshot.url, response.status, response.headers.get("location"));
             // tRPC's httpBatchStreamLink answers 200 and puts a failed
             // call's error in a later line of the streamed body.
             const trpcStream =
@@ -574,12 +576,20 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
           } finally {
             await maybeExtractSupabaseActor();
 
+            const status = typeof res.statusCode === "number" ? res.statusCode : null;
+            const getHeader = res.getHeader as ((name: string) => unknown) | undefined;
             await emitEvent({
               snapshot,
               context,
-              statusCode: typeof res.statusCode === "number" ? res.statusCode : null,
+              statusCode: status,
               exception,
               graphqlErrorMessage: null,
+              // NextAuth v4 under pages/api/auth: a failed sign-in redirects to ?error=.
+              responseErrorMessage: authRedirectError(
+                snapshot.url,
+                status,
+                typeof getHeader === "function" ? getHeader.call(res, "location") : null,
+              ),
               durationMs: Date.now() - startMs,
               startedAt: new Date(startMs),
             });
@@ -2182,7 +2192,29 @@ function buildContext(): Record<string, unknown> | null {
 async function flushTriggerAuditLog(): Promise<void> {
   const reader = configuration().databaseReader;
   if (!reader) return;
-  await flushAuditLog(reader);
+  // Reading the rows is a database round trip: keep it off the
+  // response. The work starts here, inside the request's async context
+  // (correlation, actor, dedup scope), and is not awaited. Event order
+  // doesn't matter: the server groups by correlation id.
+  const work = flushAuditLog(reader).catch((e) =>
+    logger.debug(`trigger audit flush failed: ${describeError(e)}`),
+  );
+  if (!isServerless()) return;
+  // Serverless: the process may freeze after the response. Keep it alive
+  // until the rows are read and sent; without waitUntil, wait inline.
+  const waitUntil = platformWaitUntil();
+  if (waitUntil) {
+    waitUntil(work.then(() => flushScheduler.flushNow()));
+    return;
+  }
+  // No waitUntil: wait, but never longer than the serverless send cap.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    work,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SERVERLESS_INLINE_FLUSH_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -2282,6 +2314,22 @@ const MAX_ERROR_BODY_LENGTH = 16_384;
  * Truncated to 200 chars, card numbers and tokens masked. Null when
  * there is none or the body isn't small JSON.
  */
+/**
+ * Auth.js / NextAuth answer a failed sign-in with a redirect whose target
+ * carries the reason (`/login?error=CredentialsSignin`). On an auth route
+ * that redirect is the failure; anywhere else a redirect stays a success.
+ */
+function authRedirectError(url: URL, status: number | null | undefined, location: unknown): string | null {
+  try {
+    if (typeof status !== "number" || status < 300 || status >= 400 || !isAuthPath(url.pathname)) return null;
+    if (typeof location !== "string" || !location) return null;
+    const reason = new URL(location, url).searchParams.get("error");
+    return reason ? capErrorText(reason) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function readResponseErrorMessage(response: Response, trpcRoute = false): Promise<string | null> {
   try {
     // 207 Multi-Status: a tRPC batch where some calls failed. Read only

@@ -22,6 +22,8 @@
 // That's correct on Edge (per-request V8 isolate). On Node it would
 // mix correlation ids between concurrent requests, so we warn once.
 
+import { loadNodeBuiltin } from "./node-builtin.js";
+
 interface AsyncLocalStorageCtor {
   new <T>(): {
     getStore(): T | undefined;
@@ -39,44 +41,10 @@ function loadAsyncLocalStorage(): AsyncLocalStorageCtor | null {
 
   // The string is split so a future bundler doing string-match
   // analysis sees no literal "async_hooks". Cosmetic but cheap.
-  const moduleName = "node:" + ["async", "hooks"].join("_");
-
-  // 2. process.getBuiltinModule — works in ESM and CJS alike, and is
-  // a plain function call, so static bundlers don't follow it.
-  try {
-    const getBuiltin = (
-      globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }
-    ).process?.getBuiltinModule;
-    if (typeof getBuiltin === "function") {
-      const mod = getBuiltin(moduleName) as
-        | { AsyncLocalStorage?: AsyncLocalStorageCtor }
-        | undefined;
-      if (typeof mod?.AsyncLocalStorage === "function") return mod.AsyncLocalStorage;
-    }
-  } catch {
-    // ignore — try require next
-  }
-
-  // 3. Runtime require (CJS, or a bundler that provides one) —
-  // invisible to static bundlers because the string is computed. We
-  // can't use `import("node:async_hooks")` because static analyzers
-  // DO follow dynamic imports.
-  try {
-    // Aliased, not called directly: bundlers would turn a direct
-    // `require(<expression>)` into a context module.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const req: ((id: string) => any) | undefined =
-      typeof require !== "undefined" ? require : undefined;
-    if (typeof req === "function") {
-      const mod = req(moduleName) as {
-        AsyncLocalStorage?: AsyncLocalStorageCtor;
-      };
-      if (typeof mod.AsyncLocalStorage === "function") return mod.AsyncLocalStorage;
-    }
-  } catch {
-    // ignore — fall through to the no-ALS path
-  }
-
+  const mod = loadNodeBuiltin<{ AsyncLocalStorage?: AsyncLocalStorageCtor }>(
+    ["async", "hooks"].join("_"),
+  );
+  if (typeof mod?.AsyncLocalStorage === "function") return mod.AsyncLocalStorage;
   warnNoAsyncLocalStorageOnNode();
   return null;
 }

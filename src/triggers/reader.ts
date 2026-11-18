@@ -419,9 +419,43 @@ function emitWithRowActor(row: AuditRow): void {
  * before they push the HTTP event itself, so DB events arrive
  * grouped under the same correlation as the HTTP card.
  */
-export async function flushAuditLog(
+// Reads that claimed rows (DELETE … RETURNING) and haven't emitted them
+// yet. Requests no longer wait for them, so a send or a shutdown waits
+// here first, or claimed rows would be lost.
+const inFlightFlushes = new Set<Promise<void>>();
+const IN_FLIGHT_MAX_MS = 5_000;
+
+/** Resolves once every in-flight audit read has emitted (at most `maxMs`). */
+export function settleAuditFlushes(maxMs = IN_FLIGHT_MAX_MS): Promise<void> {
+  if (inFlightFlushes.size === 0) return Promise.resolve();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    Promise.allSettled([...inFlightFlushes]).then(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, maxMs);
+      (timer as { unref?: () => void }).unref?.();
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+export function flushAuditLog(
   exec: SqlExecutor | null | undefined,
   options: { since?: Date | null } = {},
+): Promise<void> {
+  const work = readAndEmit(exec, options);
+  inFlightFlushes.add(work);
+  const done = () => inFlightFlushes.delete(work);
+  work.then(done, done);
+  // A read stuck on a stalled database stops holding up sends after a while.
+  const forget = setTimeout(done, IN_FLIGHT_MAX_MS);
+  (forget as { unref?: () => void }).unref?.();
+  work.then(() => clearTimeout(forget), () => clearTimeout(forget));
+  return work;
+}
+
+async function readAndEmit(
+  exec: SqlExecutor | null | undefined,
+  options: { since?: Date | null },
 ): Promise<void> {
   if (!exec) return;
   const correlationId = currentCorrelation();

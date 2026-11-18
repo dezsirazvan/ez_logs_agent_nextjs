@@ -235,7 +235,10 @@ BEGIN
     resource_id,
     actor_id, correlation_id
   ) VALUES (
-    TG_TABLE_NAME, TG_OP,
+    -- The tracked table's name (TG_ARGV[4]), so a partition's rows
+    -- show under their parent; triggers attached before 0.4.5 have
+    -- no 5th argument.
+    COALESCE(NULLIF(TG_ARGV[4], ''), TG_TABLE_NAME), TG_OP,
     old_json,
     new_json,
     resource_id_value,
@@ -295,6 +298,15 @@ DECLARE
   all_columns       text[];
   trigger_args      text;
 BEGIN
+  -- A partition carries the trigger cloned from its parent (which records
+  -- rows under the parent's name); that clone can't be replaced here.
+  IF EXISTS (
+    SELECT 1 FROM pg_class c
+     WHERE c.oid = format('public.%I', target_table)::regclass AND c.relispartition
+  ) THEN
+    RETURN;
+  END IF;
+
   -- Detect the table's single-column primary key so the trigger can
   -- populate `resource_id` correctly regardless of how the customer
   -- named their PK column. Tables whose PK isn't `id` are a normal
@@ -327,12 +339,17 @@ BEGIN
      AND a.attnum > 0
      AND NOT a.attisdropped;
 
+  -- The 5th argument is the table's own name. Postgres clones a
+  -- partitioned table's trigger, arguments included, onto every
+  -- partition, where TG_TABLE_NAME is the partition
+  -- (`events_2026_11`); the argument keeps the parent's name.
   trigger_args := format(
-    '%L, %L, %L, %L',
+    '%L, %L, %L, %L, %L',
     COALESCE(pk_column_name, ''),
     sensitive_columns::text,
     all_columns::text,
-    public.ezlogs_patterns_version()
+    public.ezlogs_patterns_version(),
+    target_table
   );
 
   -- Already attached with exactly these arguments (same PK, columns and

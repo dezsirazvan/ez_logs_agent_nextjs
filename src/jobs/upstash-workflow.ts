@@ -52,7 +52,7 @@
 //
 //      export const { POST } = serve(async (context) => {
 //        await captureWorkflowRequest(
-//          { request: context.request, workflowName: "send-welcome" },
+//          { context, workflowName: "send-welcome" },
 //          async () => {
 //            await context.run("send-email", async () => {/* ... */})
 //          },
@@ -230,6 +230,8 @@ async function stampPublishRequest(
   return { ...request, headers };
 }
 
+let warnedNoHeaders = false;
+
 /**
  * Worker-side capture for a single Upstash Workflow step / QStash
  * delivery. Wraps your handler body so each invocation produces
@@ -250,16 +252,34 @@ async function stampPublishRequest(
  */
 export async function captureWorkflowRequest<T>(
   meta: {
-    request: Request | { headers: Headers };
+    /**
+     * The workflow's context (`serve(async (context) => …)`), or the
+     * delivery Request. With the context, the run id comes from
+     * `context.workflowRunId`: Upstash keeps only the triggering
+     * request's headers on `context.headers`, without the per-delivery
+     * `Upstash-Workflow-RunId`.
+     */
+    context?: { headers: Headers; workflowRunId?: string };
+    request?: Request | { headers: Headers };
     workflowName: string;
     /** Optional explicit step name; defaults to workflowName. */
     stepName?: string;
   },
   work: () => Promise<T>,
 ): Promise<T> {
-  const headers = meta.request.headers;
-  const correlationId = readCorrelationFromHeaders(headers);
-  const runId = readHeader(headers, "upstash-workflow-runid");
+  const headers = meta.request?.headers ?? meta.context?.headers;
+  if (!headers) {
+    // Never break the job over a wrong argument.
+    if (!warnedNoHeaders) {
+      warnedNoHeaders = true;
+      logger.warn(
+        "captureWorkflowRequest got no headers (pass { context, workflowName }); this step runs without capture",
+      );
+    }
+    return work();
+  }
+  const runId = readHeader(headers, "upstash-workflow-runid") ?? meta.context?.workflowRunId ?? null;
+  const correlationId = readCorrelationFromHeaders(headers) ?? correlationFromRunId(runId);
   const retried = parseRetried(readHeader(headers, "upstash-retried"));
   // The actor that started the run, when its token verifies against
   // this correlation id. Otherwise the step's writes have no actor.
@@ -279,6 +299,12 @@ export async function captureWorkflowRequest<T>(
       retryCount: retried,
       correlationId,
       actor,
+      // The SDK ends each delivery by throwing: WorkflowAbort after a
+      // step ran (and WorkflowCancelAbort on context.cancel()) is a
+      // finished step, WorkflowAuthError is its signature probe that
+      // runs no step. Only other errors are failures.
+      isControlFlow: (error) => errorName(error) === "WorkflowAuthError",
+      isSuccessfulExit: (error) => SUCCESSFUL_EXITS.has(errorName(error)),
     },
     work,
   );
@@ -330,6 +356,17 @@ function readHeader(headers: Headers, name: string): string | null {
   }
 }
 
+const SUCCESSFUL_EXITS = new Set(["WorkflowAbort", "WorkflowCancelAbort"]);
+
+function errorName(error: unknown): string {
+  return error !== null && typeof error === "object" ? String((error as { name?: unknown }).name ?? "") : "";
+}
+
+function correlationFromRunId(runId: string | null): string | null {
+  const fromRunId = runId ? AGENT_RUN_ID.exec(runId)?.[1] : undefined;
+  return fromRunId && isAcceptableStepId(fromRunId) ? fromRunId : null;
+}
+
 function readCorrelationFromHeaders(headers: Headers): string | null {
   // QStash strips the `Upstash-Forward-` prefix on delivery; the
   // prefixed names are read too for safety. Only the agent's own id
@@ -342,9 +379,7 @@ function readCorrelationFromHeaders(headers: Headers): string | null {
   }
   // Later step deliveries carry no user headers; a run started by
   // wrapWorkflowClient has the correlation id in its run id.
-  const runId = readHeader(headers, "upstash-workflow-runid");
-  const fromRunId = runId ? AGENT_RUN_ID.exec(runId)?.[1] : undefined;
-  return fromRunId && isAcceptableStepId(fromRunId) ? fromRunId : null;
+  return correlationFromRunId(readHeader(headers, "upstash-workflow-runid"));
 }
 
 function parseRetried(value: string | null): number | null {

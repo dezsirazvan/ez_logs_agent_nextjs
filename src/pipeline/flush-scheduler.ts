@@ -17,7 +17,7 @@ import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
 import { drainEvents } from "./buffer.js";
 import { retrySender } from "./retry-sender.js";
-import { maintainAuditLogAfterRequests } from "../triggers/reader.js";
+import { maintainAuditLogAfterRequests, settleAuditFlushes } from "../triggers/reader.js";
 
 const GLOBAL_KEY = Symbol.for("ezlogs-nextjs:flush-scheduler-state");
 
@@ -62,6 +62,8 @@ export const flushScheduler = {
 
   async stop(): Promise<void> {
     const s = state();
+    // Rows a request's audit read already claimed must ship before exit.
+    await settleAuditFlushes();
     if (s.timer === null) return; // idempotent
     clearInterval(s.timer);
     s.timer = null;
@@ -83,17 +85,22 @@ export const flushScheduler = {
    * builds a queue.
    */
   flushNow(): Promise<void> {
-    const s = state();
-    if (!s.inFlight || !s.current) return tick();
-    if (!s.followUp) {
-      s.followUp = s.current.then(() => {
-        s.followUp = null;
-        return tick();
-      });
-    }
-    return s.followUp;
+    // Rows a request's audit read already claimed go out with this send.
+    return settleAuditFlushes().then(() => sendNow());
   },
 };
+
+function sendNow(): Promise<void> {
+  const s = state();
+  if (!s.inFlight || !s.current) return tick();
+  if (!s.followUp) {
+    s.followUp = s.current.then(() => {
+      s.followUp = null;
+      return tick();
+    });
+  }
+  return s.followUp;
+}
 
 function tick(): Promise<void> {
   const s = state();
