@@ -21,7 +21,9 @@ ezlogs.init({
 
 ```ts
 import { nextAuthActor } from "ezlogs-nextjs/actors";
-import { authOptions } from "@/lib/auth";
+
+// Inside register(), in the `NEXT_RUNTIME === "nodejs"` branch:
+const { authOptions } = await import("@/lib/auth");
 
 ezlogs.init({
   // ...
@@ -33,13 +35,20 @@ ezlogs.init({
 
 ```ts
 import { authJsActor } from "ezlogs-nextjs/actors";
-import { auth } from "@/auth";
+
+// Inside register(), in the `NEXT_RUNTIME === "nodejs"` branch:
+const { auth } = await import("@/auth");
 
 ezlogs.init({
   // ...
   actorFromRequest: authJsActor({ auth }),
 });
 ```
+
+Import your auth module with `await import` inside the `nodejs` branch,
+never at the top of `instrumentation.ts`: that file is also built for the
+Edge runtime, and an auth module that loads your database client (Prisma,
+`pg`) breaks that build.
 
 ## Supabase Auth
 

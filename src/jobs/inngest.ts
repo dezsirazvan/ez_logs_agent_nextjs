@@ -11,10 +11,13 @@
 //     middleware: [ezlogsInngestMiddleware()],
 //   })
 //
-// What's captured:
+// What's captured (v3):
 //   - onFunctionRun: snapshot start time, fn id, run id, attempt
 //   - transformInput: extract correlation id from event.data
 //   - transformOutput: emit success/failure event with duration
+// On v4 (a class Inngest calls `new` on), `wrapRequest` runs the whole
+// run request inside the event's correlation and emits the event; see
+// inngestV4Hooks.
 //
 // Inngest's runtime model is event-driven, so:
 //   - "queue" maps to event name (best stable identifier)
@@ -33,7 +36,9 @@ import {
   signedActorToken,
   readActorToken,
   ACTOR_PAYLOAD_KEY,
+  CORRELATION_PAYLOAD_KEY,
 } from "./shared.js";
+import { createScopedStorage } from "../edge-fallback.js";
 import { runWithActorScope } from "../actor.js";
 import { markJobDelivery } from "../job-delivery.js";
 import {
@@ -58,30 +63,33 @@ interface InngestSendContext {
   payloads?: Array<{ name?: string; data?: unknown }>;
 }
 
-let warnedUnsupported = false;
+interface InngestV4FunctionInput {
+  ctx?: { event?: unknown; events?: unknown } & Record<string, unknown>;
+  steps?: Record<string, { type?: string; data?: unknown } | undefined>;
+}
+
+// True inside a v4 run the middleware wraps.
+const insideV4Run = createScopedStorage<boolean>(Symbol.for("ezlogs-nextjs:inngest-v4-run"));
+
+interface InngestV4RequestBody {
+  event?: { name?: string; data?: unknown };
+  ctx?: { run_id?: string; attempt?: number } | null;
+}
 
 /**
- * Returns an Inngest v3 middleware. Pass it via:
+ * Returns an Inngest middleware for v3 and v4. Pass it via:
  *   new Inngest({ middleware: [ezlogsInngestMiddleware()] })
  *
  * Returned `unknown` because Inngest's `Middleware` type is parameterized
  * over the client and we don't want to take a hard type dep.
  *
- * Inngest v4 has a different middleware API (a class it calls `new`
- * on) that this adapter doesn't support. There the middleware does
- * nothing and warns once, instead of crashing `inngest.send`.
+ * v3 reads `name` and calls `init()`. v4 calls `new` on it (one
+ * instance per request or send), which returns the v4 hooks.
  */
 export function ezlogsInngestMiddleware(): unknown {
   const middleware = function ezlogsInngestV4() {
-    if (!warnedUnsupported) {
-      warnedUnsupported = true;
-      logger.warn(
-        "ezlogsInngestMiddleware supports Inngest v3 only; on this Inngest version it does nothing (jobs are not captured)",
-      );
-    }
-    return {};
+    return inngestV4Hooks();
   };
-  // v3 reads `name` and calls `init()`.
   Object.defineProperty(middleware, "name", { value: "ezlogs-nextjs" });
   return Object.assign(middleware, {
     init() {
@@ -153,37 +161,8 @@ export function ezlogsInngestMiddleware(): unknown {
             // payloads it returns. Stamped copies: the caller's event
             // objects are never written (one reused across requests
             // would carry the first request's id and actor).
-            transformInput(
-              args: InngestSendContext,
-            ): Promise<InngestSendContext> | InngestSendContext | void {
-              try {
-                const id = currentCorrelation();
-                if (!id) return;
-                if (!Array.isArray(args.payloads)) return;
-                const stamped: Array<Record<string, unknown>> = [];
-                const payloads = args.payloads.map((payload) => {
-                  if (!payload || typeof payload !== "object") return payload;
-                  const data = payload.data ?? {};
-                  if (typeof data !== "object" || data === null || Array.isArray(data)) {
-                    return payload;
-                  }
-                  if (typeof (data as Record<string, unknown>).ezlogs_correlation_id === "string") {
-                    return payload;
-                  }
-                  const copy: Record<string, unknown> = { ...data, ezlogs_correlation_id: id };
-                  if (!(ACTOR_PAYLOAD_KEY in copy)) stamped.push(copy);
-                  return { ...payload, data: copy };
-                });
-                const pending = stamped.length > 0 ? signedActorToken(id) : null;
-                if (!pending) return { payloads };
-                // The sender's human actor, verified by runInsideInngestCorrelation.
-                return pending.then((token) => {
-                  if (token) for (const data of stamped) data[ACTOR_PAYLOAD_KEY] = token;
-                  return { payloads };
-                });
-              } catch (error) {
-                logger.debug(`inngest send-stamp failed: ${describeError(error)}`);
-              }
+            transformInput(args: InngestSendContext) {
+              return stampSendEvents(args.payloads, (payloads) => ({ payloads }));
             },
           };
         },
@@ -192,12 +171,178 @@ export function ezlogsInngestMiddleware(): unknown {
   });
 }
 
+// Inngest v4 hooks, one object per request (or send). `wrapRequest`
+// wraps the whole serve-route POST for one function run: the function
+// body and the steps it runs execute inside the event's correlation
+// scope, then one job event is emitted for the request.
+function inngestV4Hooks() {
+  let runError: unknown = null;
+  let ranStep: string | null = null;
+  // Set once the run starts executing, which Inngest does only after the
+  // request's signature checked out: an unsigned POST emits nothing.
+  let executed = false;
+  return {
+    id: "ezlogs-nextjs",
+    // Before the function sees (and Inngest validates) its events: our keys
+    // are removed, so a trigger or `waitForEvent` with a strict schema
+    // still accepts them. The scope was opened from the request body.
+    transformFunctionInput(arg: InngestV4FunctionInput) {
+      executed = true;
+      try {
+        return withoutCarriedKeysInInput(arg);
+      } catch (error) {
+        logger.debug(`inngest input strip failed: ${describeError(error)}`);
+        return arg;
+      }
+    },
+    // Called for `inngest.send` and `step.sendEvent`; returns the arg with stamped copies.
+    transformSendEvent(args: { events?: unknown }) {
+      return stampSendEvents(args?.events, (events) => ({ ...args, events })) ?? args;
+    },
+    // Only for steps that run in this request (`step.run`, `step.sendEvent`), not memoized ones.
+    onStepStart(args: { stepInfo?: { options?: { id?: unknown; name?: unknown } } }) {
+      const options = args?.stepInfo?.options;
+      const name = options?.name ?? options?.id;
+      ranStep = typeof name === "string" && name ? name : null;
+    },
+    onStepError(args: { error?: unknown }) {
+      runError = args?.error ?? runError;
+    },
+    onRunError(args: { error?: unknown }) {
+      runError = args?.error ?? runError;
+    },
+    async wrapRequest(args: {
+      fn?: InngestRunContext["fn"];
+      next: () => Promise<unknown>;
+      requestInfo?: { body?: () => Promise<unknown> };
+      runId?: string;
+    }): Promise<unknown> {
+      let nextCalled = false;
+      const next = () => {
+        nextCalled = true;
+        return args.next();
+      };
+      try {
+        // No function: not a run (Inngest only calls this hook on POSTs).
+        const body = args.fn ? ((await args.requestInfo?.body?.()) as InngestV4RequestBody | null) : null;
+        if (!body || typeof body !== "object") return await next();
+        const fnId = functionId(args.fn) ?? "inngest-function";
+        const event = body.event;
+        const attempt = typeof body.ctx?.attempt === "number" ? body.ctx.attempt : 0;
+        const runId = args.runId || body.ctx?.run_id || null;
+        return await runInsideInngestCorrelation(event, () => insideV4Run.run(true, async () => {
+          const startedAt = new Date();
+          try {
+            return await next();
+          } catch (error) {
+            runError = error;
+            throw error;
+          } finally {
+            if (executed) {
+              // The request (Inngest calling the serve route) delivers this run: its job event stands for it.
+              markJobDelivery();
+              emitJobEvent({
+              jobClass: fnId,
+              jobId: runId,
+              queue: event?.name ?? null,
+              step: ranStep,
+              retryCount: attempt,
+              outcome: runError ? "failure" : "success",
+              errorMessage: runError ? formatError(runError) : null,
+              durationMs: Date.now() - startedAt.getTime(),
+              startedAt,
+              payload: event?.data,
+              });
+            }
+          }
+        }));
+      } catch (error) {
+        if (nextCalled) throw error;
+        logger.debug(`inngest capture failed: ${describeError(error)}`);
+        return args.next();
+      }
+    },
+  };
+}
+
+// The function input with our keys removed from its events and from
+// memoized `waitForEvent` results; the same object when none carry them.
+function withoutCarriedKeysInInput(arg: InngestV4FunctionInput): InngestV4FunctionInput {
+  const ctx = arg?.ctx;
+  if (!ctx) return arg;
+  let changed = false;
+  const strip = <T>(value: T): T => {
+    const out = withoutCarriedKeys(value);
+    if (out !== value) changed = true;
+    return out;
+  };
+  const event = strip(ctx.event);
+  const events = Array.isArray(ctx.events) ? ctx.events.map(strip) : ctx.events;
+  const steps: InngestV4FunctionInput["steps"] = {};
+  for (const [id, step] of Object.entries(arg.steps ?? {})) {
+    steps[id] = step?.type === "data" ? { ...step, data: strip(step.data) } : step;
+  }
+  return changed ? { ...arg, ctx: { ...ctx, event, events }, steps } : arg;
+}
+
+function withoutCarriedKeys<T>(event: T): T {
+  const data = (event as { data?: unknown } | null)?.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return event;
+  if (!(CORRELATION_PAYLOAD_KEY in data) && !(ACTOR_PAYLOAD_KEY in data)) return event;
+  const rest: Record<string, unknown> = { ...(data as Record<string, unknown>) };
+  delete rest[CORRELATION_PAYLOAD_KEY];
+  delete rest[ACTOR_PAYLOAD_KEY];
+  return { ...event, data: rest };
+}
+
+/**
+ * Outgoing events with the current correlation id (and the sender's
+ * signed actor) stamped on `data`, passed to `wrap`. Stamped copies:
+ * the caller's event objects are never written (one reused across
+ * requests would carry the first request's id and actor). Undefined
+ * when there is nothing to stamp. Never throws.
+ */
+function stampSendEvents<R>(events: unknown, wrap: (events: unknown[]) => R): R | Promise<R> | undefined {
+  try {
+    const id = currentCorrelation();
+    if (!id) return;
+    if (!Array.isArray(events)) return;
+    const stamped: Array<Record<string, unknown>> = [];
+    const payloads = events.map((payload: { data?: unknown; validate?: unknown } | null) => {
+      if (!payload || typeof payload !== "object") return payload;
+      // An `eventType().create()` event keeps its `validate()` through the
+      // spread: it checks the caller's original data (a closure), not this
+      // stamped copy, so a strict schema still passes.
+      const data = payload.data ?? {};
+      if (typeof data !== "object" || data === null || Array.isArray(data)) {
+        return payload;
+      }
+      if (typeof (data as Record<string, unknown>).ezlogs_correlation_id === "string") {
+        return payload;
+      }
+      const copy: Record<string, unknown> = { ...data, ezlogs_correlation_id: id };
+      if (!(ACTOR_PAYLOAD_KEY in copy)) stamped.push(copy);
+      return { ...payload, data: copy };
+    });
+    const pending = stamped.length > 0 ? signedActorToken(id) : null;
+    if (!pending) return wrap(payloads);
+    // The sender's human actor, verified by runInsideInngestCorrelation.
+    return pending.then((token) => {
+      if (token) for (const data of stamped) data[ACTOR_PAYLOAD_KEY] = token;
+      return wrap(payloads);
+    });
+  } catch (error) {
+    logger.debug(`inngest send-stamp failed: ${describeError(error)}`);
+  }
+}
+
 /**
  * Run an Inngest function body (or a step) inside the run's
  * correlation scope, so its DB writes are tagged and emitted under the
- * action that sent the event. Inngest middleware can't wrap the body
+ * action that sent the event. Inngest v3 middleware can't wrap the body
  * itself, so without this the job event is captured but the body's DB
- * writes ship as their own actions:
+ * writes ship as their own actions. Not needed on v4 (the middleware
+ * wraps the run), where it is harmless:
  *
  *   inngest.createFunction({ id: "send-invoice" }, { event: "invoice/created" },
  *     ({ event, step }) => runInsideInngestCorrelation(event, async () => { ... }))
@@ -206,6 +351,9 @@ export async function runInsideInngestCorrelation<T>(
   event: { data?: unknown } | undefined,
   callback: () => Promise<T>,
 ): Promise<T> {
+  // v4: the middleware already runs this in the event's scope (and the
+  // function's event no longer carries the id).
+  if (insideV4Run.read()) return callback();
   const carried = extractCorrelationFromPayload(event?.data);
   const id = carried ?? generateCorrelation();
   // The sending request's human actor, when its signed token verifies.

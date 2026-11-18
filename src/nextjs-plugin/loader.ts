@@ -1069,24 +1069,30 @@ interface RenameResult {
 function renameExport(source: string, name: string): RenameResult {
   // Word-boundary anchored — we don't want `GET` matching inside
   // `GETTER` or some other identifier.
+  // The name ends where no identifier character follows (`\\b` also stops before `$` or `é`: `GET$`).
+  const end = "(?![\\p{L}\\p{N}_$\\u200C\\u200D])";
   const patterns: Array<RegExp> = [
-    // `export async function NAME(`
-    new RegExp(`(^|\\s)export\\s+async\\s+function\\s+${name}\\b`, "m"),
+    // `export async function NAME(` / `export async function* NAME(`
+    new RegExp(`(^|\\s)export\\s+async\\s+function\\s*\\*?\\s*${name}${end}`, "mu"),
     // `export function NAME(`
-    new RegExp(`(^|\\s)export\\s+function\\s+${name}\\b`, "m"),
+    new RegExp(`(^|\\s)export\\s+function\\s*\\*?\\s*${name}${end}`, "mu"),
     // `export const NAME =` / `export let NAME =` / `export var NAME =`
-    new RegExp(`(^|\\s)export\\s+(const|let|var)\\s+${name}\\b`, "m"),
+    new RegExp(`(^|\\s)export\\s+(const|let|var)\\s+${name}${end}`, "mu"),
   ];
 
   for (const pattern of patterns) {
     const match = source.match(pattern);
+    // `export const GET = a, POST = b`: dropping `export` would unexport POST too. Leave the file as is.
+    if (match && pattern === patterns[2] && declaresMoreThanOne(source, match.index! + match[0].length)) {
+      return { source, changed: false };
+    }
     if (match) {
       const replaced = source.replace(pattern, (full, lead) => {
         // Strip the leading `export` keyword and rename the identifier.
         // Preserves leading whitespace so source positions are stable.
         const rest = full
           .replace(/^\s*export\s+/, "")
-          .replace(new RegExp(`\\b${name}\\b`), `${ALREADY_WRAPPED_MARKER}${name}`);
+          .replace(new RegExp(`(?<![\\p{L}\\p{N}_$])${name}${end}`, "u"), `${ALREADY_WRAPPED_MARKER}${name}`);
         return `${lead}${rest}`;
       });
       return { source: replaced, changed: true };
@@ -1094,6 +1100,53 @@ function renameExport(source: string, name: string): RenameResult {
   }
 
   return { source, changed: false };
+}
+
+/**
+ * True when the `const|let|var` declaration starting at `from` has a
+ * second declarator (`= a, POST = b`): a comma outside any bracket,
+ * string or comment, followed by `NAME =` or `NAME:`, before the
+ * statement ends. The statement ends at a
+ * top-level `;` or at a line break followed by another top-level
+ * statement keyword. Errs toward true (the caller then leaves the file
+ * untouched: not captured, never broken).
+ */
+const TT_JSX_TEXT = 56320; // sucrase TokenType.jsxText
+
+/**
+ * True when the `const|let|var` declaration whose name ends at `from`
+ * may declare a second name (`= a, POST = b`, `= a, { POST } = b`,
+ * `= x, y`): a comma outside every bracket, read from the file's tokens
+ * (strings, regex literals, comments, JSX text and type-only syntax
+ * such as `Handler<A, B>` never count), before the next top-level `;`.
+ * Without semicolons that scan runs on to the end of the file, so a
+ * later top-level `const a = 1, b = 2` also answers true. True also when
+ * the file can't be tokenized. The caller then leaves the file untouched:
+ * not captured, never an export lost.
+ */
+function declaresMoreThanOne(source: string, from: number): boolean {
+  const sucraseParse = getSucraseParse();
+  if (sucraseParse === null) return true;
+  let tokens: SucraseToken[];
+  try {
+    tokens = sucraseParse(source, false, true, false).tokens;
+  } catch {
+    try {
+      tokens = sucraseParse(source, true, true, false).tokens;
+    } catch {
+      return true;
+    }
+  }
+  let depth = 0;
+  for (const t of tokens) {
+    if (t.start < from || t.isType || t.type === TT_JSX_TEXT) continue;
+    const text = source.slice(t.start, t.end);
+    if (text === "(" || text === "[" || text === "{" || text === "${") depth++;
+    else if (text === ")" || text === "]" || text === "}") depth--;
+    else if (depth === 0 && text === ",") return true;
+    else if (depth === 0 && text === ";") return false;
+  }
+  return false;
 }
 
 /**

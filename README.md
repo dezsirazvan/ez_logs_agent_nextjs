@@ -53,6 +53,10 @@ npm install ezlogs-nextjs
 # or: pnpm add ezlogs-nextjs / bun add ezlogs-nextjs
 ```
 
+On a Next.js canary or release candidate, npm stops with `ERESOLVE`
+(npm never counts a pre-release as matching the `next >=14` peer range).
+Add `--legacy-peer-deps` to that install; pnpm and bun only warn.
+
 ### 2. Add `instrumentation.ts`
 
 Starts the agent when your server boots. Put it at the project root
@@ -85,6 +89,21 @@ Auth there is nothing to add. Otherwise add one line to `ezlogs.init`:
 
 ```ts
 import { authJsActor } from "ezlogs-nextjs/actors"; // or nextAuthActor / clerkActor
+```
+
+Import your own `auth` / `authOptions` inside the `nodejs` branch, with
+`await import`: `instrumentation.ts` is also built for the Edge runtime,
+and an auth module that loads your database client (Prisma, `pg`) breaks
+that build when imported at the top of the file.
+
+```ts
+if (process.env.NEXT_RUNTIME === "nodejs") {
+  const { auth } = await import("@/auth"); // or: const { authOptions } = await import("@/lib/auth");
+  ezlogs.init({
+    projectToken: process.env.EZLOGS_PROJECT_TOKEN!,
+    actorFromRequest: authJsActor({ auth }),
+  });
+}
 ```
 
 ### 3. Wrap your Next config
@@ -340,7 +359,7 @@ made:
 | Upstash Workflow | `serve`, `servePagesRouter`, `createWorkflow`, `serveMany` from `@upstash/workflow/nextjs`; `Client` from `@upstash/workflow` |
 | QStash | `Client` from `@upstash/qstash` |
 | BullMQ | `Queue`, `Worker` from `bullmq` |
-| Inngest (v3) | `Inngest` from `inngest` (gets `ezlogsInngestMiddleware()`); wrap a function body in `runInsideInngestCorrelation` to link its writes |
+| Inngest (v3, v4) | `Inngest` from `inngest` (gets `ezlogsInngestMiddleware()`); on v3, wrap a function body in `runInsideInngestCorrelation` to link its writes |
 
 A workflow step or QStash delivery is one job event: the agent does not
 also record the POST that delivered it.
@@ -388,8 +407,9 @@ ezlogs.init({
 });
 ```
 
-The key is the table name for trigger-captured changes (`users`) and
-the model name for the per-ORM adapters (`User`). Without it, the
+The key is the database table name (`users`) and the row has the
+database column names; only the Prisma adapter used without triggers
+keys by the model name (`User`). Without it, the
 record shows by its id.
 
 ---

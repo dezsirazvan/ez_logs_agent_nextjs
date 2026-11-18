@@ -148,6 +148,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
       const correlationId = resolveCorrelation((request as Request).headers ?? null);
       // Marked by a job capture when this request only delivers a job.
       const delivery: DeliverySlot = { jobDelivery: false };
+      const inngestServerKind = (request as Request).headers?.get?.(INNGEST_SERVER_KIND) ?? null;
 
       return await runWithCorrelation(correlationId, () =>
         runWithDeliverySlot(delivery, () => runWithActorAndAuditScope(async () => {
@@ -171,6 +172,9 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             // Supabase client constructed during the handler is
             // registered, and its auth cookies have been read.
             await maybeExtractSupabaseActor();
+            if (isJobRunnerSync(snapshot.method, inngestServerKind, response?.headers?.get?.(INNGEST_SDK) ?? null)) {
+              delivery.jobDelivery = true;
+            }
 
             await emitEvent({
               snapshot,
@@ -580,6 +584,7 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
       });
 
       const delivery: DeliverySlot = { jobDelivery: false };
+      const inngestServerKind = readPagesHeader(req, INNGEST_SERVER_KIND);
 
       return await runWithCorrelation(correlationId, () =>
         runWithDeliverySlot(delivery, () => runWithActorAndAuditScope(async () => {
@@ -599,6 +604,10 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
 
             const status = typeof res.statusCode === "number" ? res.statusCode : null;
             const getHeader = res.getHeader as ((name: string) => unknown) | undefined;
+            const sdkHeader = typeof getHeader === "function" ? getHeader.call(res, INNGEST_SDK) : null;
+            if (isJobRunnerSync(snapshot.method, inngestServerKind, sdkHeader ? String(sdkHeader) : null)) {
+              delivery.jobDelivery = true;
+            }
             await emitEvent({
               snapshot,
               context,
@@ -1974,6 +1983,19 @@ function readPagesHeader(req: PagesApiReq, name: string): string | null {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value[0] ?? null;
   return null;
+}
+
+// Inngest calls its serve route with this header: GET to inspect it, PUT to sync the
+// app's functions (the dev server every few seconds), POST to run one. A run is a job
+// delivery its middleware marks; a sync or inspection is the runner's plumbing, never a
+// person's action. The serve handler answers with x-inngest-sdk, which a caller can't
+// set, so only a real serve route skips its HTTP event. Its DB rows, if any, still flush.
+const INNGEST_SERVER_KIND = "x-inngest-server-kind";
+const INNGEST_SDK = "x-inngest-sdk";
+
+function isJobRunnerSync(method: string | undefined, inngestServerKind: string | null, sdkResponseHeader: string | null): boolean {
+  const m = (method ?? "").toUpperCase();
+  return inngestServerKind !== null && sdkResponseHeader !== null && (m === "GET" || m === "PUT");
 }
 
 interface EmitInput {

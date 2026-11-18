@@ -3,6 +3,39 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.7] — 2026-11-18
+
+### Added
+- **Inngest v4.** `ezlogsInngestMiddleware()` (added automatically by
+  the Next config wrapper) now works on Inngest v4 as on v3: each run
+  request is one job event, the serve route's POST is no longer an HTTP
+  card, `inngest.send` / `step.sendEvent` carry the correlation id and
+  signed actor, and the function body and its steps run inside the
+  event's correlation, so their DB writes join the action that sent
+  the event without `runInsideInngestCorrelation` (still harmless).
+  The correlation keys are removed from the event before the function
+  sees it, so a strict event schema never rejects a run. A run request is
+  recorded only after Inngest accepted its signature.
+
+### Fixed
+- **Actions across services.** An incoming request also adopts `x-correlation-id` (what this agent and the Rails agent stamp on outgoing calls), in the agents' own format and recent only. A Next.js or Rails app calling this one now joins its action.
+- **A route file with `export const GET = a, POST = b`** no longer loses
+  its other exports at build time (the app answered 405 for them). The
+  build loader now leaves a statement that declares several exports
+  untouched.
+- **Inngest's own calls to the serve route** (the function sync `PUT`
+  the dev server repeats every few seconds, the `GET` inspection) no
+  longer show as actions. Skipped only for a GET or PUT that carries
+  `x-inngest-server-kind` and that the Inngest serve handler answered
+  (`x-inngest-sdk` response header, which a caller can't set); its DB
+  writes, if any, are still recorded.
+
+### Docs
+- Import your `auth` / `authOptions` with `await import` inside the
+  `nodejs` branch of `instrumentation.ts`: a top-level import of an auth
+  module that loads the database client broke the Edge build.
+- npm on a Next.js canary / rc needs `--legacy-peer-deps`.
+
 ## [0.4.6] — 2026-11-18
 
 ### Added

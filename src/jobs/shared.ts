@@ -64,7 +64,7 @@ export interface JobSourceData {
   job_id?: string | null;
   /** Queue name. Some runners (Inngest) have no queue concept — pass null. */
   queue?: string | null;
-  /** 0-indexed retry count. Sidekiq's "retry_count": 0, 1, 2, ... */
+  /** Earlier failed attempts: 0 on a first run, 1 on the first retry (the Ruby agent sends Sidekiq's retry_count + 1). */
   retry_count?: number | null;
   /**
    * The step of a multi-step job this run executed (an Upstash Workflow

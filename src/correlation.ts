@@ -34,6 +34,7 @@ import { runWithActorScope } from "./actor.js";
  * The canonical declaration lives in `http/capture.ts`.
  */
 const CORRELATION_HEADER = "x-ezlogs-correlation-id";
+const CROSS_SERVICE_HEADER = "x-correlation-id";
 
 /**
  * Platform-injected request-id headers, in priority order.
@@ -122,7 +123,8 @@ export interface HeadersLike {
  * Resolve a correlation id for the current request, in priority:
  *
  *   1. `x-ezlogs-correlation-id` (set by an upstream ezlogs middleware
- *      or hop). Used verbatim.
+ *      or hop), then `x-correlation-id` (another service's agent stamps it
+ *      on outgoing calls). Each only in the agents' own format and recent.
  *   2. A platform-injected request id (`x-vercel-id`, `cf-ray`,
  *      `x-request-id`) wrapped to the agent's wire format. Same
  *      input -> same output, so multiple cold-started entry points
@@ -139,6 +141,9 @@ export function resolveCorrelation(headers: HeadersLike | null | undefined): str
 
   const ezlogs = safeRead(headers, CORRELATION_HEADER);
   if (ezlogs && isTrustedInboundId(ezlogs)) return ezlogs;
+  // Another service's call: both agents stamp `x-correlation-id` on outgoing HTTP.
+  const crossService = safeRead(headers, CROSS_SERVICE_HEADER);
+  if (crossService && isTrustedInboundId(crossService)) return crossService;
 
   for (const name of PLATFORM_REQUEST_ID_HEADERS) {
     const platformId = safeRead(headers, name);

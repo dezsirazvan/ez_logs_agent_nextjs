@@ -8,7 +8,7 @@ request params: `password`, `token`, … become `"[FILTERED]"`).
 DB writes made by the job body run inside the job's correlation, so
 with the trigger path they appear in the same action as the request
 that enqueued the job (BullMQ, Trigger.dev, Supabase Queues, Upstash
-Workflow; Inngest via `runInsideInngestCorrelation`).
+Workflow, Inngest v4; Inngest v3 via `runInsideInngestCorrelation`).
 
 | Runner | Import |
 |---|---|
@@ -64,8 +64,11 @@ only when the signature verifies (so the worker needs the same
 
 ## Inngest
 
-Inngest v3. On Inngest v4 the middleware does nothing (its middleware
-API changed) and logs one warning; Inngest jobs aren't captured there.
+Inngest v3 and v4 (the middleware detects which API Inngest uses).
+Each request Inngest makes to the serve route for a function run is
+one job event (`job_class` = function id, `job_id` = run id, `queue` =
+event name, `retry_count` = attempt, `step` = the step it ran), and no
+HTTP event for that POST.
 
 ```ts
 import { Inngest } from "inngest";
@@ -77,8 +80,10 @@ export const inngest = new Inngest({
 });
 ```
 
-Inngest middleware can't wrap the function body, so to link the body's
-DB writes to the action that sent the event, wrap it:
+On v4 the middleware runs the function and its steps inside the
+event's correlation, so their DB writes join the action that sent the
+event. Inngest v3 middleware can't wrap the function body, so on v3
+wrap it (harmless on v4):
 
 ```ts
 import { runInsideInngestCorrelation } from "ezlogs-nextjs/inngest";
