@@ -21,6 +21,16 @@ Workflow; Inngest via `runInsideInngestCorrelation`).
 All adapters lazy-import their host package; apps that don't use a
 given runner pay zero at runtime.
 
+**Automatic with the plugin (0.4.6).** With `withEzlogsConfig` (README
+step 3), Upstash Workflow (`serve`, `servePagesRouter`, `createWorkflow`,
+`serveMany`, `Client`), QStash (`Client`), BullMQ (`Queue`, `Worker`) and
+Inngest (`Inngest`, which gets `ezlogsInngestMiddleware()`) are
+instrumented where your server code imports them: the snippets below are
+then already in place. Use them for code Next doesn't build (a worker
+started with `node worker.js`), for `import * as` / `require()`, and for
+Trigger.dev and Supabase Queues. Calling a wrapper on something the
+plugin already instrumented is a no-op: each job is recorded once.
+
 ## BullMQ
 
 ```ts
@@ -152,6 +162,16 @@ export const { POST } = serve(async (context) => {
   );
 });
 ```
+
+With the plugin, the route needs none of this: `serve` captures every
+step (named by the route's path) and `new WorkflowClient(...)` /
+`new QStashClient(...)` are the wrapped clients. A step delivery is one
+job event; the POST that carried it (including QStash callbacks that run
+no step) sends no HTTP event of its own. Only requests QStash signed
+count as deliveries: a workflow started by calling its route directly
+keeps that request's HTTP event. Inside an instrumented `serve`, a
+manual `captureWorkflowRequest` adds nothing (the step is already
+captured, under its route's path); drop it.
 
 The wrapped clients send the current correlation id with the run, so
 each step's job event and DB writes join the action of the request

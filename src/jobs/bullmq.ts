@@ -21,6 +21,7 @@
 // Both wrappers are idempotent.
 
 import { logger } from "../logger.js";
+import { instrumentClass, instrumentFrom } from "../instrument.js";
 import { current as currentCorrelation } from "../correlation.js";
 import type { ActorContext } from "../actor.js";
 import {
@@ -90,6 +91,7 @@ interface BullJobLike {
   id?: string | number | null;
   name?: string;
   data?: unknown;
+  updateData?: (data: unknown, ...rest: unknown[]) => Promise<unknown>;
   attemptsMade?: number;
   queueName?: string;
   timestamp?: number;
@@ -196,6 +198,8 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
       const job = (args[0] ?? {}) as BullJobLike;
       if (typeof args[0] === "object" && args[0] !== null) reported.add(args[0]);
       const correlationId = extractCorrelationFromPayload(job.data);
+      const token = (job.data as Record<string, unknown> | null | undefined)?.[ACTOR_PAYLOAD_KEY];
+      if (typeof args[0] === "object" && args[0] !== null) hideAgentKeys(job);
       const run = (actor: ActorContext | null) =>
         runJobWithCapture(
           {
@@ -212,7 +216,6 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
           },
           () => Promise.resolve(original.apply(this, args)),
         );
-      const token = (job.data as Record<string, unknown> | null | undefined)?.[ACTOR_PAYLOAD_KEY];
       if (!correlationId || token === undefined) return run(null);
       return readActorToken(token, correlationId).then(run);
     };
@@ -314,6 +317,34 @@ function isOurs(data: unknown): boolean {
   return Boolean(id) && obj[CORRELATION_PAYLOAD_KEY] === id && !(ACTOR_PAYLOAD_KEY in obj);
 }
 
+const AGENT_KEYS = [CORRELATION_PAYLOAD_KEY, ACTOR_PAYLOAD_KEY];
+
+// The processor sees the data the app enqueued (a strict schema on it must
+// not trip over the agent's keys); data it saves back (job.updateData, a
+// step job's `{ ...job.data, step }`) gets them again, so later runs keep
+// their action. Fails open: the job as it was.
+function hideAgentKeys(job: BullJobLike): void {
+  try {
+    const data = job.data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return;
+    const carried = Object.fromEntries(AGENT_KEYS.filter((k) => k in data).map((k) => [k, (data as Record<string, unknown>)[k]]));
+    if (Object.keys(carried).length === 0) return;
+    const rest = { ...(data as Record<string, unknown>) };
+    for (const k of AGENT_KEYS) delete rest[k];
+    job.data = rest;
+    const save = job.updateData;
+    if (typeof save !== "function") return;
+    job.updateData = async function ezlogsUpdateData(this: unknown, next: unknown, ...more: unknown[]) {
+      const stamped = next !== null && typeof next === "object" && !Array.isArray(next) ? { ...carried, ...(next as object) } : next;
+      const result = await save.call(job, stamped, ...more);
+      job.data = next;
+      return result;
+    };
+  } catch {
+    // keep the job as it was
+  }
+}
+
 // Copies, like stampPayload: the caller's object never gets the token.
 function withActor(data: unknown, token: string | null): unknown {
   return token ? { ...(data as Record<string, unknown>), [ACTOR_PAYLOAD_KEY]: token } : data;
@@ -330,3 +361,13 @@ function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
 }
+
+/**
+ * Replacements for the plugin's instrumented imports (instrument.ts):
+ * every Queue and Worker the app's server code constructs is wrapped.
+ * Internal: called by build-time generated code, not by apps.
+ */
+export const __ezlogsInstrument = instrumentFrom({
+  "bullmq#Queue": (original) => instrumentClass(original, (queue) => wrapBullQueue(queue as BullQueueLike)),
+  "bullmq#Worker": (original) => instrumentClass(original, (worker) => wrapBullWorker(worker as BullWorkerLike)),
+});

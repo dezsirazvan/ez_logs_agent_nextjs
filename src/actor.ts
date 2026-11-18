@@ -51,11 +51,11 @@ export function setActor(input: unknown): ActorContext | null {
   return sanitized;
 }
 
-// Per-scope Supabase actor source: the client constructed in this
-// request, and whether it was already asked (no user). Mutable object,
-// one per runWithActorScope.
+// Per-scope Supabase actor source: the clients constructed in this
+// request, in order, and whether they were already asked (no user).
+// Mutable object, one per runWithActorScope.
 interface ActorSourceSlot {
-  client?: unknown;
+  clients?: unknown[];
   tried?: boolean;
 }
 const sourceStorage = createScopedStorage<ActorSourceSlot>(

@@ -112,7 +112,31 @@ at build time. Both Webpack and Turbopack are supported.
 | `proxy.{ts,tsx,js,jsx}` (root + `src/` only) | `proxy` | Next 16's `proxy.ts` (`export function proxy` or a default export), same as middleware |
 | `actions/**/*`, `app/**/actions.{ts,tsx}`, `app/**/actions/**/*` | `server-action` | File-level `"use server"` modules |
 | `app/**/{page,layout,template,loading,error,default,not-found}.{ts,tsx,js,jsx}` | `inline-server-action` | Inline `"use server"` actions inside RSC components |
-| `lib/supabase/**`, `utils/supabase/**` (+ `src/` variants) | `supabase-factory` | Rewrites Supabase factory imports to auto-instrument every client |
+| Any other server file that imports an instrumented library | `instrumented-imports` | Library imports (below) |
+
+Every server file the plugin reaches (all of the above, and any other
+file that imports one of these libraries) gets its named imports of
+them instrumented. `import { X } from "lib"` (aliases included) becomes
+the original import plus `const X = <the agent's replacement>(original)`
+on the same line:
+
+| Module | Names |
+|---|---|
+| `@upstash/workflow/nextjs` | `serve`, `servePagesRouter`, `createWorkflow`, `createWorkflowPagesRouter`, `serveMany`, `serveManyPagesRouter` |
+| `@upstash/workflow` | `serve`, `Client` |
+| `@upstash/qstash` | `Client` |
+| `bullmq` | `Queue`, `Worker` |
+| `inngest` | `Inngest` |
+| `@supabase/supabase-js` | `createClient` |
+| `@supabase/ssr` | `createServerClient` |
+
+Type-only imports (and names a file uses only as types), text in
+comments and strings, client components (`"use client"`), the root
+`middleware` / `proxy` file, `node_modules`, `import * as` and
+`require()` are left alone. Each
+replacement keeps the original's behavior (a class stays a class:
+`new`, `instanceof`, statics and subclasses work) and falls back to the
+original on anything unexpected.
 
 Files outside these conventional locations that use `"use server"`
 won't be auto-wrapped. Wrap manually with `captureServerAction(fn, "name")`

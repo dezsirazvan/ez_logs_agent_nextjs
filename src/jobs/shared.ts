@@ -133,7 +133,8 @@ export async function runJobWithCapture<T>(
   meta: {
     jobClass: string;
     jobId?: string | null;
-    queue?: string | null;
+    /** The queue, or a function read when the job ends (a workflow step known only once it ran). */
+    queue?: string | null | (() => string | null);
     retryCount?: number | null;
     correlationId: string | null;
     /**
@@ -165,10 +166,13 @@ export async function runJobWithCapture<T>(
   const body = async (): Promise<T> => {
     const startedAt = new Date();
     const startMs = startedAt.getTime();
+    const queue = meta.queue;
     const baseMeta = {
       jobClass: meta.jobClass,
       jobId: meta.jobId ?? null,
-      queue: meta.queue ?? null,
+      get queue() {
+        return (typeof queue === "function" ? queue() : queue) ?? null;
+      },
       retryCount: meta.retryCount ?? null,
       correlationId,
       startedAt,

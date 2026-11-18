@@ -11,23 +11,19 @@
 // and every Pages Router API route (pages/api/**/*.{ts,js,tsx,jsx})
 // at build time. No per-route opt-in.
 //
-// Database adapters (Supabase / Prisma / Drizzle) are NOT auto-wrapped.
-// Wrap your client factory once per file:
-//
-//   import { wrapSupabase } from "ezlogs-nextjs/supabase"
-//   const client = wrapSupabase(createServerClient(...))
-//
-// Why no auto-alias for Supabase: build-time aliasing of @supabase/ssr
-// fights Turbopack's resolve graph (recursion / browser-bundling /
-// CJS-interop in different Next.js versions). The two-line manual
-// wrap is the same pattern Sentry, Datadog, Highlight all use, and
-// it works without bundler magic.
+// Job and database clients (Upstash Workflow / QStash, BullMQ, Inngest,
+// Supabase) are instrumented where the app's server code imports them:
+// the loader rewrites those named imports (INSTRUMENTED_IMPORTS) in any
+// server file, so no wrapper is needed in app code. Not a resolve
+// alias: aliasing a package fights Turbopack's resolve graph
+// (recursion / browser-bundling / CJS interop across Next versions).
 
 import { resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import { INSTRUMENTED_IMPORT_CONTENT } from "./instrumented-imports.js";
 
 interface NextConfig {
   webpack?: (
@@ -197,7 +193,7 @@ function mergeTurbopackConfig(
       loaders: [
         {
           loader: loaderPath,
-          options: { kind: "middleware" },
+          options: { kind: "middleware", projectDir },
         },
       ],
       as: `*.${ext}`,
@@ -207,7 +203,7 @@ function mergeTurbopackConfig(
       loaders: [
         {
           loader: loaderPath,
-          options: { kind: "middleware" },
+          options: { kind: "middleware", projectDir },
         },
       ],
       as: `*.${ext}`,
@@ -262,28 +258,6 @@ function mergeTurbopackConfig(
       };
     }
 
-    // Supabase factory files — `lib/supabase/*`, `utils/supabase/*`,
-    // and the same under `src/`. These are the conventional locations
-    // for `createClient` / `createServerClient` factory definitions in
-    // Next + Supabase apps (matches the Supabase docs template + Vercel
-    // starter templates). The loader rewrites factory imports so every
-    // returned client is wrapped with `wrapSupabase()`.
-    const supabaseGlobs = [
-      `**/{lib,src/lib,utils,src/utils}/supabase/**/*.${ext}`,
-    ];
-    for (const glob of supabaseGlobs) {
-      ezlogsRules[glob] = {
-        condition: { not: "browser" },
-        loaders: [
-          {
-            loader: loaderPath,
-            options: { kind: "supabase-factory" },
-          },
-        ],
-        as: `*.${ext}`,
-      };
-    }
-
     // Inline `"use server"` actions inside RSC route files. Scoping
     // to Next's closed set of route filenames (page/layout/template/
     // loading/error/default/not-found) keeps the glob narrow, AND a
@@ -314,6 +288,30 @@ function mergeTurbopackConfig(
         ],
       };
     }
+
+    // Any other server file that imports an instrumented library (a
+    // queue / workflow client, a serve() wrapper, a Supabase factory).
+    // The content condition keeps the rule off every other file (a
+    // loader chain on unrelated files triggers Turbopack's
+    // path-doubling bug, see above), and no `as`: the rewrite only adds
+    // plain JS. Files another rule above owns are excluded: those rules
+    // run the same import pass themselves.
+    ezlogsRules[`**/*.${ext}`] = {
+      condition: {
+        all: [
+          { not: "browser" },
+          { content: INSTRUMENTED_IMPORT_CONTENT },
+          { not: { path: /(^|[\\/])node_modules[\\/]/ } },
+          { not: { any: ownedByOtherRules(wrapProxy) } },
+        ],
+      },
+      loaders: [
+        {
+          loader: loaderPath,
+          options: { kind: "instrumented-imports" },
+        },
+      ],
+    };
   }
 
   return {
@@ -428,25 +426,6 @@ function installLoaders(
     ],
   });
 
-  // Supabase factory files — `lib/supabase/`, `utils/supabase/`, and
-  // their `src/` variants. The loader rewrites any imported factory
-  // from `@supabase/supabase-js` or `@supabase/ssr` so every
-  // constructed client is wrapped with `wrapSupabase()`.
-  const libSupabase = resolve(projectDir, "lib/supabase");
-  const srcLibSupabase = resolve(projectDir, "src/lib/supabase");
-  const utilsSupabase = resolve(projectDir, "utils/supabase");
-  const srcUtilsSupabase = resolve(projectDir, "src/utils/supabase");
-  newRules.push({
-    test: new RegExp(`\\.(${extPattern})$`),
-    include: [libSupabase, srcLibSupabase, utilsSupabase, srcUtilsSupabase],
-    use: [
-      {
-        loader: loaderPath,
-        options: { kind: "supabase-factory", projectDir },
-      },
-    ],
-  });
-
   // Inline `"use server"` actions inside RSC route files. Anchored on
   // Next's closed set of conventional filenames (page/layout/template/
   // loading/error/default/not-found) so the rule never fires on a
@@ -460,6 +439,21 @@ function installLoaders(
       {
         loader: loaderPath,
         options: { kind: "inline-server-action", projectDir },
+      },
+    ],
+  });
+
+  // Any other server file that imports an instrumented library. The
+  // loader returns other files unchanged at once (a substring check);
+  // a file another rule above also matches is rewritten once (the
+  // import pass is idempotent and the rule order doesn't matter).
+  newRules.push({
+    test: new RegExp(`\\.(${extPattern})$`),
+    exclude: /[\\/]node_modules[\\/]/,
+    use: [
+      {
+        loader: loaderPath,
+        options: { kind: "instrumented-imports", projectDir },
       },
     ],
   });
@@ -489,6 +483,29 @@ function nextMajorVersion(projectDir: string): number {
   } catch {
     return 0;
   }
+}
+
+// The files the Turbopack rules above give to another loader kind
+// (each of which runs the import pass too), as path conditions that
+// mirror those globs.
+function ownedByOtherRules(wrapProxy: boolean): TurbopackCondition[] {
+  const sep = "[\\\\/]";
+  const ext = "\\.(?:ts|tsx|js|jsx)$";
+  const owned: TurbopackCondition[] = [
+    { path: new RegExp(`(^|${sep})app${sep}(.*${sep})?route${ext}`) },
+    { path: new RegExp(`(^|${sep})pages${sep}api${sep}`) },
+    { path: new RegExp(`(^|${sep})middleware${ext}`) },
+    { path: new RegExp(`(^|${sep})actions${sep}`) },
+    { path: new RegExp(`(^|${sep})app${sep}(.*${sep})?actions${ext}`) },
+    {
+      all: [
+        { path: new RegExp(`(^|${sep})app${sep}(.*${sep})?(${INLINE_ROUTE_FILENAMES.join("|")})${ext}`) },
+        { content: /"use server"|'use server'/ },
+      ],
+    },
+  ];
+  if (wrapProxy) owned.push({ path: new RegExp(`(^|${sep})proxy${ext}`) });
+  return owned;
 }
 
 function escapeRegex(input: string): string {

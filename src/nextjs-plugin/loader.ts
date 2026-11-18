@@ -23,6 +23,7 @@
 // auto-instrumented; users wrap manually with captureRoute() if they
 // need it.
 
+import { INSTRUMENTED_IMPORTS } from "./instrumented-imports.js";
 import { relative, sep } from "node:path";
 
 // Sucrase's deep parser entry point has no published types and lives
@@ -164,6 +165,17 @@ function loaderImpl(this: PitchContext, source: string): string {
   const kind = (options.kind as string | undefined) ?? "app-route-handler";
   const routeModulePath = computeRouteModulePath(this.resourcePath, kind);
 
+  // Every server file gets its library imports instrumented, whichever
+  // rule matched it. Idempotent, so a file two rules match is rewritten
+  // once. The root middleware / proxy is the exception: Next runs it
+  // before every request (on the edge runtime for middleware), and it
+  // starts no jobs.
+  const root = (options.projectDir as string | undefined) ?? this.rootContext ?? process.cwd();
+  const rootEntry =
+    isRootEntryFile(this.resourcePath, root, "middleware") || isRootEntryFile(this.resourcePath, root, "proxy");
+  if (!rootEntry) source = rewriteInstrumentedImports(source, this.resourcePath);
+  if (kind === "instrumented-imports") return source;
+
   if (kind === "pages-api") {
     return rewritePagesApi(source, routeModulePath);
   }
@@ -171,21 +183,10 @@ function loaderImpl(this: PitchContext, source: string): string {
     return rewriteMiddleware(source);
   }
   if (kind === "proxy") {
-    const root =
-      (options.projectDir as string | undefined) ?? this.rootContext ?? process.cwd();
-    return isRootProxyFile(this.resourcePath, root) ? rewriteMiddleware(source, "proxy") : source;
+    return rootEntry ? rewriteMiddleware(source, "proxy") : source;
   }
   if (kind === "server-action") {
-    // The server-action loader also handles supabase factory wrapping
-    // because both transformations run on user source files. Order
-    // matters: we rewrite supabase imports FIRST so that any wrapped
-    // factory calls inside an action file produce instrumented
-    // clients, then run the SA wrap pass.
-    const withSupabase = rewriteSupabaseFactoryImports(source);
-    return rewriteServerActionFile(withSupabase);
-  }
-  if (kind === "supabase-factory") {
-    return rewriteSupabaseFactoryImports(source);
+    return rewriteServerActionFile(source);
   }
   if (kind === "inline-server-action") {
     return rewriteInlineServerActions(source, this.resourcePath);
@@ -359,41 +360,20 @@ function rewriteLocalAliasedRouteExports(
  * so `rewriteAppRoute` can append the wrapped exports. Every statement
  * in the file is handled; one with a non-method name (`{ GET, auth }`)
  * is left alone.
- *
- * Also left alone: `export const { POST } = serve(...)` with `serve`
- * imported from `@upstash/workflow` (any subpath). Every workflow step
- * is a QStash delivery to that route; captureWorkflowRequest records it
- * as a job event, and an HTTP event per delivery would be an extra
- * actor-less card.
  */
 function renameDestructuredExports(source: string): { source: string; methods: HttpMethodName[] } {
   const methodSet = new Set<string>(HTTP_METHOD_NAMES);
-  const workflowServe = upstashWorkflowServeNames(source);
   const methods: HttpMethodName[] = [];
   const out = source.replace(
     /(^|\n)([ \t]*)export\s+const\s*\{([^}]+)\}\s*=/g,
     (full, lead: string, indent: string, list: string, offset: number) => {
       const names = list.split(",").map((n) => n.trim()).filter(Boolean);
       if (names.length === 0 || !names.every((n) => methodSet.has(n))) return full;
-      const callee = /^\s*([A-Za-z_$][\w$]*)\s*[<(]/.exec(source.slice(offset + full.length))?.[1];
-      if (callee && workflowServe.has(callee)) return full;
       methods.push(...(names as HttpMethodName[]));
       return `${lead}${indent}const { ${names.map((n) => `${n}: ${ALREADY_WRAPPED_MARKER}${n}`).join(", ")} } =`;
     },
   );
   return { source: out, methods };
-}
-
-/** Local names of `serve` in `import { serve [as x] } from "@upstash/workflow[/…]"`. */
-function upstashWorkflowServeNames(source: string): Set<string> {
-  const names = new Set<string>();
-  for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*["']@upstash\/workflow(?:\/[^"']*)?["']/g)) {
-    for (const spec of m[1]!.split(",")) {
-      const [imported, local] = spec.trim().split(/\s+as\s+/);
-      if (imported === "serve") names.add((local ?? imported).trim());
-    }
-  }
-  return names;
 }
 
 /**
@@ -408,93 +388,95 @@ function upstashWorkflowServeNames(source: string): Set<string> {
 // values (constants, schemas, etc.) pass through untouched.
 const NEVER_WRAP_EXPORTS = new Set(["config", "metadata", "generateMetadata"]);
 
-// Modules whose factory exports we wrap to auto-instrument every
-// constructed Supabase client. Map: module specifier -> exported name.
-// Both factories return a SupabaseClient instance; wrapping the call
-// site instruments the resulting object's `from()` directly.
-const SUPABASE_FACTORY_IMPORTS: ReadonlyArray<{
-  module: string;
-  exportName: string;
-}> = [
-  { module: "@supabase/supabase-js", exportName: "createClient" },
-  { module: "@supabase/ssr", exportName: "createServerClient" },
-  { module: "@supabase/ssr", exportName: "createBrowserClient" },
-];
+// Renamed import bindings. Distinct from ALREADY_WRAPPED_MARKER: this
+// pass runs before (and beside) the route / action rewrites, whose
+// idempotency check must not see it.
+const IMPORT_MARKER = "__ezlogs_import_";
+
+// `import [Default,] { a, b as c } from "module";` at the start of a line
+// (the file's first line may start with a byte-order mark).
+// `import type { … }` is skipped (types only).
+const NAMED_IMPORT = /^(\uFEFF?[ \t]*)import\s+(?!type\b)((?:[A-Za-z_$][\w$]*\s*,\s*)?)\{([^}]*)\}(\s*from\s*)(["'])([^"'\n]+)\5([ \t]*;?)/gm;
 
 /**
- * Build-time import rewrite for the Supabase factory functions.
+ * Rewrites `import { X } from "<library>"` (aliases included) so the
+ * file's `X` is the agent's instrumented replacement:
  *
- * Why a build-time rewrite instead of runtime prototype-patching:
- * Turbopack duplicates the SupabaseClient class across server/RSC/edge
- * layers, so patching the prototype reachable from one layer misses
- * clients constructed in another. Wrapping the factory CALL SITE in
- * the user's own source file produces a wrapped instance regardless
- * of which class instance the layer's bundle contains.
+ *   import { Queue as __ezlogs_import_Queue } from "bullmq"; import { __ezlogsInstrument as __ezlogs_instrument_bullmq } from "ezlogs-nextjs/bullmq"; const Queue = __ezlogs_instrument_bullmq("bullmq#Queue", __ezlogs_import_Queue);
  *
- * Transformation:
- *
- *   import { createServerClient } from "@supabase/ssr";
- *   const c = createServerClient(url, key, opts);
- *
- * becomes:
- *
- *   import { createServerClient as __ezlogs_orig_createServerClient } from "@supabase/ssr";
- *   import { wrapSupabase as __ezlogs_wrap } from "ezlogs-nextjs/supabase";
- *   const createServerClient = (...args) => __ezlogs_wrap(__ezlogs_orig_createServerClient(...args));
- *   const c = createServerClient(url, key, opts);
- *
- * Idempotent (the `__ezlogs_orig_` marker check at the loader entry
- * skips already-rewritten files). Aliased imports
- * (`{ createClient as foo }`) are NOT rewritten in v0.1 — users with
- * aliases can fall back to manual `wrapSupabase()`.
+ * The added code stays on the import's own line (line numbers in stack
+ * traces are unchanged) and right after it (the binding exists before
+ * any top-level code uses it). Only real import statements are touched
+ * (the tokenizer tells them from text in comments and strings), and
+ * only bindings the file uses as values: a type-only import stays one,
+ * so TypeScript still drops it and the library is not pulled into a
+ * bundle that never needed it. Client components are left alone: they
+ * also render on the server, but their imports are browser code.
+ * Idempotent: renamed bindings are not renamed again.
  */
-function rewriteSupabaseFactoryImports(source: string): string {
-  let rewritten = source;
-  let changed = false;
-  let needsWrapImport = false;
-
-  for (const { module, exportName } of SUPABASE_FACTORY_IMPORTS) {
-    // Match: import { ..., createServerClient, ... } from "@supabase/ssr"
-    // The named-imports list can contain other names + commas + whitespace.
-    // We match the named-imports block and check whether `exportName` is
-    // present as a non-aliased name.
-    const importPattern = new RegExp(
-      `(import\\s*\\{[^}]*?)\\b(${exportName})\\b(\\s*(?:,[^}]*)?\\}\\s*from\\s*['"]${escapeRegexLiteral(module)}['"])`,
-      "m",
+export function rewriteInstrumentedImports(source: string, filename = "file.ts"): string {
+  if (!INSTRUMENTED_IMPORTS.some((entry) => source.includes(entry.module))) return source;
+  if (hasFileLevelDirective(source, "use client")) return source;
+  const tokens = tokenize(source, filename);
+  if (!tokens) return source;
+  const importStarts = new Set(tokens.filter((t) => t.type === TT_IMPORT).map((t) => t.start));
+  // A binding is used as a value when a non-type name token outside its import names it.
+  const valueUses = (local: string, from: number, to: number) =>
+    tokens.some(
+      (t) => t.type === TT_NAME && !t.isType && (t.start < from || t.start >= to) && source.slice(t.start, t.end) === local,
     );
-    const match = rewritten.match(importPattern);
-    if (!match) continue;
-    // Skip when the user aliased the import: `createServerClient as foo`.
-    // Detect by looking at the character immediately after the name.
-    const insertPoint = match.index! + match[1]!.length + match[2]!.length;
-    const after = rewritten.slice(insertPoint, insertPoint + 6);
-    if (/^\s+as\b/.test(after)) continue;
 
-    // Rewrite the named import: `createServerClient` -> `createServerClient as __ezlogs_orig_<name>`.
-    rewritten = rewritten.replace(importPattern, (_full, lead, name, tail) => {
-      return `${lead}${name} as ${ALREADY_WRAPPED_MARKER}${name}${tail}`;
-    });
+  const imported = new Set<string>();
+  return source.replace(
+    NAMED_IMPORT,
+    (full, indent: string, defaultPart: string, list: string, from: string, quote: string, module: string, end: string, offset: number) => {
+      const entry = INSTRUMENTED_IMPORTS.find((e) => e.module === module);
+      if (!entry || !importStarts.has(offset + indent.length)) return full;
+      // `… from "x" with { type: "…" }`: the added code can't go between them.
+      if (/^\s*(?:with|assert)\s*\{/.test(source.slice(offset + full.length))) return full;
+      const replaced: Array<{ local: string; name: string }> = [];
+      const specifiers = list.split(",").map((piece) => {
+        const spec = piece.trim();
+        const match = /^([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/.exec(spec);
+        if (!match) return piece; // `type X`, empty, or a shape we don't know
+        const name = match[1]!;
+        const local = match[2] ?? name;
+        if (!entry.names.includes(name) || local.startsWith(IMPORT_MARKER)) return piece;
+        if (!valueUses(local, offset, offset + full.length)) return piece;
+        replaced.push({ local, name });
+        return piece.replace(spec, `${name} as ${IMPORT_MARKER}${local}`);
+      });
+      if (replaced.length === 0) return full;
 
-    // Append a wrapper const so all references to `name` in the rest
-    // of the file resolve to the instrumented version.
-    const wrapper = `const ${exportName} = (...__ezlogs_args) => ${ALREADY_WRAPPED_MARKER}wrap(${ALREADY_WRAPPED_MARKER}${exportName}(...__ezlogs_args));`;
-    rewritten = `${rewritten}\n${wrapper}\n`;
-
-    changed = true;
-    needsWrapImport = true;
-  }
-
-  if (!changed) return source;
-
-  if (needsWrapImport) {
-    rewritten = `import { wrapSupabase as ${ALREADY_WRAPPED_MARKER}wrap } from "${PACKAGE_NAME}/supabase";\n${rewritten}`;
-  }
-
-  return rewritten;
+      const instrument = `__ezlogs_instrument_${entry.via.replace(/[^A-Za-z0-9]/g, "_")}`;
+      const added: string[] = [];
+      if (!imported.has(instrument)) {
+        imported.add(instrument);
+        added.push(`import { __ezlogsInstrument as ${instrument} } from "${PACKAGE_NAME}/${entry.via}";`);
+      }
+      for (const { local, name } of replaced) {
+        added.push(`const ${local} = ${instrument}("${module}#${name}", ${IMPORT_MARKER}${local});`);
+      }
+      const statement = `${indent}import ${defaultPart}{${specifiers.join(",")}}${from}${quote}${module}${quote}${end}`;
+      return `${statement}${end.trim().endsWith(";") ? "" : ";"} ${added.join(" ")}`;
+    },
+  );
 }
 
-function escapeRegexLiteral(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// The file's tokens, or null (the file is then left as it is) when the
+// tokenizer is unavailable or can't read it.
+function tokenize(source: string, filename: string): SucraseToken[] | null {
+  const sucraseParse = getSucraseParse();
+  if (sucraseParse === null) return null;
+  try {
+    return sucraseParse(source, /\.(jsx|tsx|js|mjs|cjs)$/i.test(filename), /\.([cm]?ts|tsx)$/i.test(filename), false).tokens;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[ezlogs] sucrase parse failed for ${filename}; its library imports are not instrumented. ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return null;
+  }
 }
 
 /**
@@ -585,6 +567,7 @@ const TT_ARROW = 22528;
 const TT_CONST = 80912;
 const TT_LET = 79888;
 const TT_VAR = 78864;
+const TT_IMPORT = 90640;
 
 const INLINE_HELPER_NAME = "__ezlogs_run_inline_server_action";
 
@@ -593,6 +576,8 @@ interface SucraseToken {
   start: number;
   end: number;
   scopeDepth: number;
+  /** True for tokens in type positions (annotations, `import type`, generics). */
+  isType?: boolean;
 }
 
 interface SucraseScope {
@@ -951,13 +936,17 @@ function skipMatchingParens(tokens: SucraseToken[], idx: number): number {
  * peek at the file head.
  */
 function hasFileLevelUseServer(source: string): boolean {
+  return hasFileLevelDirective(source, "use server");
+}
+
+function hasFileLevelDirective(source: string, directive: "use server" | "use client"): boolean {
   // Strip leading whitespace + line/block comments greedily.
   let i = 0;
   const n = source.length;
   while (i < n) {
     const ch = source.charCodeAt(i);
-    // whitespace
-    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d) {
+    // whitespace (and a byte-order mark)
+    if (ch === 0x20 || ch === 0x09 || ch === 0x0a || ch === 0x0d || ch === 0xfeff) {
       i += 1;
       continue;
     }
@@ -979,8 +968,8 @@ function hasFileLevelUseServer(source: string): boolean {
   }
   // We're at the first real character. Must be a quote starting a
   // directive prologue.
-  const head = source.slice(i, i + 14);
-  return /^["']use server["']/.test(head);
+  const head = source.slice(i, i + directive.length + 2);
+  return head === `"${directive}"` || head === `'${directive}'`;
 }
 
 /**
@@ -1027,10 +1016,10 @@ function rewriteMiddleware(source: string, name: "middleware" | "proxy" = "middl
   return source;
 }
 
-/** `<root>/proxy.<ext>` or `<root>/src/proxy.<ext>` (Next's only proxy locations). */
-function isRootProxyFile(resourcePath: string, root: string): boolean {
+/** `<root>/<name>.<ext>` or `<root>/src/<name>.<ext>` (Next's only middleware / proxy locations). */
+function isRootEntryFile(resourcePath: string, root: string, name: "middleware" | "proxy"): boolean {
   const rel = relative(root, resourcePath).split(sep).join("/");
-  return /^(?:src\/)?proxy\.[cm]?[jt]sx?$/.test(rel);
+  return new RegExp(`^(?:src/)?${name}\\.[cm]?[jt]sx?$`).test(rel);
 }
 
 function rewritePagesApi(source: string, routeModulePath: string): string {

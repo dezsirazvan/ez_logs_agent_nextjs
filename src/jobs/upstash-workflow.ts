@@ -69,6 +69,9 @@ import {
 } from "./shared.js";
 import { current as currentCorrelation } from "../correlation.js";
 import { maybeExtractSupabaseActor } from "../actor.js";
+import { createScopedStorage } from "../edge-fallback.js";
+import { markJobDelivery } from "../job-delivery.js";
+import { instrumentClass, instrumentFrom } from "../instrument.js";
 
 // QStash forwards any header with this prefix to the destination URL.
 const FORWARD_PREFIX = "upstash-forward-";
@@ -264,9 +267,19 @@ export async function captureWorkflowRequest<T>(
     workflowName: string;
     /** Optional explicit step name; defaults to workflowName. */
     stepName?: string;
+    /** @internal The step this delivery ran, read when it ends (the plugin's serve()). */
+    ranStep?: () => string | undefined;
   },
   work: () => Promise<T>,
 ): Promise<T> {
+  // The SDK's signature probe runs the route function with a disabled
+  // context, which runs no step (also on a request that starts a
+  // workflow by calling the route directly): nothing to record.
+  if ((meta.context as { disabled?: boolean } | undefined)?.disabled === true) return work();
+  // The request delivers this step: its job event stands for it.
+  markJobDelivery();
+  // Already captured (the plugin's automatic capture around a manual one): one event per step.
+  if (insideStepCapture.read()) return work();
   const headers = meta.request?.headers ?? meta.context?.headers;
   if (!headers) {
     // Never break the job over a wrong argument.
@@ -291,11 +304,11 @@ export async function captureWorkflowRequest<T>(
       (await readActorToken(runId ? AGENT_RUN_ID.exec(runId)?.[2] : null, correlationId)))
     : null;
 
-  return runJobWithCapture(
+  return insideStepCapture.run(true, () => runJobWithCapture(
     {
       jobClass: meta.workflowName,
       jobId: runId,
-      queue: meta.stepName ?? meta.workflowName,
+      queue: () => meta.ranStep?.() ?? meta.stepName ?? meta.workflowName,
       retryCount: retried,
       correlationId,
       actor,
@@ -307,8 +320,127 @@ export async function captureWorkflowRequest<T>(
       isSuccessfulExit: (error) => SUCCESSFUL_EXITS.has(errorName(error)),
     },
     work,
-  );
+  ));
 }
+
+const insideStepCapture = createScopedStorage<boolean>(Symbol.for("ezlogs-nextjs:upstash-step-capture"));
+
+interface WorkflowContextLike {
+  headers: Headers;
+  workflowRunId?: string;
+  url?: string;
+}
+
+// The workflow's route path ("/api/internal/csv-exports"): what the step is named by.
+function workflowNameOf(context: WorkflowContextLike): string {
+  try {
+    if (typeof context.url === "string") return new URL(context.url).pathname;
+  } catch {
+    // fall through
+  }
+  return "upstash-workflow";
+}
+
+// The route function, each run of it captured as one step.
+function captureRouteFunction(routeFunction: unknown): unknown {
+  if (typeof routeFunction !== "function") return routeFunction;
+  const run = routeFunction as (context: WorkflowContextLike, ...rest: unknown[]) => Promise<unknown>;
+  return function ezlogsWorkflowStep(this: unknown, context: WorkflowContextLike, ...rest: unknown[]) {
+    if (!context || typeof context !== "object" || !context.headers) return run.call(this, context, ...rest);
+    const ran: { step?: string } = {};
+    const watched = watchRunSteps(context, ran);
+    return captureWorkflowRequest({ context, workflowName: workflowNameOf(context), ranStep: () => ran.step }, () =>
+      run.call(this, watched, ...rest),
+    );
+  };
+}
+
+// The context, with `context.run(name, fn)` noting the step whose fn ran:
+// the SDK runs only a delivery's new step and replays earlier ones from
+// their stored results, so that is the step this delivery did. Methods
+// stay bound to the real context; anything unexpected uses it as is.
+function watchRunSteps(context: WorkflowContextLike, ran: { step?: string }): WorkflowContextLike {
+  if (typeof (context as { run?: unknown }).run !== "function") return context;
+  try {
+    return new Proxy(context, {
+      get(target, key) {
+        const value = Reflect.get(target, key, target) as unknown;
+        if (typeof value !== "function") return value;
+        if (key !== "run") return value.bind(target);
+        const run = value as (name: unknown, fn: unknown, ...rest: unknown[]) => unknown;
+        return (name: unknown, fn: unknown, ...rest: unknown[]) => {
+          if (typeof fn !== "function") return run.call(target, name, fn, ...rest);
+          const step = fn as (...args: unknown[]) => unknown;
+          return run.call(target, name, (...args: unknown[]) => {
+            if (typeof name === "string" && ran.step === undefined) ran.step = name;
+            return step(...args);
+          }, ...rest);
+        };
+      },
+    });
+  } catch {
+    return context;
+  }
+}
+
+// `serve(routeFunction, options)` with each step captured, and its
+// handlers marking QStash's requests as job deliveries (callbacks such
+// as context.call results and failure callbacks reach the route
+// without running a step). QStash signs every request it sends; a
+// request without the signature (a workflow started by calling the
+// route directly) is the app's own and keeps its HTTP event.
+function instrumentServe(original: unknown): unknown {
+  if (typeof original !== "function") return original;
+  const serve = original as (...args: unknown[]) => unknown;
+  return function ezlogsServe(this: unknown, routeFunction: unknown, ...rest: unknown[]) {
+    const served = serve.call(this, captureRouteFunction(routeFunction), ...rest);
+    if (!served || typeof served !== "object") return served;
+    const handlers: Record<string, unknown> = { ...(served as Record<string, unknown>) };
+    for (const [name, handler] of Object.entries(handlers)) {
+      if (typeof handler !== "function") continue;
+      const deliver = handler as (...args: unknown[]) => unknown;
+      handlers[name] = function ezlogsDelivery(this: unknown, ...args: unknown[]) {
+        if (signedByQStash(args[0])) markJobDelivery();
+        return deliver.apply(this, args);
+      };
+    }
+    return handlers;
+  };
+}
+
+// The App Router's Request or the Pages Router's req carries QStash's signature.
+function signedByQStash(request: unknown): boolean {
+  const headers = (request as { headers?: unknown } | null | undefined)?.headers;
+  if (!headers || typeof headers !== "object") return false;
+  if (typeof (headers as Headers).get === "function") return Boolean((headers as Headers).get("upstash-signature"));
+  return Boolean((headers as Record<string, unknown>)["upstash-signature"]);
+}
+
+// `createWorkflow(routeFunction, options)` (served by serveMany): each step captured.
+function instrumentCreateWorkflow(original: unknown): unknown {
+  if (typeof original !== "function") return original;
+  const create = original as (...args: unknown[]) => unknown;
+  return function ezlogsCreateWorkflow(this: unknown, routeFunction: unknown, ...rest: unknown[]) {
+    return create.call(this, captureRouteFunction(routeFunction), ...rest);
+  };
+}
+
+/**
+ * Replacements for the plugin's instrumented imports (instrument.ts).
+ * Internal: called by build-time generated code, not by apps.
+ */
+export const __ezlogsInstrument = instrumentFrom({
+  "@upstash/workflow/nextjs#serve": instrumentServe,
+  "@upstash/workflow/nextjs#servePagesRouter": instrumentServe,
+  "@upstash/workflow/nextjs#createWorkflow": instrumentCreateWorkflow,
+  "@upstash/workflow/nextjs#createWorkflowPagesRouter": instrumentCreateWorkflow,
+  // Its workflows come from createWorkflow (captured there); only the handlers are marked.
+  "@upstash/workflow/nextjs#serveMany": instrumentServe,
+  "@upstash/workflow/nextjs#serveManyPagesRouter": instrumentServe,
+  "@upstash/workflow#serve": instrumentServe,
+  "@upstash/workflow#Client": (original) => instrumentClass(original, (client) => wrapWorkflowClient(client as WorkflowClientLike)),
+  "@upstash/qstash#Client": (original) => instrumentClass(original, (client) => wrapQStashClient(client as QStashClientLike)),
+});
 
 /**
  * Standalone capture entry — for users who already have a finished

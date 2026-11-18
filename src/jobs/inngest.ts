@@ -25,6 +25,7 @@
 // Documented in AGENT_PARITY_NOTES.md.
 
 import { logger } from "../logger.js";
+import { instrumentClass, instrumentFrom } from "../instrument.js";
 import {
   emitJobEvent,
   extractCorrelationFromPayload,
@@ -34,6 +35,7 @@ import {
   ACTOR_PAYLOAD_KEY,
 } from "./shared.js";
 import { runWithActorScope } from "../actor.js";
+import { markJobDelivery } from "../job-delivery.js";
 import {
   current as currentCorrelation,
   endCorrelationScope,
@@ -88,6 +90,8 @@ export function ezlogsInngestMiddleware(): unknown {
         // one function). Returns per-run hooks that fire as the run
         // proceeds. We track the run via closure-scoped state.
         onFunctionRun(args: InngestRunContext) {
+          // The request (Inngest calling the serve route) delivers this run: its job event stands for it.
+          markJobDelivery();
           const fnId = functionId(args.fn) ?? "inngest-function";
           const runId = args.ctx?.runId ?? null;
           const attempt = typeof args.ctx?.attempt === "number" ? args.ctx.attempt : 0;
@@ -241,3 +245,23 @@ function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
 }
+
+// The client options with the agent's middleware added, unless the app already passes it.
+function withEzlogsMiddleware(args: unknown[]): unknown[] {
+  const [options, ...rest] = args;
+  if (!options || typeof options !== "object" || Array.isArray(options)) return args;
+  const opts = options as { middleware?: unknown };
+  const existing = Array.isArray(opts.middleware) ? opts.middleware : opts.middleware == null ? [] : null;
+  if (existing === null) return args; // a shape we don't know: leave it alone
+  if (existing.some((m) => (m as { name?: unknown } | null)?.name === "ezlogs-nextjs")) return args;
+  return [{ ...opts, middleware: [...existing, ezlogsInngestMiddleware()] }, ...rest];
+}
+
+/**
+ * Replacements for the plugin's instrumented imports (instrument.ts):
+ * every Inngest client the app's server code constructs gets
+ * ezlogsInngestMiddleware. Internal: called by build-time generated code.
+ */
+export const __ezlogsInstrument = instrumentFrom({
+  "inngest#Inngest": (original) => instrumentClass(original, (client) => client, withEzlogsMiddleware),
+});

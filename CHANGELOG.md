@@ -3,6 +3,68 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.6] — 2026-11-18
+
+### Added
+- **Job runners need no code.** The Next config wrapper now instruments
+  the job and database clients where the app's server code imports them,
+  in any file (aliases included): Upstash Workflow `serve` /
+  `servePagesRouter` / `createWorkflow` / `serveMany` and `Client`,
+  QStash `Client`, BullMQ `Queue` / `Worker`, the Inngest client (gets
+  `ezlogsInngestMiddleware()`), and Supabase `createClient` /
+  `createServerClient`. One table drives it (`INSTRUMENTED_IMPORTS`);
+  each replacement keeps the original's behavior and falls back to it on
+  anything unexpected. Manual wrappers still work and don't double.
+  Only real import statements are rewritten (not text in comments or
+  strings), and only names the file uses as values: a type-only import
+  stays type-only, so no library is added to a bundle that didn't load
+  it. The root `middleware` / `proxy` file is left alone.
+
+### Changed
+- **A job delivered over HTTP is one event.** A workflow step or QStash
+  delivery records its job event and no HTTP event for the POST that
+  carried it, including QStash callbacks that run no step (context.call
+  results, failure callbacks). Only requests QStash signed count: a
+  workflow started by calling its route directly keeps its HTTP event.
+  The same holds for Inngest function runs. Routes that serve a workflow
+  are wrapped like any other route; the skip for `serve()` route files
+  is gone.
+- **Steps are named by their route and step.** An instrumented `serve()`
+  records each delivery under its route path (`job_class`,
+  `/api/workflows/export`) and the `context.run` step it ran (`queue`,
+  `generate-and-upload`), the field `captureWorkflowRequest({ stepName })`
+  already used; a delivery that ran no step keeps the route path. A manual
+  `captureWorkflowRequest({ workflowName })` inside it no longer adds a
+  second capture, so its name is not used; drop the manual call.
+- **What every client now carries.** Each BullMQ job's data gets
+  `ezlogs_correlation_id` (and a signed actor token when a person started
+  it), as with `wrapBullQueue`. An instrumented `Worker` hands your
+  processor the data you enqueued, without them (a strict schema keeps
+  passing), and puts them back in data the job saves (`job.updateData`),
+  so a step job's later runs keep their action. A worker in another
+  service sees the keys. Each QStash publish forwards the
+  `x-ezlogs-correlation-id` / `x-ezlogs-actor` headers, as with
+  `wrapQStashClient`.
+- The instrumented binding is a `const` defined on the import's line.
+  Code that runs before that line (an import cycle that calls into the
+  file at load time) sees it uninitialized; wrap that client manually
+  with the `wrap*` function instead.
+- **Faster actor, same safety.** The Supabase actor comes from
+  `auth.getClaims()` when supabase-js has it (the token verified locally,
+  no auth round trip), else (or when it gives no user) `getUser()`. Every client the request created
+  is asked, oldest first, so a service-role client made after the user's
+  no longer hides the user. The lookup stays before the response (a
+  session refresh's cookies must reach it); the event is sent after it
+  for Server Actions, bodyless route responses and middleware page views.
+- Helpers named `middleware.ts` / `proxy.ts` outside the project root
+  (Supabase's `utils/supabase/middleware.ts`) are instrumented like any
+  server file, so page views get their actor; the root file is not.
+- Supabase factories are instrumented in every server file, not only
+  under `lib/supabase` / `utils/supabase`, aliased imports included, and
+  the replacement is defined right after the import (it used to be
+  appended at the end of the file, too late for a client created at
+  module level).
+
 ## [0.4.5] — 2026-11-18
 
 Found by installing the agent into a large real Next.js 16 app (App

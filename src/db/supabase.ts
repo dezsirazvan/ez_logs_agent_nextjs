@@ -30,6 +30,7 @@
 // values and leave `from: null`. Same gap as Prisma.
 
 import { logger } from "../logger.js";
+import { instrumentFactory, instrumentFrom } from "../instrument.js";
 import { currentActorSource } from "../actor.js";
 import { configuration } from "../configuration.js";
 import {
@@ -68,6 +69,17 @@ interface SupabaseAuthLike {
     data?: { user?: SupabaseUser | null };
     error?: unknown;
   }>;
+  // supabase-js >= 2.69: the session's verified token claims.
+  getClaims?: () => Promise<{
+    data?: { claims?: SupabaseClaims | null } | null;
+    error?: unknown;
+  }>;
+}
+
+interface SupabaseClaims {
+  sub?: unknown;
+  email?: unknown;
+  user_metadata?: { full_name?: unknown; name?: unknown } | null;
 }
 
 interface SupabaseUser {
@@ -206,8 +218,8 @@ export function wrapSupabase<T>(client: T): T {
 // ---- actor extraction ---------------------------------------------------
 
 // "Current Supabase client" for actor extraction. Inside a request /
-// job scope it is the client constructed in THAT scope (per-scope slot,
-// see actor.ts), so concurrent requests never read each other's user.
+// job scope they are the clients constructed in THAT scope (per-scope
+// slot, see actor.ts), so concurrent requests never read each other's user.
 // Outside any scope it falls back to a process-global "most recent
 // client" (pinned on globalThis to survive module duplication).
 const GLOBAL_CLIENT_KEY = Symbol.for("ezlogs-nextjs:supabase-current-client");
@@ -220,7 +232,8 @@ function registerActorSource(client: SupabaseClientLike): void {
   try {
     const slot = currentActorSource();
     if (slot) {
-      slot.client = client;
+      slot.clients ??= [];
+      if (!slot.clients.includes(client)) slot.clients.push(client);
       slot.tried = false; // a new client may know the user
       return;
     }
@@ -232,10 +245,10 @@ function registerActorSource(client: SupabaseClientLike): void {
 }
 
 /**
- * Returns the current actor (if any) by asking the Supabase client
- * registered in this scope (outside any scope: the most recent one)
- * for its authenticated user. Returns null
- * when no client is registered or the call fails. Used by the HTTP
+ * Returns the current actor (if any) by asking the Supabase clients
+ * constructed in this scope, oldest first (outside any scope: the most
+ * recent client), for their authenticated user. Returns null when no
+ * client knows one. Used by the HTTP
  * capturer's default `actorFromSupabase` path.
  *
  * Cheap-but-not-free: each call is a Supabase auth roundtrip. Callers
@@ -246,24 +259,45 @@ export async function tryExtractSupabaseActor(): Promise<{
   label?: string;
 } | null> {
   const slot = currentActorSource();
-  const client = slot
-    ? (slot.client as SupabaseClientLike | undefined)
-    : (globalThis as unknown as GlobalWithCurrentClient)[GLOBAL_CLIENT_KEY];
-  if (!client || typeof client.auth?.getUser !== "function") return null;
+  // In a scope, every client the request constructed, oldest first: the
+  // request's own (cookie) client comes first, and a service-role or
+  // other session-less client made later must not hide its user. A
+  // client without a session answers without a network call.
+  const clients = (
+    slot ? (slot.clients ?? []) : [(globalThis as unknown as GlobalWithCurrentClient)[GLOBAL_CLIENT_KEY]]
+  ) as Array<SupabaseClientLike | null | undefined>;
+  for (const client of clients) {
+    const actor = await userOf(client);
+    if (actor) return actor;
+  }
+  return null;
+}
 
+async function userOf(client: SupabaseClientLike | null | undefined): Promise<{ id: string; label?: string } | null> {
+  const auth = client?.auth;
+  if (!auth) return null;
   try {
-    const { data } = await client.auth.getUser();
+    // getClaims verifies the session token locally (asymmetric signing keys): no auth round trip.
+    // Anything short of claims with a subject (no session, a JWKS fetch that failed) asks getUser.
+    if (typeof auth.getClaims === "function") {
+      const claims = await auth.getClaims().then((r) => r?.data?.claims, () => null);
+      if (claims && typeof claims.sub === "string" && claims.sub) {
+        return withLabel(claims.sub, claims.user_metadata?.full_name, claims.user_metadata?.name, claims.email);
+      }
+    }
+    if (typeof auth.getUser !== "function") return null;
+    const { data } = await auth.getUser();
     const user = data?.user;
     if (!user || typeof user.id !== "string" || !user.id) return null;
-    const label =
-      user.user_metadata?.full_name ??
-      user.user_metadata?.name ??
-      user.email ??
-      undefined;
-    return label ? { id: user.id, label } : { id: user.id };
+    return withLabel(user.id, user.user_metadata?.full_name, user.user_metadata?.name, user.email);
   } catch {
     return null;
   }
+}
+
+function withLabel(id: string, ...candidates: unknown[]): { id: string; label?: string } {
+  const label = candidates.find((c): c is string => typeof c === "string" && c.length > 0);
+  return label ? { id, label } : { id };
 }
 
 type PrereadFn = (
@@ -741,3 +775,13 @@ function describeError(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
 }
+
+/**
+ * Replacements for the plugin's instrumented imports (instrument.ts):
+ * every server-side client the app creates is wrapped.
+ * Internal: called by build-time generated code, not by apps.
+ */
+export const __ezlogsInstrument = instrumentFrom({
+  "@supabase/supabase-js#createClient": (original) => instrumentFactory(original, wrapSupabase),
+  "@supabase/ssr#createServerClient": (original) => instrumentFactory(original, wrapSupabase),
+});

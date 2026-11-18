@@ -51,6 +51,7 @@ import {
   scrubSecretsInText,
 } from "./sanitize.js";
 import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
+import { runWithDeliverySlot, type DeliverySlot } from "../job-delivery.js";
 import { hasExcludedExtension, pathMatches } from "./path-matcher.js";
 import { DEFAULT_EXCLUDED_EXTENSIONS } from "../configuration.js";
 import {
@@ -145,9 +146,11 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
       // same id and group into one Action card — even without
       // `middleware.ts`.
       const correlationId = resolveCorrelation((request as Request).headers ?? null);
+      // Marked by a job capture when this request only delivers a job.
+      const delivery: DeliverySlot = { jobDelivery: false };
 
       return await runWithCorrelation(correlationId, () =>
-        runWithActorAndAuditScope(async () => {
+        runWithDeliverySlot(delivery, () => runWithActorAndAuditScope(async () => {
           await maybeRunActorHook(request as Request);
 
           const startMs = Date.now();
@@ -178,6 +181,7 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
               responseErrorMessage,
               durationMs: handlerMs ?? Date.now() - startMs,
               startedAt: new Date(startMs),
+              jobDelivery: delivery.jobDelivery,
             });
             await flushOnServerless();
             endCorrelationScope();
@@ -233,9 +237,13 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             statusCode = 500;
             throw e;
           } finally {
-            if (!followed) await finish();
+            if (!followed) {
+              // Before the response: a Supabase lookup may refresh the session and set cookies.
+              await maybeExtractSupabaseActor();
+              await offTheResponse(finish);
+            }
           }
-        }),
+        })),
       );
     } catch (preCaptureError) {
       if (handlerInvoked) throw preCaptureError;
@@ -345,22 +353,33 @@ export function withMiddlewareCapture<
           // emit alongside captureRoute / captureServerAction.
           try {
             if (shouldEmitPageNavigation(request)) {
+              const durationMs = Date.now() - startMs;
               // Run the user's actor hook so page navigations carry
               // "Triggered by" too. Without this every page view in the
               // dashboard renders "Unknown" while the route-handler
               // events from the same user show their email — confusing.
               // Casting because the middleware request and `Request` are
               // structurally compatible at the headers.get() / cookies
-              // level the hook actually uses.
+              // level the hook actually uses. Both run before the
+              // middleware answers: a Supabase lookup may refresh the
+              // session, and its cookies go on the response it returns.
               await maybeRunActorHook(request as unknown as Request);
               await maybeExtractSupabaseActor();
-              await emitPageNavigationEvent({
-                request,
-                statusCode:
-                  typeof response?.status === "number" ? response.status : null,
-                durationMs: Date.now() - startMs,
-                startedAt,
-              });
+              // The page view is sent after the middleware answers
+              // (the event's waitUntil keeps it alive where it must).
+              const event = rest[0] as { waitUntil?: (promise: Promise<unknown>) => void } | undefined;
+              await offTheResponse(
+                async () => {
+                  await emitPageNavigationEvent({
+                    request,
+                    statusCode:
+                      typeof response?.status === "number" ? response.status : null,
+                    durationMs,
+                    startedAt,
+                  });
+                },
+                typeof event?.waitUntil === "function" ? event.waitUntil.bind(event) : null,
+              );
             }
           } catch (error) {
             logger.debug(`page navigation capture failed: ${describeError(error)}`);
@@ -560,8 +579,10 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
         get: (name: string) => readPagesHeader(req, name),
       });
 
+      const delivery: DeliverySlot = { jobDelivery: false };
+
       return await runWithCorrelation(correlationId, () =>
-        runWithActorAndAuditScope(async () => {
+        runWithDeliverySlot(delivery, () => runWithActorAndAuditScope(async () => {
           await maybeRunActorHookFromPages(req);
 
           const startMs = Date.now();
@@ -592,11 +613,12 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
               ),
               durationMs: Date.now() - startMs,
               startedAt: new Date(startMs),
+              jobDelivery: delivery.jobDelivery,
             });
             await flushOnServerless();
             endCorrelationScope();
           }
-        }),
+        })),
       );
     } catch (preCaptureError) {
       if (handlerInvoked) throw preCaptureError;
@@ -691,45 +713,31 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
           // who triggered it.
           await maybeRunActorHookFromServerAction();
 
-          try {
-            const result = await Promise.resolve(runAction(...args));
-            // Late-fallback: a Supabase client constructed inside the
-            // action might only have its auth cookies attached now.
-            // maybeExtractSupabaseActor short-circuits when an actor
-            // is already set, so this is a no-op when the hook above
-            // succeeded.
+          // The late Supabase actor lookup runs before the action answers
+          // (a client constructed inside the action might only have its
+          // auth cookies attached now; a no-op when the hook above set the
+          // actor): it may refresh the session, and Next only takes cookies
+          // while the action runs. The event is sent after the answer.
+          const record = async (input: Parameters<typeof emitServerActionEvent>[0]) => {
             await maybeExtractSupabaseActor();
-
-            // Many apps (next-safe-action, Vercel templates, in-house wrappers, …)
-            // don't throw on failure — they catch the error and return
-            // `{ success: false, error: "..." }` so the client can render
-            // the message inline. The HTTP response stays 200, so we have
-            // to inspect the value to know the action failed. See
-            // ServerActionErrorClassifier in configuration.ts.
-            const failure = classifyServerActionResult(result);
-            await emitServerActionEvent({
-              actionName,
-              // A returned failure (`{ success: false, error }`) is a
-              // handled refusal, not a crash: no HTTP status is
-              // invented; outcome + error_message carry it.
-              statusCode: failure ? null : 200,
-              exception: failure ? new Error(failure.errorMessage) : null,
-              durationMs: Date.now() - startMs,
-              startedAt,
-              args,
+            await offTheResponse(async () => {
+              await emitServerActionEvent(input);
+              await flushOnServerless();
+              endCorrelationScope();
             });
-            return result;
+          };
+
+          let result: Awaited<TResult>;
+          try {
+            result = await Promise.resolve(runAction(...args));
           } catch (e) {
             // Next.js implements redirect() and notFound() by THROWING
             // sentinel errors that the RSC pipeline catches upstream.
             // These aren't application failures — they're control flow.
             // Re-throw without recording the action as failed.
             if (isNextControlFlowError(e)) {
-              // Actor was resolved up-front; just collect any
-              // late-bound Supabase actor as a final fallback.
-              await maybeExtractSupabaseActor();
               const controlStatus = nextControlFlowStatus(e) ?? 200;
-              await emitServerActionEvent({
+              await record({
                 actionName,
                 // redirect() is a success; notFound() / forbidden()
                 // keep their 4xx.
@@ -743,8 +751,7 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
               throw e;
             }
             exception = e instanceof Error ? e : new Error(String(e));
-            await maybeExtractSupabaseActor();
-            await emitServerActionEvent({
+            await record({
               actionName,
               statusCode: 500,
               exception,
@@ -753,10 +760,32 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
               args,
             });
             throw e;
-          } finally {
-            await flushOnServerless();
-            endCorrelationScope();
           }
+
+          // Many apps (next-safe-action, Vercel templates, in-house wrappers, …)
+          // don't throw on failure — they catch the error and return
+          // `{ success: false, error: "..." }` so the client can render
+          // the message inline. The HTTP response stays 200, so we have
+          // to inspect the value to know the action failed. See
+          // ServerActionErrorClassifier in configuration.ts.
+          let failure: ReturnType<typeof classifyServerActionResult> = null;
+          try {
+            failure = classifyServerActionResult(result);
+          } catch (e) {
+            logger.debug(`server action result classification failed: ${describeError(e)}`);
+          }
+          await record({
+            actionName,
+            // A returned failure (`{ success: false, error }`) is a
+            // handled refusal, not a crash: no HTTP status is
+            // invented; outcome + error_message carry it.
+            statusCode: failure ? null : 200,
+            exception: failure ? new Error(failure.errorMessage) : null,
+            durationMs: Date.now() - startMs,
+            startedAt,
+            args,
+          });
+          return result;
         }),
       );
     } catch (preCaptureError) {
@@ -1957,6 +1986,8 @@ interface EmitInput {
   responseErrorMessage?: string | null;
   durationMs: number;
   startedAt: Date;
+  /** The request only delivered a job (job-delivery.ts): its job event stands for it. */
+  jobDelivery?: boolean;
 }
 
 async function emitEvent(input: EmitInput): Promise<void> {
@@ -1965,6 +1996,7 @@ async function emitEvent(input: EmitInput): Promise<void> {
     // before we ship the HTTP event. Same actor + correlation scope
     // is still open here, so the reader matches rows back correctly.
     await flushTriggerAuditLog();
+    if (input.jobDelivery) return;
 
     const config = configuration();
 
@@ -2118,6 +2150,51 @@ function followBody(
     logger.debug(`could not follow the response body: ${describeError(e)}`);
     return null;
   }
+}
+
+let recordBeforeResponse = false;
+
+/**
+ * Test-only. Records each request before its response returns, so a test
+ * reads its events right after the call (the work itself is unchanged).
+ */
+export function _setRecordBeforeResponseForTests(value: boolean): void {
+  recordBeforeResponse = value;
+}
+
+/**
+ * Sends a request's event without holding up its response. The work starts
+ * here, inside the request's async context (correlation, actor, dedup
+ * scope), and is not awaited. Callers resolve the actor before calling
+ * this: a Supabase lookup may refresh the session, whose cookies must
+ * reach the response.
+ * Serverless: the process may freeze once the response is sent, so the
+ * platform's `waitUntil` keeps it alive; without one the request waits
+ * at most SERVERLESS_INLINE_FLUSH_MS. Never throws.
+ */
+async function offTheResponse(
+  work: () => Promise<void>,
+  waitUntil: ((promise: Promise<unknown>) => void) | null = null,
+): Promise<void> {
+  const done = work().catch((e) => logger.debug(`capture failed: ${describeError(e)}`));
+  if (recordBeforeResponse) await done;
+  if (!isServerless()) return;
+  try {
+    const keepAlive = waitUntil ?? platformWaitUntil();
+    if (keepAlive) {
+      keepAlive(done);
+      return;
+    }
+  } catch (e) {
+    logger.debug(`waitUntil unavailable, recording inline: ${describeError(e)}`);
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    done,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SERVERLESS_INLINE_FLUSH_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 /** Longest a serverless request waits for its events to ship when the platform has no `waitUntil`. */

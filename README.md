@@ -329,17 +329,32 @@ at a quiet moment. Details in [CHANGELOG.md](./CHANGELOG.md).
 
 ### 6. Capture background jobs
 
-Only if you use a job runner. Wrap it once, and each job shows up in the
-same action as the request that started it, with the database changes
-the job made:
+Nothing to add for the runners below. The Next config wrapper from step 3
+instruments them where your server code imports them (aliases such as
+`Client as WorkflowClient` included). Each job then shows up in the same
+action as the request that started it, with the database changes the job
+made:
 
-| Runner | Add (snippets in [docs/jobs.md](./docs/jobs.md)) |
+| Runner | Instrumented imports |
 |---|---|
-| BullMQ | `wrapBullQueue` + `wrapBullWorker` from `ezlogs-nextjs/bullmq` |
-| Inngest (v3) | `ezlogsInngestMiddleware()` from `ezlogs-nextjs/inngest`, + `runInsideInngestCorrelation` around the body to link its writes |
+| Upstash Workflow | `serve`, `servePagesRouter`, `createWorkflow`, `serveMany` from `@upstash/workflow/nextjs`; `Client` from `@upstash/workflow` |
+| QStash | `Client` from `@upstash/qstash` |
+| BullMQ | `Queue`, `Worker` from `bullmq` |
+| Inngest (v3) | `Inngest` from `inngest` (gets `ezlogsInngestMiddleware()`); wrap a function body in `runInsideInngestCorrelation` to link its writes |
+
+A workflow step or QStash delivery is one job event: the agent does not
+also record the POST that delivered it.
+
+Add these by hand ([docs/jobs.md](./docs/jobs.md)):
+
+| Runner | Add |
+|---|---|
 | Trigger.dev | `registerTriggerHooks(tasks)` from `ezlogs-nextjs/trigger` |
 | Supabase Queues (pgmq) | `wrapSupabaseQueueClient` + `captureQueueMessage` from `ezlogs-nextjs/supabase-queues` |
-| Upstash Workflow / QStash | `wrapWorkflowClient` / `wrapQStashClient` + `captureWorkflowRequest` from `ezlogs-nextjs/upstash-workflow` |
+| Code Next doesn't build (a worker started with `node worker.js`), or `import * as` / `require()` | the same runner's wrapper: `wrapBullWorker`, `wrapWorkflowClient`, … (listed in [docs/jobs.md](./docs/jobs.md)) |
+
+Wrapping by hand where the agent already instruments is harmless: each
+job is still recorded once.
 
 **Jobs that run in a separate worker process** (for example a BullMQ
 worker you start with `node worker.js`) don't load `instrumentation.ts`.
