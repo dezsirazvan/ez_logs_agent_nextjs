@@ -177,6 +177,14 @@ export function captureRoute<TArgs extends unknown[], TResult extends Response |
             // Supabase client constructed during the handler is
             // registered, and its auth cookies have been read.
             await maybeExtractSupabaseActor();
+            if (response) {
+              await retryActorHookWithNewCookies(
+                (request as Request).headers ?? null,
+                cookiesSetBy(setCookieLines(response.headers)),
+                snapshot.method,
+                (request as Request).url ?? "",
+              );
+            }
             if (isJobRunnerSync(snapshot.method, inngestServerKind, response?.headers?.get?.(INNGEST_SDK) ?? null)) {
               delivery.jobDelivery = true;
             }
@@ -613,6 +621,12 @@ export function capturePagesApi<TArgs extends [PagesApiReq, PagesApiRes, ...unkn
 
             const status = typeof res.statusCode === "number" ? res.statusCode : null;
             const getHeader = res.getHeader as ((name: string) => unknown) | undefined;
+            if (typeof getHeader === "function") {
+              const set = getHeader.call(res, "set-cookie");
+              const lines = Array.isArray(set) ? set.map(String) : set ? [String(set)] : [];
+              const headers = req.headers instanceof Headers ? req.headers : toWebHeaders(req.headers);
+              await retryActorHookWithNewCookies(headers, cookiesSetBy(lines), snapshot.method, req.url ?? "");
+            }
             const sdkHeader = typeof getHeader === "function" ? getHeader.call(res, INNGEST_SDK) : null;
             if (isJobRunnerSync(snapshot.method, inngestServerKind, sdkHeader ? String(sdkHeader) : null)) {
               delivery.jobDelivery = true;
@@ -738,6 +752,7 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
           // while the action runs. The event is sent after the answer.
           const record = async (input: Parameters<typeof emitServerActionEvent>[0]) => {
             await maybeExtractSupabaseActor();
+            await retryActorHookAfterServerAction();
             await offTheResponse(async () => {
               await emitServerActionEvent(input);
               await flushOnServerless();
@@ -1917,7 +1932,49 @@ async function readNextHeadersAsAdapter(): Promise<{
 
 type NextHeadersMod = {
   headers: () => Headers | Promise<Headers>;
+  cookies?: () => CookieStoreLike | Promise<CookieStoreLike>;
 };
+
+type CookieStoreLike = { getAll: () => Array<{ name: string; value: string }> };
+
+/**
+ * Server Action form of retryActorHookWithNewCookies: Next's `cookies()` store in an action
+ * holds the request's cookies plus the ones the action set (a deleted one reads "").
+ */
+async function retryActorHookAfterServerAction(): Promise<void> {
+  if (!configuration().actorFromRequest || getCurrentActor()) return;
+  try {
+    const mod = await tryLoadNextHeadersModule();
+    if (!mod?.cookies) return;
+    const headers = await Promise.resolve(mod.headers());
+    const store = await Promise.resolve(mod.cookies());
+    // The store holds the request's cookies as Next parsed them (decoded, a bare name reads
+    // "true") plus the ones the action set: keep only what is new or changed, encoded the way
+    // Next writes it, so ordinary traffic never asks the hook twice.
+    const sent = new Map<string, string>();
+    for (const part of (headers?.get("cookie") ?? "").split(";")) {
+      const eq = part.indexOf("=");
+      const name = (eq < 0 ? part : part.slice(0, eq)).trim();
+      if (!name) continue;
+      const raw = eq < 0 ? "true" : part.slice(eq + 1).trim();
+      let value = raw;
+      try {
+        value = decodeURIComponent(raw);
+      } catch {
+        // malformed escape: Next keeps it as is
+      }
+      sent.set(name, value);
+    }
+    const changed = store
+      .getAll()
+      .filter((c) => sent.get(c.name) !== c.value)
+      .map((c): [string, string] => [c.name, c.value === "" ? "" : encodeURIComponent(c.value)]);
+    if (changed.length === 0) return;
+    await retryActorHookWithNewCookies(headers, changed, "POST", "");
+  } catch (error) {
+    logger.debug(`actorFromRequest (server action, after the action) skipped: ${describeError(error)}`);
+  }
+}
 
 async function loadNextHeaders(): Promise<Headers | null> {
   // Try `next/headers` first (the documented specifier — what Next's
@@ -2509,6 +2566,75 @@ function describeError(error: unknown): string {
  *   the Pulse Agent view has something to anchor on.
  * - No hook actor, no UA match       -> leave the scope empty.
  */
+/**
+ * A sign-in: the actor hook ran before the handler, when the session cookie did not exist yet,
+ * so the request read "Signed in" by nobody. When the hook found nobody, the request changes
+ * something (not GET/HEAD) and the handler set cookies, the hook runs once more with the
+ * request's cookies plus those, so the app's own hook names who signed in. It never replaces an
+ * actor already set and never guesses: no answer from the hook leaves the request as it was.
+ */
+async function retryActorHookWithNewCookies(
+  base: Headers | null,
+  newCookies: Array<[string, string]>,
+  method: string,
+  url: string,
+): Promise<void> {
+  const hook = configuration().actorFromRequest;
+  if (!hook || getCurrentActor() || newCookies.length === 0) return;
+  if (method === "GET" || method === "HEAD") return;
+
+  const jar = new Map<string, string>();
+  for (const part of (base?.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0) jar.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+  }
+  const before = new Map(jar);
+  for (const [name, value] of newCookies) {
+    if (value === "") jar.delete(name);
+    else jar.set(name, value);
+  }
+  // Nothing new or changed: the hook would give the same answer as before.
+  if (jar.size === before.size && [...jar].every(([n, v]) => before.get(n) === v)) return;
+  const cookie = [...jar].map(([n, v]) => `${n}=${v}`).join("; ");
+
+  try {
+    const headers = new Headers(base ?? undefined);
+    headers.set("cookie", cookie);
+    const result = await Promise.resolve(hook({ headers, method, url } as unknown as Request));
+    if (result) applyActorFromHookAndUa(result, headers.get("user-agent"));
+  } catch (error) {
+    logger.debug(`actorFromRequest hook (after the handler) failed: ${describeError(error)}`);
+  }
+}
+
+/** `name=value` pairs a response sets; a cookie being cleared (Max-Age=0 / expired) reads "". */
+function cookiesSetBy(setCookies: readonly string[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  for (const line of setCookies) {
+    const [pair = "", ...attrs] = line.split(";");
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    const cleared = attrs.some((a) => {
+      const [k = "", v = ""] = a.trim().split("=");
+      const key = k.toLowerCase();
+      if (key === "max-age") return Number(v) <= 0;
+      if (key === "expires") return Date.parse(v) <= Date.now();
+      return false;
+    });
+    out.push([pair.slice(0, eq).trim(), cleared ? "" : pair.slice(eq + 1).trim()]);
+  }
+  return out;
+}
+
+/** Set-Cookie lines of a fetch Response (one entry per cookie). */
+function setCookieLines(headers: Headers | null | undefined): string[] {
+  if (!headers) return [];
+  const getAll = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+  if (typeof getAll === "function") return getAll.call(headers);
+  const joined = headers.get("set-cookie");
+  return joined ? joined.split(/,(?=\s*[^;,=\s]+=)/) : [];
+}
+
 function applyActorFromHookAndUa(hookResult: unknown, userAgent: string | null): void {
   const uaMatch = classifyUserAgent(userAgent);
 

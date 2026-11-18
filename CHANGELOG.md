@@ -3,6 +3,23 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.9] — 2026-11-19
+
+### Added
+- **A sign-in names who signed in.** `actorFromRequest` runs before the
+  handler, when the session cookie does not exist yet, so a sign-in read
+  "Signed in" by nobody. When the hook found nobody, the request changes
+  something (not GET/HEAD) and the handler set cookies, the agent now runs the
+  hook once more with the request's cookies plus those (route handlers: the
+  response's `Set-Cookie`; Pages API routes: `res.setHeader("set-cookie")`;
+  Server Actions: Next's `cookies()` store). A cleared cookie counts as gone,
+  so a sign-out still reads nobody. It never replaces an actor already found,
+  and a hook that answers nothing (or throws) leaves the request as it was.
+  A hand-written hook that reads `request.headers.get("cookie")` gets this on
+  every path; the Auth.js / NextAuth / Clerk presets read Next's own cookies, so
+  they get it for a sign-in done in a Server Action. Rails needed no change: the
+  gem asks for the actor after the request.
+
 ## [0.4.8] — 2026-11-18
 
 ### Fixed
