@@ -3,6 +3,13 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.10] — 2026-11-20
+
+### Changed
+- **npm search keywords.** `package.json` now lists keywords (activity-log,
+  audit-log, nextjs, prisma, bullmq, ai-agents, mcp, …) so the package shows up
+  when people search npm for them. No code change.
+
 ## [0.4.9] — 2026-11-19
 
 ### Added
