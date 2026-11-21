@@ -140,6 +140,14 @@ export interface InitOptions {
   /** Patch globalThis.fetch to inject X-Correlation-ID. Default true. */
   patchGlobalFetch?: boolean;
   /**
+   * Record calls to outside services (Stripe, Resend, OpenAI, ...) as steps of the action that
+   * made them: host's domain, method, path pattern, status, time. Never a body, query or header.
+   * Default true.
+   */
+  captureOutbound?: boolean;
+  /** Hosts never recorded as outside calls, with their subdomains. Default []. */
+  excludedHosts?: string[];
+  /**
    * Suppress the "serverUrl is not HTTPS" warning when intentionally
    * pointing the agent at a non-HTTPS endpoint (a local relay, a
    * staging proxy on a private network, …). HTTPS is otherwise
@@ -356,6 +364,8 @@ export class Configuration {
   retryAttempts = 3;
   logLevel: LogLevel = "warn";
   patchGlobalFetch = true;
+  captureOutbound = true;
+  excludedHosts: string[] = [];
   actorFromSupabase = true;
   allowInsecureTransport = false;
 
@@ -416,6 +426,8 @@ export class Configuration {
     if (options.patchGlobalFetch !== undefined) {
       this.patchGlobalFetch = options.patchGlobalFetch;
     }
+    if (options.captureOutbound !== undefined) this.captureOutbound = options.captureOutbound;
+    if (options.excludedHosts) this.excludedHosts = [...options.excludedHosts];
     if (options.allowInsecureTransport !== undefined) {
       this.allowInsecureTransport = options.allowInsecureTransport;
     }

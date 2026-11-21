@@ -20,7 +20,8 @@
 export type SourceType =
   | "http_request"
   | "background_job"
-  | "database_callback";
+  | "database_callback"
+  | "outbound_call";
 
 export type Outcome = "success" | "failure";
 
@@ -66,6 +67,7 @@ const VALID_SOURCE_TYPES: readonly string[] = [
   "http_request",
   "background_job",
   "database_callback",
+  "outbound_call",
 ];
 
 const VALID_OUTCOMES: readonly string[] = ["success", "failure"];

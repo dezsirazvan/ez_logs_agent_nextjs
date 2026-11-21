@@ -19,7 +19,9 @@
 //   - It's reversible via `unpatchGlobalFetch()` (used in tests).
 
 import { current as currentCorrelation } from "../correlation.js";
+import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
+import { channelsRecordCalls, correlationForCall, now, recordCall } from "./outbound-capture.js";
 import { loadNodeBuiltin } from "../node-builtin.js";
 
 const HEADER = "x-correlation-id";
@@ -37,14 +39,20 @@ export function patchGlobalFetch(): void {
     const id = currentCorrelation();
     if (!id) return originalFetch!.call(globalThis, input, init);
 
+    // Where Node's channels don't record calls (Edge), the call is measured here, around the
+    // promise the app already awaits: nothing is added to its wait (http/outbound-capture.ts).
+    const measure = channelsRecordCalls() ? null : startMeasure(input, init);
+    let enriched: { input: Parameters<typeof fetch>[0]; init: Parameters<typeof fetch>[1] } = { input, init };
     try {
-      const enriched = injectHeader(input, init, id);
-      return originalFetch!.call(globalThis, enriched.input, enriched.init);
+      // Never the agent's own POST to EZLogs: on serverless its flush runs inside the request.
+      if (!toEzlogsServer(input)) enriched = injectHeader(input, init, id);
     } catch (error) {
       // Never break a host fetch call — log and pass through unchanged.
       logger.debug(`outgoing-fetch injection failed: ${describeError(error)}`);
-      return originalFetch!.call(globalThis, input, init);
     }
+    // Called once, outside the try: a fetch that throws must never be sent a second time.
+    const call = originalFetch!.call(globalThis, enriched.input, enriched.init);
+    return measure ? measure(call) : call;
   };
 
   globalThis.fetch = wrapped;
@@ -76,10 +84,11 @@ interface UndiciRequestLike {
 
 function onUndiciRequest(message: unknown): void {
   try {
-    const request = (message as { request?: UndiciRequestLike } | null)?.request;
+    const request = (message as { request?: UndiciRequestLike & { origin?: unknown } } | null)?.request;
     if (!request || typeof request.addHeader !== "function") return;
     const id = currentCorrelation();
     if (!id || hasCorrelationHeader(request.headers)) return;
+    if (sameOrigin(String(request.origin ?? ""), configuration().serverUrl)) return;
     request.addHeader(HEADER, id);
   } catch (error) {
     logger.debug(`outgoing request header injection failed: ${describeError(error)}`);
@@ -160,6 +169,65 @@ function injectHeader(
     input,
     init: { ...init, headers },
   };
+}
+
+// ---------------------------------------------------------------- Edge measuring and self-skip
+
+function urlOf(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return (input as Request).url;
+}
+
+function methodOf(input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]): string {
+  return (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+}
+
+function sameOrigin(a: string, b: string | null): boolean {
+  if (!b) return false;
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+// A prefix check first, so an ordinary call parses no URL here.
+function toEzlogsServer(input: Parameters<typeof fetch>[0]): boolean {
+  try {
+    const server = configuration().serverUrl;
+    if (!server) return false;
+    const url = urlOf(input);
+    return url.startsWith(server.replace(/\/+$/, "")) && sameOrigin(url, server);
+  } catch {
+    return false;
+  }
+}
+
+function startMeasure(
+  input: Parameters<typeof fetch>[0],
+  init: Parameters<typeof fetch>[1],
+): ((call: Promise<Response>) => Promise<Response>) | null {
+  try {
+    const url = urlOf(input);
+    const id = correlationForCall(new URL(url).origin);
+    if (!id) return null;
+    const started = now();
+    const method = methodOf(input, init);
+    return (call) =>
+      call.then(
+        (response) => {
+          recordCall(id, started, url, method, response.status, null);
+          return response;
+        },
+        (error: unknown) => {
+          recordCall(id, started, url, method, 0, (error as { name?: string } | null)?.name ?? "Error");
+          throw error;
+        },
+      );
+  } catch {
+    return null;
+  }
 }
 
 function describeError(error: unknown): string {

@@ -59,8 +59,19 @@ export function drainEvents(): Event[] {
     const queue = getQueue();
     if (queue.length === 0) return [];
     // splice(0) is the standard pattern for atomic drain-and-clear:
-    // returns the previous contents and empties.
-    return queue.splice(0, queue.length);
+    // returns the previous contents and empties. A measured outside call
+    // becomes its event here, off the app's call (http/outbound-capture.ts).
+    const drained: Event[] = [];
+    for (const item of queue.splice(0, queue.length)) {
+      const pending = item as unknown as { toEvent?: () => Event | null };
+      if (typeof pending.toEvent === "function") {
+        const event = pending.toEvent();
+        if (event) drained.push(event);
+      } else {
+        drained.push(item);
+      }
+    }
+    return drained;
   } catch (error) {
     logger.error(`drainEvents failed: ${describe(error)}`);
     return [];

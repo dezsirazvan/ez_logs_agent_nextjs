@@ -3,6 +3,20 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.11] — 2026-11-21
+
+### Added
+- **Calls to outside services show up.** A call your app makes to another service (`fetch`, and on Node the `http`/`https` modules that stripe-node, axios and many SDKs use) is recorded as a step of the action that made it, read by EZLogs as "Created a charge at stripe.com" or "Called slack.com". A failed one ("…, but the call to slack.com failed") makes the action partly failed and gives its reason.
+  - Sent: the host's domain, method, the path as a pattern (API versions and the first segment when it names a collection; everything else `:id`), status and time. Never a body, a query string, a header, an IP address or an internal host name.
+  - Not recorded: calls outside an action, to EZLogs itself, the agent's own calls, your app's own Supabase project (`SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_URL`, or any client the agent wraps) and Upstash Redis (`UPSTASH_REDIS_REST_URL` / `KV_REST_API_URL`), whose writes already show as data changes. At most 50 calls per action.
+  - New options: `captureOutbound` (default `true`) and `excludedHosts` (default `[]`).
+  - Never slows or changes the call: on Node it listens on Node's own diagnostics channels (nothing is wrapped or awaited; the event is built later, when the buffer drains). On Edge the existing `fetch` wrapper measures around the promise the app already awaits. On Node 20 an `http`/`https` call that got no answer is not recorded (Node 20 has no channel for it; `fetch` is).
+- Needs the EZLogs server from 2026-11-21, which accepts `outbound_call` events.
+
+### Fixed
+- The agent's own posts to EZLogs no longer carry `x-correlation-id`: on serverless the flush runs inside the request.
+- The `fetch` wrapper calls the original `fetch` once, even when it throws synchronously (it used to retry it unstamped).
+
 ## [0.4.10] — 2026-11-20
 
 ### Changed

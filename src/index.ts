@@ -10,6 +10,7 @@
  * runs the pipeline.
  */
 
+import { installOutboundCapture, uninstallOutboundCapture } from "./http/outbound-capture.js";
 import {
   configuration,
   type DatabaseReader,
@@ -123,6 +124,7 @@ export const ezlogs = {
 
     flushScheduler.start();
     if (config.patchGlobalFetch) patchGlobalFetch();
+    if (config.captureOutbound) installOutboundCapture();
 
     // Auto-wire the trigger path. Detection cascade:
     //   1. `options.databaseUrl` (explicit)
@@ -181,6 +183,7 @@ export const ezlogs = {
     if (!initialized) return;
     await flushScheduler.stop();
     unpatchGlobalFetch();
+    uninstallOutboundCapture();
     initialized = false;
   },
 };

@@ -29,6 +29,7 @@
 // before/after for updates. We populate `to:` from the user-passed
 // values and leave `from: null`. Same gap as Prisma.
 
+import { addOwnDataStore, runInternal } from "../http/outbound-capture.js";
 import { logger } from "../logger.js";
 import { instrumentFactory, instrumentFrom } from "../instrument.js";
 import { currentActorSource } from "../actor.js";
@@ -135,6 +136,9 @@ export function wrapSupabase<T>(client: T): T {
   };
   if (obj.__ezlogsWrapped) return client;
   if (typeof obj.from !== "function") return client;
+  // Its calls are the app's own data store, never outside calls (whatever setting built it).
+  const located = obj as unknown as { supabaseUrl?: unknown; rest?: { url?: unknown } };
+  addOwnDataStore(located.supabaseUrl ?? located.rest?.url);
 
   const originalFrom = obj.from.bind(obj) as (
     table: string,
@@ -149,7 +153,12 @@ export function wrapSupabase<T>(client: T): T {
   // SAME client (with auth cookies and RLS context) so the pre-read
   // sees what the user's session is allowed to see. Failures fall back
   // to "after-only" diffs.
-  const prereadRow = async (
+  // The agent's own read: never recorded as the app's outside call.
+  const prereadRow = (
+    table: string,
+    filters: ReadonlyArray<{ column: string; value: unknown }>,
+  ): Promise<Record<string, unknown> | null> => runInternal(() => prereadRowNow(table, filters));
+  const prereadRowNow = async (
     table: string,
     filters: ReadonlyArray<{ column: string; value: unknown }>,
   ): Promise<Record<string, unknown> | null> => {

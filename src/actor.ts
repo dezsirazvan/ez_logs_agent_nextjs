@@ -97,7 +97,9 @@ export async function maybeExtractSupabaseActor(): Promise<void> {
   try {
     // Lazy import so non-Supabase apps don't pay the cost.
     const mod = await import("./db/supabase.js");
-    const actor = await mod.tryExtractSupabaseActor();
+    // The agent's own call: never recorded as the app's outside call.
+    const { runInternal } = await import("./http/outbound-capture.js");
+    const actor = await runInternal(() => mod.tryExtractSupabaseActor());
     if (slot) slot.tried = true;
     if (actor) setActor(actor);
   } catch (error) {
