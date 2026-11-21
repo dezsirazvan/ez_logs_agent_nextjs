@@ -26,9 +26,25 @@ import { pushEvent } from "../pipeline/buffer.js";
 
 const MAX_PER_ACTION = 50;
 const MAX_SEGMENTS = 8;
-const WORD = /^[a-z][a-z_]{0,19}$/;
-const PLURAL = /[a-z]s$/;
-const NOT_PLURAL = /(?:ss|us|is)$/;
+// The first word after the version is kept only when it is one of these common API collections
+// ("/v1/charges" → "Created a charge"). Any other word becomes :id, even one that looks plural:
+// "charles" or "james" could be a person. Identical to the server's and ez_logs_agent's lists.
+const COLLECTIONS = new Set([
+  "accounts", "activities", "addresses", "agents", "alerts", "apps", "assets", "assistants",
+  "attachments", "audiences", "balances", "batches", "bookings", "calendars", "calls",
+  "campaigns", "cards", "carts", "categories", "channels", "charges", "chats", "checkouts",
+  "comments", "companies", "completions", "contacts", "conversations", "coupons", "credits",
+  "customers", "deals", "deployments", "devices", "discounts", "disputes", "documents", "domains",
+  "emails", "embeddings", "events", "files", "forms", "groups", "images", "invoices", "issues",
+  "items", "jobs", "leads", "links", "lists", "locations", "logs", "meetings", "members",
+  "messages", "metrics", "models", "notes", "notifications", "orders", "organizations", "pages",
+  "payment_intents", "payment_methods", "payments", "payouts", "people", "plans", "posts", "prices", "products", "profiles", "projects",
+  "prompts", "queries", "records", "refunds", "reports", "requests", "responses", "reviews",
+  "rooms", "runs", "sessions", "shipments", "sites", "sources", "spaces", "subscribers",
+  "subscriptions", "tasks", "teams", "templates", "threads", "tickets", "tokens", "transactions",
+  "transcriptions", "transfers", "translations", "uploads", "users", "videos", "webhooks",
+  "workspaces",
+]);
 const VERSION = /^v\d{1,2}$/;
 const SECOND_LEVEL = new Set(["co", "com", "net", "org", "gov", "ac", "edu", "ne", "or"]);
 const PRIVATE_SUFFIXES = new Set(["local", "internal", "localhost", "lan", "home", "intranet", "corp", "test", "example", "invalid"]);
@@ -260,15 +276,15 @@ function buildCallEvent(pending: PendingCall): Event | null {
 
 /**
  * The server's rule: API versions, and the first segment after them only when it is a
- * collection ("/v1/customers/cus_9x/orders" → "/v1/customers/:id/:id"). Nothing after it is kept:
- * grammar can't tell a name ("charles") from a collection ("charges").
+ * known collection ("/v1/customers/cus_9x/orders" → "/v1/customers/:id/:id"). Nothing after it is
+ * kept, and no unknown word: grammar can't tell a name ("charles") from a collection ("charges").
  */
 export function pathPattern(path: string): string {
   const segments = path.split(/[?#]/, 1)[0]!.split("/").filter(Boolean).slice(0, MAX_SEGMENTS);
   let first = true;
   const kept = segments.map((segment) => {
     if (first && VERSION.test(segment)) return segment;
-    const keep = first && WORD.test(segment) && PLURAL.test(segment) && !NOT_PLURAL.test(segment);
+    const keep = first && COLLECTIONS.has(segment);
     first = false;
     return keep ? segment : ":id";
   });
