@@ -24,6 +24,7 @@ import { logger } from "../logger.js";
 import { instrumentClass, instrumentFrom } from "../instrument.js";
 import { current as currentCorrelation } from "../correlation.js";
 import type { ActorContext } from "../actor.js";
+import { describeEventError } from "../http/source-data.js";
 import {
   emitJobEvent,
   extractCorrelationFromPayload,
@@ -249,7 +250,7 @@ export function wrapBullWorker<T extends BullWorkerLike>(worker: T): T {
 let warnedNoProcessor = false;
 
 function describeFailure(error: Error | undefined): string {
-  return error ? `${error.name ?? "Error"}: ${error.message ?? String(error)}` : "Error: job failed";
+  return error ? describeEventError(error.name ?? "Error", error.message ?? String(error)) : "Error: job failed";
 }
 
 // BullMQ moves the job (delayed, waiting for children, rate-limited)

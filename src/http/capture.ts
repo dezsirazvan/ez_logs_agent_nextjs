@@ -868,8 +868,8 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
               const controlStatus = nextControlFlowStatus(e) ?? 200;
               await record({
                 actionName,
-                // redirect() is a success; notFound() / forbidden()
-                // keep their 4xx.
+                // redirect() is a success unless its target says `?error=`;
+                // notFound() / forbidden() keep their 4xx.
                 statusCode: controlStatus >= 400 ? controlStatus : 200,
                 exception: null,
                 durationMs: Date.now() - startMs,
@@ -1430,16 +1430,22 @@ async function emitServerActionEvent(input: {
       contentType: null,
       excludedVariableKeys: configuration().excludedGraphqlVariableKeys,
     });
+    let redirectError: string | null = null;
     if (input.redirectTo) {
       const host = (await readNextHeader("x-forwarded-host")) ?? (await readNextHeader("host"));
-      const redirectTo = redirectPath(input.redirectTo, host?.split(",")[0]?.trim() ?? null);
+      const requestHost = host?.split(",")[0]?.trim() ?? null;
+      const redirectTo = redirectPath(input.redirectTo, requestHost);
       if (redirectTo) sourceData.redirect_to = redirectTo;
+      // A same-origin redirect to `?error=<code>` is the action refusing the work.
+      redirectError = redirectErrorReason(input.redirectTo, requestHost);
+      if (redirectError) sourceData.status_code = 302;
     }
 
     const { outcome, error_message } = determineOutcome(
       input.statusCode,
       input.exception,
       null,
+      redirectError,
     );
 
     const event = buildEvent({
@@ -2585,19 +2591,31 @@ const MAX_ERROR_BODY_LENGTH = 16_384;
  * there is none or the body isn't small JSON.
  */
 /**
- * Auth.js / NextAuth answer a failed sign-in with a redirect whose target
- * carries the reason (`/login?error=CredentialsSignin`). On an auth route
- * that redirect is the failure; anywhere else a redirect stays a success.
+ * A redirect whose target carries `?error=` is a refusal (Auth.js answers a
+ * failed sign-in with `/login?error=CredentialsSignin`; apps redirect to
+ * `/?error=seats`). Only the key `error` counts; the value is sent only when
+ * it is a short code word, never the query or the URL.
  */
-function authRedirectError(url: URL, status: number | null | undefined, location: unknown): string | null {
+function redirectErrorReason(location: unknown, requestHost: string | null): string | null {
   try {
-    if (typeof status !== "number" || status < 300 || status >= 400 || !isAuthPath(url.pathname)) return null;
     if (typeof location !== "string" || !location) return null;
-    const reason = new URL(location, url).searchParams.get("error");
-    return reason ? capErrorText(reason) : null;
+    const url = new URL(location, "http://ezlogs.internal");
+    // Only a same-origin target: a bounce to another site (OAuth) is not a refusal.
+    const absolute = /^[a-z][a-z0-9+.-]*:/i.test(location) || location.startsWith("//");
+    if (absolute && (!requestHost || url.host.toLowerCase() !== requestHost.toLowerCase())) return null;
+    const reason = url.searchParams.get("error");
+    if (!reason) return null;
+    // A code word or a short plain phrase ("CredentialsSignin", "Invalid credentials"); anything else
+    // (an email, a URL, punctuation) is never sent.
+    return /^[A-Za-z0-9_-][A-Za-z0-9 _-]{0,39}$/.test(reason) && !/\s$/.test(reason) ? reason : "Redirected with an error";
   } catch {
     return null;
   }
+}
+
+function authRedirectError(url: URL, status: number | null | undefined, location: unknown): string | null {
+  if (typeof status !== "number" || status < 300 || status >= 400) return null;
+  return redirectErrorReason(location, url.host);
 }
 
 async function readResponseErrorMessage(response: Response, trpcRoute = false): Promise<string | null> {

@@ -28,6 +28,7 @@ import {
 } from "../correlation.js";
 import { configuration } from "../configuration.js";
 import { sanitizeArgs } from "../http/sanitize.js";
+import { describeEventError } from "../http/source-data.js";
 import { flushAuditLog } from "../triggers/reader.js";
 import {
   getCurrentActor,
@@ -201,7 +202,7 @@ export async function runJobWithCapture<T>(
     } catch (error) {
       const message =
         error instanceof Error
-          ? `${error.name}: ${error.message}`
+          ? describeEventError(error.name, error.message)
           : String(error);
       await flushJobAuditLog(startedAt);
       if (meta.isControlFlow?.(error)) throw error;

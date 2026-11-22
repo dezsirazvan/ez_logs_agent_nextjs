@@ -3,6 +3,12 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.14] — 2026-11-22
+
+### Fixed
+- **A refused Server Action that redirects with an error is a failure.** `redirect("/login?error=CredentialsSignin")` or `redirect("/?error=seats")` was recorded as a success. A same-origin redirect (Server Action, route handler or Pages API route, on any path; a bounce to another site such as an OAuth provider is left alone) whose target carries the query key `error` is now a failure with status 302; the value is sent only when it is a short code word or plain phrase (letters, digits, spaces, `_`, `-`, up to 40: "CredentialsSignin", "Invalid credentials"), otherwise a fixed text ("Redirected with an error"). `redirect_to` stays the bare path; no other query parameter is sent.
+- **Our own context SQL is never the failure reason.** An error message (request, Server Action or job failure) that contains our `set_config('ezlogs.…')` call is reduced to the error class name. What the app sees is unchanged.
+
 ## [0.4.13] — 2026-11-21
 
 ### Added

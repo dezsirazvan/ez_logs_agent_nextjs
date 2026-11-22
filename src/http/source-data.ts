@@ -293,6 +293,13 @@ function compact(obj: Record<string, unknown>): Record<string, unknown> {
  * errors > success. A 4xx/5xx carries the response body's own error
  * text when the handler returned one (`responseError`), else "HTTP n".
  */
+const OWN_CONTEXT_SQL = /set_config\(\s*['"]ezlogs\./i;
+
+/** `Name: message` for an event, or only `Name` when the message holds our own context SQL. */
+export function describeEventError(name: string, message: string): string {
+  return OWN_CONTEXT_SQL.test(message) ? name : `${name}: ${message}`;
+}
+
 export function determineOutcome(
   statusCode: number | null,
   exception: Error | null,
@@ -307,6 +314,8 @@ export function determineOutcome(
     const message = Array.isArray(issues)
       ? capErrorText(specificErrorMessage({ issues }) ?? "Validation failed")
       : exception.message;
+    // Our own context-stamping SQL is never the reason an app's call failed.
+    if (OWN_CONTEXT_SQL.test(message)) return { outcome: "failure", error_message: exception.name };
     return {
       outcome: "failure",
       error_message: `${exception.name}: ${message}`,

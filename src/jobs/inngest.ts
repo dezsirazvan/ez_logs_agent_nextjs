@@ -41,6 +41,7 @@ import {
 import { createScopedStorage } from "../edge-fallback.js";
 import { runWithActorScope } from "../actor.js";
 import { markJobDelivery } from "../job-delivery.js";
+import { describeEventError } from "../http/source-data.js";
 import {
   current as currentCorrelation,
   endCorrelationScope,
@@ -386,11 +387,11 @@ function functionId(fn: InngestRunContext["fn"]): string | null {
 
 function formatError(error: unknown): string {
   if (error instanceof Error) {
-    return `${error.name ?? "Error"}: ${error.message ?? String(error)}`;
+    return describeEventError(error.name ?? "Error", error.message ?? String(error));
   }
   if (typeof error === "object" && error !== null) {
     const err = error as { name?: string; message?: string };
-    return `${err.name ?? "Error"}: ${err.message ?? JSON.stringify(error)}`;
+    return describeEventError(err.name ?? "Error", err.message ?? JSON.stringify(error));
   }
   return String(error);
 }
