@@ -274,21 +274,41 @@ function buildCallEvent(pending: PendingCall): Event | null {
   }
 }
 
+// Generic API vocabulary, kept by REST structure (deny by default): a verb only as the last segment;
+// a noun, like a collection, only first (after the version), after an id, or after a kept noun. Right
+// after a collection comes an id's place, where a name could be. Identical to the server's lists.
+const API_VERBS = new Set([
+  "approve", "archive", "authorize", "cancel", "capture", "complete", "confirm", "create", "delete", "download",
+  "exchange", "export", "finalize", "get", "import", "invalidate", "list", "lookup", "pay", "refresh",
+  "refund", "reject", "remove", "resend", "restore", "retrieve", "reverse", "search", "send", "start",
+  "stop", "sync", "update", "upload", "validate", "verify", "void",
+]);
+const API_NOUNS = new Set(["auth", "balance", "chat", "checkout", "item", "link", "token"]);
+
 /**
  * The server's rule: API versions, and the first segment after them only when it is a
  * known collection ("/v1/customers/cus_9x/orders" → "/v1/customers/:id/:id"). Nothing after it is
  * kept, and no unknown word: grammar can't tell a name ("charles") from a collection ("charges").
  */
 export function pathPattern(path: string): string {
-  const segments = path.split(/[?#]/, 1)[0]!.split("/").filter(Boolean).slice(0, MAX_SEGMENTS);
-  let first = true;
-  const kept = segments.map((segment) => {
-    if (first && VERSION.test(segment)) return segment;
-    const keep = first && COLLECTIONS.has(segment);
-    first = false;
-    return keep ? segment : ":id";
+  const all = path.split(/[?#]/, 1)[0]!.split("/").filter(Boolean);
+  const kept: string[] = [];
+  all.slice(0, MAX_SEGMENTS).forEach((segment, i) => {
+    kept.push(keepSegment(segment, i, all.length, kept) ? segment : ":id");
   });
   return `/${kept.join("/")}`;
+}
+
+// The server's keep_segment?: a version first; a collection or API noun where a collection sits;
+// an API verb only as the very last segment, after an id that follows a kept collection or noun or after a kept noun.
+function keepSegment(segment: string, index: number, total: number, kept: string[]): boolean {
+  if (index === 0 && VERSION.test(segment)) return true;
+  const previous = kept[kept.length - 1];
+  const idSlot = previous === ":id" && kept.length >= 2 && kept[kept.length - 2] !== ":id" && !VERSION.test(kept[kept.length - 2]!);
+  const afterNoun = previous !== undefined && API_NOUNS.has(previous);
+  if (API_VERBS.has(segment)) return index === total - 1 && (idSlot || afterNoun);
+  if (!COLLECTIONS.has(segment) && !API_NOUNS.has(segment)) return false;
+  return previous === undefined || VERSION.test(previous) || idSlot || afterNoun;
 }
 
 /**
