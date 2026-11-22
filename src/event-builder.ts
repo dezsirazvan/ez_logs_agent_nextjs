@@ -84,8 +84,10 @@ export function build(input: BuildInput): Event {
 
   validateOutcomeErrorConsistency(outcome, error_message);
 
-  const source_data = sanitizeRecord(source_data_raw);
-  const context = context_raw === null ? null : sanitizeRecord(context_raw);
+  // Sanitized, then long strings cut (a long text column, a raw body): one event can never make a
+  // post too large to send.
+  const source_data = capStrings(sanitizeRecord(source_data_raw)) as Record<string, unknown>;
+  const context = context_raw === null ? null : (capStrings(sanitizeRecord(context_raw)) as Record<string, unknown>);
   const correlation_id = input.correlation_id ?? null;
 
   // Top-level key order matters — this is the wire format. See file header.
@@ -101,6 +103,21 @@ export function build(input: BuildInput): Event {
     error_message,
   };
   return event;
+}
+
+const MAX_STRING = 4_096;
+
+/** Strings over 4 KB keep their start and say how long they were (same rule as the Rails agent). */
+export function capStrings(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}… [${value.length} characters]` : value;
+  }
+  if (depth > 8 || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((v) => capStrings(v, depth + 1));
+  if (value instanceof Date) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = capStrings(v, depth + 1);
+  return out;
 }
 
 function validateSourceType(value: unknown): SourceType {

@@ -69,6 +69,8 @@ interface CorrelationScope {
   id: string;
   /** Epoch ms after which the scope no longer links anything. */
   expiresAt: number;
+  /** A Drizzle transaction's state on this request (src/db/drizzle.ts). */
+  drizzleTx?: unknown;
 }
 const storage = createScopedStorage<CorrelationScope>(
   Symbol.for("ezlogs-nextjs:correlation-storage"),
@@ -255,6 +257,11 @@ function fnv1aHex(input: string): string {
 export function current(): string | null {
   const scope = storage.read();
   return scope && Date.now() <= scope.expiresAt ? scope.id : null;
+}
+
+/** The current request scope (mutable), for per-request state such as an open transaction. */
+export function currentScope(): CorrelationScope | null {
+  return storage.read();
 }
 
 /**

@@ -93,6 +93,11 @@ export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "cardnumber",
   "cvv",
   "cvc",
+  "verification_code",
+  "recovery_code",
+  "backup_code",
+  "one_time_code",
+  "login_code",
 ]);
 
 export interface DbAttributeChange {

@@ -61,9 +61,15 @@ export const SENSITIVE_VARIABLE_PATTERNS: readonly string[] = Object.freeze([
   "digest",
   "signature",
   "hmac",
-  // 0.2.0 additions (not yet in the Rails gem's list).
+  // 0.2.0 additions (in the Rails gem's list since 0.2.11).
   "passcode",
   "cardnumber",
+  // One-time and recovery codes (0.4.13; every list).
+  "verification_code",
+  "recovery_code",
+  "backup_code",
+  "one_time_code",
+  "login_code",
 ]);
 
 /**
@@ -85,6 +91,7 @@ export const SENSITIVE_WORD_PATTERNS: readonly string[] = Object.freeze([
   "iban",
   "mfa",
   "passphrase",
+  "jti",
 ]);
 
 /** `mdmUnlockPin` → `mdm_unlock_pin`, `apiKey` → `api_key`. */

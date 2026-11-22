@@ -28,7 +28,99 @@
 //   })
 
 import { logger } from "../logger.js";
+import { currentScope } from "../correlation.js";
 import { emitDbEvent, type DbOperation } from "./shared.js";
+
+type DbEventInput = Parameters<typeof emitDbEvent>[0];
+
+/**
+ * Drizzle runs a transaction's `begin`, `commit`, `rollback` and savepoints
+ * through the logger too: a write inside a transaction waits for its commit (or
+ * its savepoint's release) and is dropped on rollback, so a rolled-back write
+ * never reads as done. Kept on the request's own scope (the logger is shared by
+ * every request). Without a request scope (a script), writes are sent at once.
+ */
+function transactionStep(query: string): "begin" | "commit" | "rollback" | "savepoint" | "release" | "rollback_to" | null {
+  const q = query.trim().toLowerCase();
+  if (/^(begin|start transaction)\b/.test(q)) return "begin";
+  if (/^(commit|end)\b/.test(q)) return "commit";
+  if (/^rollback\s+to\b/.test(q)) return "rollback_to";
+  if (/^rollback\b/.test(q)) return "rollback";
+  if (/^release\b/.test(q)) return "release";
+  if (/^savepoint\b/.test(q)) return "savepoint";
+  return null;
+}
+
+// Per request: the open transaction's frames (one per savepoint level), how many transactions are
+// open, and whether two overlap. The logger can't tell connections apart, so with two transactions
+// open at once (Promise.all of db.transaction) nothing is held: writes go out at once, never dropped.
+interface TxState {
+  frames: DbEventInput[][];
+  open: number;
+  ambiguous: boolean;
+}
+
+function txState(): TxState | null {
+  const scope = currentScope();
+  if (!scope) return null;
+  return ((scope.drizzleTx as unknown as TxState | undefined) ??= { frames: [], open: 0, ambiguous: false }) as TxState;
+}
+
+function onTransactionStep(step: NonNullable<ReturnType<typeof transactionStep>>): void {
+  const state = txState();
+  if (!state) return;
+  const frames = state.frames;
+  if (step === "begin") {
+    state.open += 1;
+    if (state.open > 1) {
+      state.ambiguous = true;
+      const held = frames.flat();
+      frames.length = 0;
+      for (const input of held) emitDbEvent(input);
+    } else {
+      frames.length = 0;
+      frames.push([]);
+    }
+    return;
+  }
+  if (step === "commit" || step === "rollback") {
+    state.open = Math.max(0, state.open - 1);
+    if (state.ambiguous) {
+      if (state.open === 0) state.ambiguous = false;
+      return;
+    }
+  } else if (state.ambiguous) {
+    return; // savepoints of overlapping transactions: nothing is held
+  }
+  switch (step) {
+    case "savepoint":
+      if (frames.length > 0) frames.push([]);
+      break;
+    case "release": {
+      const top = frames.length > 1 ? frames.pop()! : null;
+      if (top) frames[frames.length - 1]!.push(...top);
+      break;
+    }
+    case "rollback_to":
+      if (frames.length > 1) frames.pop();
+      break;
+    case "rollback":
+      frames.length = 0;
+      break;
+    case "commit": {
+      const writes = frames.flat();
+      frames.length = 0;
+      for (const input of writes) emitDbEvent(input);
+      break;
+    }
+  }
+}
+
+function emitOrHold(input: DbEventInput): void {
+  const state = currentScope() ? txState() : null;
+  if (state && !state.ambiguous && state.frames.length > 0) state.frames[state.frames.length - 1]!.push(input);
+  else emitDbEvent(input);
+}
 
 interface DrizzleLogger {
   logQuery(query: string, params: unknown[]): void;
@@ -43,7 +135,9 @@ export function ezlogsDrizzleLogger(options: Options = {}): DrizzleLogger {
   return {
     logQuery(query: string, params: unknown[]): void {
       try {
-        const parsed = parseMutation(query);
+        const step = transactionStep(query);
+        if (step) onTransactionStep(step);
+        const parsed = step ? null : parseMutation(query);
         if (parsed) {
           // Phase 4: try to extract resource_id from a simple
           // `WHERE id = $N` shape. Only fires when the WHERE clause
@@ -63,7 +157,7 @@ export function ezlogsDrizzleLogger(options: Options = {}): DrizzleLogger {
               ? extractSetChangesFromUpdate(query, params)
               : null;
 
-          emitDbEvent({
+          emitOrHold({
             modelClass: parsed.table,
             operation: parsed.operation,
             resourceId,

@@ -74,6 +74,13 @@ export async function register() {
 }
 ```
 
+**Pages that crash.** Add one line to the same file, so a page or layout that
+fails while rendering reads as a failure (0.4.13 and later):
+
+```ts
+export { onRequestError } from "ezlogs-nextjs";
+```
+
 `serverUrl` is optional: it defaults to `process.env.EZLOGS_SERVER_URL`
 if set, otherwise `https://app.ezlogs.io`. Set it only if you self-host.
 
@@ -216,7 +223,7 @@ request and person that made the change. Pick your stack:
 | **Prisma** on Postgres | [Triggers](#triggers) + [Prisma extension](#prisma) |
 | **postgres.js**, or **Drizzle** on postgres-js | [Triggers](#triggers) + [wrap `sql`](#postgresjs) |
 | Neon HTTP, scripts | [Triggers](#triggers) (writes show up as their own actions, not linked to the request) |
-| MySQL, SQLite, PlanetScale, no trigger access | A per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)). New values only, no before-values |
+| MySQL, SQLite, PlanetScale, no trigger access | A per-ORM adapter: `ezlogsPrisma()`, `ezlogsDrizzleLogger`, `wrapSupabase` ([docs/database.md](./docs/database.md)). New values only, no before-values. Drizzle sends a transaction's writes only once it commits; Prisma's extension can't see a `$transaction` end, so a write inside one that later rolls back still shows (the database triggers never do) |
 
 #### Triggers
 

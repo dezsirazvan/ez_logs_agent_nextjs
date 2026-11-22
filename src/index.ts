@@ -56,6 +56,7 @@ export {
   __ezlogs_run_inline_server_action,
   withMiddlewareCapture,
   captureHttpEvent,
+  onRequestError,
 } from "./http/capture.js";
 
 let initialized = false;

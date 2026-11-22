@@ -358,6 +358,11 @@ export function withMiddlewareCapture<
           try {
             if (response?.headers && typeof response.headers.set === "function") {
               response.headers.set(CORRELATION_HEADER, correlationId);
+              // Only for a page load (never a client-side router request), where no router headers
+              // are in play: the page's render, its writes and a crash share the id.
+              if (shouldEmitPageNavigation(request)) {
+                forwardCorrelationToRoute(request.headers, response.headers, correlationId);
+              }
             }
           } catch {
             // ignore — never break the host's middleware return value
@@ -477,6 +482,92 @@ const ROUTER_FETCH_HEADERS = [
   "x-middleware-prefetch",
   "x-nextjs-data",
 ] as const;
+
+/**
+ * Next.js forwards a middleware's change to the request headers only through
+ * its override headers (what `NextResponse.next({ request: { headers } })`
+ * sets): setting a header on the middleware's request object alone never
+ * reaches the page or route. So the page's render, its writes and a crash
+ * (onRequestError) share the middleware's correlation id. Only for a response
+ * that continues to the app (next or rewrite). An override list the app set
+ * itself is kept, with our header added; otherwise every request header is
+ * passed on unchanged, as Next.js does.
+ */
+function forwardCorrelationToRoute(requestHeaders: Headers, responseHeaders: Headers, correlationId: string): void {
+  if (!responseHeaders.get("x-middleware-next") && !responseHeaders.get("x-middleware-rewrite")) return;
+  const existing = responseHeaders.get("x-middleware-override-headers");
+  const names = existing
+    ? existing.split(",").map((n) => n.trim()).filter(Boolean)
+    : [...requestHeaders.keys()];
+  if (!existing) {
+    requestHeaders.forEach((value, name) => {
+      if (name !== CORRELATION_HEADER) responseHeaders.set(`x-middleware-request-${name}`, value);
+    });
+  }
+  if (!names.includes(CORRELATION_HEADER)) names.push(CORRELATION_HEADER);
+  responseHeaders.set("x-middleware-override-headers", names.join(","));
+  responseHeaders.set(`x-middleware-request-${CORRELATION_HEADER}`, correlationId);
+}
+
+interface RequestErrorRequest {
+  path: string;
+  method: string;
+  headers: Record<string, string | string[] | undefined>;
+}
+
+interface RequestErrorContext {
+  routerKind?: string;
+  routePath?: string;
+  routeType?: string;
+  renderSource?: string;
+}
+
+/**
+ * For `instrumentation.ts`: `export { onRequestError } from "ezlogs-nextjs";`
+ * A page or layout that crashed while rendering is recorded as a failure, on the
+ * request's correlation (so a page view the middleware recorded for that request
+ * reads as failed too). Route handlers and Server Actions wrapped by this agent
+ * record their own errors, so only renders are taken here. Never throws.
+ */
+export async function onRequestError(error: unknown, request: RequestErrorRequest, context: RequestErrorContext): Promise<void> {
+  try {
+    if (context?.routeType !== "render") return;
+    // A client component failing during server rendering is rendered again in the browser, which
+    // usually recovers: only a server component's failure is the page failing.
+    if (context.renderSource === "server-rendering") return;
+    const header = request.headers?.[CORRELATION_HEADER];
+    const correlationId = resolveCorrelation(new Headers(typeof header === "string" ? { [CORRELATION_HEADER]: header } : {}));
+    const url = new URL(request.path || "/", "http://localhost");
+    const sourceData = buildHttpSourceData({
+      method: (request.method || "GET").toUpperCase(),
+      url,
+      statusCode: 500,
+      rawParams: null,
+      routeModulePath: pageControllerFromPath(context.routePath || url.pathname),
+      userAgent: typeof request.headers?.["user-agent"] === "string" ? (request.headers["user-agent"] as string) : null,
+      remoteIp: null,
+      contentType: null,
+      excludedVariableKeys: configuration().excludedGraphqlVariableKeys,
+    });
+    const name = error instanceof Error ? error.name : "Error";
+    pushEvent(
+      buildEvent({
+        source_type: "http_request",
+        source_data: sourceData,
+        outcome: "failure",
+        correlation_id: correlationId,
+        resource_ids: [],
+        context: null,
+        duration_ms: null,
+        error_message: `${name}: the page failed to render`,
+        timestamp: new Date(),
+      }),
+    );
+    if (isServerless()) await flushScheduler.flushNow();
+  } catch (captureError) {
+    logger.debug(`onRequestError capture failed: ${describeError(captureError)}`);
+  }
+}
 
 async function emitPageNavigationEvent(input: {
   request: MiddlewareRequest;
@@ -715,6 +806,11 @@ export function captureServerAction<TArgs extends unknown[], TResult>(
 
     try {
       if (!configuration().captureHttp) {
+        return Promise.resolve(runAction(...args));
+      }
+      // Called from inside another captured action or route: part of that one action (its writes
+      // join it), and no second request event.
+      if (currentCorrelation()) {
         return Promise.resolve(runAction(...args));
       }
 

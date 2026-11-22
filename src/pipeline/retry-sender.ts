@@ -17,7 +17,7 @@
 
 import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
-import { transport, type TransportResult } from "./transport.js";
+import { batches, transport, type TransportResult } from "./transport.js";
 import type { Event } from "../event-builder.js";
 
 const MAX_SLEEP_MS = 5_000;
@@ -30,13 +30,22 @@ let randomFn: () => number = Math.random;
 export const retrySender = {
   async send(events: Event[]): Promise<TransportResult> {
     if (!events || events.length === 0) return "success";
+    let result: TransportResult = "success";
+    for (const batch of batches(events)) {
+      if ((await sendBatch(batch)) !== "success") result = "failure";
+    }
+    return result;
+  },
+};
 
+async function sendBatch(events: Event[]): Promise<TransportResult> {
     const maxAttempts = retryAttempts() + 1; // initial + retries
     let attempt = 1;
 
     while (attempt <= maxAttempts) {
       const result = await attemptSend(events, attempt, maxAttempts);
       if (result === "success") return "success";
+      if (result === "rejected") return "failure"; // the same post again can't succeed
 
       if (attempt >= maxAttempts) break;
 
@@ -48,8 +57,7 @@ export const retrySender = {
       `RetrySender: failed after ${maxAttempts} attempts, dropping ${events.length} events`,
     );
     return "failure";
-  },
-};
+}
 
 async function attemptSend(
   events: Event[],

@@ -3,6 +3,18 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.13] — 2026-11-21
+
+### Added
+- **`onRequestError` for `instrumentation.ts`** (`export { onRequestError } from "ezlogs-nextjs";`): a server component (page or layout) that crashes while rendering reads as a failure, on the request's own action. A client component failing during server rendering is left out: the browser renders it again.
+
+### Fixed
+- **The middleware's correlation id reaches the page.** It was set only on the middleware's request object, which Next.js doesn't forward; for a page load it now goes through Next's request-header overrides (what `NextResponse.next({ request: { headers } })` sets), keeping every other header and any override the app set. Client-side router requests are left untouched. A page view, the page's writes and a crash share one action.
+- **Drizzle: only committed writes are sent.** A transaction's writes wait for its commit (or its savepoint's release) and are dropped on rollback. While two transactions of one request overlap (the logger can't tell them apart), writes are sent at once, never dropped. A write made with `db` (not `tx`) while a transaction is open in the same request is treated as part of it.
+- **A Server Action called from another action or route is part of that action**, not a second one.
+- **A busy moment is never lost whole:** posts of at most about 1 MB, strings over 4 KB cut with a note of their length, and a post the server refuses (4xx other than 408 and 429) is not sent again.
+- **One secret-name list everywhere:** one-time and recovery codes (`verification_code`, `recovery_code`, `backup_code`, `one_time_code`, `login_code`) and the word `jti` are masked; the database triggers' rules version is now `p2` (re-attach with `install-triggers`).
+
 ## [0.4.12] — 2026-11-21
 
 ### Changed
