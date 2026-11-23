@@ -438,8 +438,9 @@ server stitches them into a single Action card.
 **Automatic exclusions** (no config needed):
 `_next`, `_vercel`, `__nextjs_*`, health-checks, static assets, and
 auth plumbing: `GET` / `HEAD` on `/api/auth/*` and on any login /
-logout / sign-in / sign-out / signin / signout / `/session*` path
-(page loads, session polls, OAuth and email-link callbacks), plus
+sign-in / signin / `/session*` path (page loads, session polls, OAuth
+and email-link callbacks; a sign-out route is never excluded, a
+`GET /logout` link included), plus
 `/api/auth/session`, `/api/auth/csrf`, `/api/auth/providers` and
 `/api/auth/_log` on every method.
 
@@ -452,9 +453,8 @@ from their API routes). Passwords, tokens and other
 sensitive params are sent as `"[FILTERED]"`; on auth routes and auth
 Server Actions (`signIn`, `verifyOtp`, …) one-time codes and OAuth
 state are too (`code`, `state`, `verification_code`, `otp*`, `pin`,
-`token*`; `code` stays visible on other routes). Secret query params
-inside `callbackUrl` / `redirect` / `from_page` values are masked
-everywhere.
+`token*`; `code` stays visible on other routes). A full URL in any
+value, or a value that is a relative link, loses its query and fragment.
 
 ## Per-area docs
 
@@ -497,6 +497,15 @@ event. EZLogs is best-effort, not guaranteed delivery.
 
 ## Security: what is captured and redacted
 
+- **Secrets inside values.** Every string and key the agent sends (params,
+  job payloads, row values, display names, error messages) is checked by
+  its shape, whatever its key:
+  - **URLs:** a URL (`scheme://…`, alone or inside a text, also URL-encoded as `https%3A%2F%2F…`) keeps its scheme, host and path; its `user:pass@` and everything from `?` or `#` (or `%3F`, `%23`) are removed. A value that is a path on its own (`/first_password/edit?reset_password_token=…`, `//cdn/x.png?sig=…`) loses its query and fragment too. Inside such a URL or path, a segment that looks generated (16+ characters with a lowercase letter, an uppercase letter and a digit, never a file name with a `.`: Slack and Discord webhook tokens, `/reset/<token>`) and a Telegram `bot<digits>:<token>` segment become `[FILTERED]`. The event's own request or outbound `path` keeps its segments (its query and card numbers still go): titles read the ids there.
+  - **Known shapes:** JWTs, private keys, Stripe / Stripe webhook / OpenAI-style (`sk-` with a digit) / GitHub / Slack / AWS keys, and any 15-16 digit number that passes the Luhn check (card numbers, wherever they sit) become `[FILTERED]`.
+  - **Bearer / Basic:** the word after `Bearer` is masked when it has a digit or symbol, a lowercase-then-uppercase pair (base64) or 16+ characters; after `Basic`, the same with 8+ characters.
+  - **Mailer jobs:** in an ActionMailer job (mailer class, method, then `deliver_now` / `deliver_later`) whose method has a secret word (`reset_password_instructions`, `confirmation_instructions`, `unlock_instructions`, `invitation_instructions`, …), every positional string is masked except method names, GlobalIDs, numbers and UUIDs, so the token Devise passes is never sent. Any other job's arguments are left to the rules above (`["card_declined", "Order 42 for Alice"]` stays).
+  - Keys are checked the same way (two keys masked alike both stay: `[FILTERED]`, `[FILTERED] 2`), and anything nested deeper than 8 levels is sent as `[Object]`. Error messages are cut to 4 KB like every other string.
+  What this costs, on purpose: a URL's query and fragment are dropped even when they are ordinary data (`youtube.com/watch?v=…` reads as `youtube.com/watch`); any 15-16 digit number that passes Luhn is masked, so are some order ids and IMEIs; a slug, username or random id of 16+ characters with mixed case and digits inside a link in a value (a nanoid, `github.com/JohnDoe2024Developer`) is masked; file names are not. Not masked: a token in the request's own route path (`GET /reset/<token>`), a known limit until the agents send the route pattern; a link without `scheme://` inside a sentence (`see /reset?token=…`), a text that is not a URL (`reset_password_token=abc`; its key is still filtered by name), and a short lowercase or letters-only word after `Bearer` / `Basic` (`Bearer of bad news`, `Basic Monthly`, `Basic 2`; this also lets through a real but unusual credential such as `Bearer abcdef`).
 - **Request params / Server Action args.** Keys matching a sensitive
   name are sent as `"[FILTERED]"`: password, token, secret, api key,
   credential, auth, signature, card number / cvv, ssn, … (substring),

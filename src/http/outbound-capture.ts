@@ -45,7 +45,9 @@ const COLLECTIONS = new Set([
   "transcriptions", "transfers", "translations", "uploads", "users", "videos", "webhooks",
   "workspaces",
 ]);
-const VERSION = /^v\d{1,2}$/;
+// An API prefix: "api" or a version ("v1", "v2"), kept wherever it sits ("/api/v2/models"):
+// never a name. A date version ("2010-04-01") stays an id.
+const API_PREFIX = /^(?:api|v\d{1,2})$/;
 const SECOND_LEVEL = new Set(["co", "com", "net", "org", "gov", "ac", "edu", "ne", "or"]);
 const PRIVATE_SUFFIXES = new Set(["local", "internal", "localhost", "lan", "home", "intranet", "corp", "test", "example", "invalid"]);
 const HOST = /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?(:\d{1,5})?$/;
@@ -286,9 +288,9 @@ const API_VERBS = new Set([
 const API_NOUNS = new Set(["auth", "balance", "chat", "checkout", "item", "link", "token"]);
 
 /**
- * The server's rule: API versions, and the first segment after them only when it is a
- * known collection ("/v1/customers/cus_9x/orders" → "/v1/customers/:id/:id"). Nothing after it is
- * kept, and no unknown word: grammar can't tell a name ("charles") from a collection ("charges").
+ * The server's rule, kept by REST structure (keepSegment: "/v1/customers/cus_9x/orders" →
+ * "/v1/customers/:id/orders"). No unknown word: grammar can't tell a name ("charles") from a
+ * collection ("charges").
  */
 export function pathPattern(path: string): string {
   const all = path.split(/[?#]/, 1)[0]!.split("/").filter(Boolean);
@@ -299,16 +301,16 @@ export function pathPattern(path: string): string {
   return `/${kept.join("/")}`;
 }
 
-// The server's keep_segment?: a version first; a collection or API noun where a collection sits;
+// The server's keep_segment?: an API prefix ("api", a version) anywhere; a collection or API noun where a collection sits;
 // an API verb only as the very last segment, after an id that follows a kept collection or noun or after a kept noun.
 function keepSegment(segment: string, index: number, total: number, kept: string[]): boolean {
-  if (index === 0 && VERSION.test(segment)) return true;
+  if (API_PREFIX.test(segment)) return true;
   const previous = kept[kept.length - 1];
-  const idSlot = previous === ":id" && kept.length >= 2 && kept[kept.length - 2] !== ":id" && !VERSION.test(kept[kept.length - 2]!);
+  const idSlot = previous === ":id" && kept.length >= 2 && kept[kept.length - 2] !== ":id" && !API_PREFIX.test(kept[kept.length - 2]!);
   const afterNoun = previous !== undefined && API_NOUNS.has(previous);
   if (API_VERBS.has(segment)) return index === total - 1 && (idSlot || afterNoun);
   if (!COLLECTIONS.has(segment) && !API_NOUNS.has(segment)) return false;
-  return previous === undefined || VERSION.test(previous) || idSlot || afterNoun;
+  return previous === undefined || API_PREFIX.test(previous) || idSlot || afterNoun;
 }
 
 /**

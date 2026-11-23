@@ -3,6 +3,27 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.16] — 2026-11-23
+
+### Security
+- **Secrets written inside values are masked by their shape before they are sent.** The value-shape masker (`scrubSecretsInText`) ran only on row values and some error text; a job payload, a request param or a Server Action argument carrying a link such as `https://app.example/reset?token=…` was sent as is. It now runs on every string and key of every event (request params, job payloads for BullMQ, Inngest, QStash and the rest, row changes, display names, error messages), with the same rules as the Rails agent 0.2.22 and the EZLogs server, checked against one shared table of test cases; every rule is linear (1 MB adversarial inputs in the tests):
+  - **URLs:** a URL (`scheme://…`, alone or inside a text, also URL-encoded as `https%3A%2F%2F…`) keeps its scheme, host and path; its `user:pass@` and everything from `?` or `#` (or `%3F`, `%23`) are removed. A value that is a path on its own (`/first_password/edit?reset_password_token=…`, `//cdn/x.png?sig=…`) loses its query and fragment too. Inside such a URL or path, a segment that looks generated (16+ characters with a lowercase letter, an uppercase letter and a digit, never a file name with a `.`: Slack and Discord webhook tokens, `/reset/<token>`) and a Telegram `bot<digits>:<token>` segment become `[FILTERED]`. The event's own request or outbound `path` keeps its segments (its query and card numbers still go): titles read the ids there.
+  - **Known shapes:** JWTs, private keys, Stripe / Stripe webhook / OpenAI-style (`sk-` with a digit) / GitHub / Slack / AWS keys, and any 15-16 digit number that passes the Luhn check (card numbers, wherever they sit) become `[FILTERED]`.
+  - **Bearer / Basic:** the word after `Bearer` is masked when it has a digit or symbol, a lowercase-then-uppercase pair (base64) or 16+ characters; after `Basic`, the same with 8+ characters.
+  - **Mailer jobs:** in an ActionMailer job (mailer class, method, then `deliver_now` / `deliver_later`) whose method has a secret word (`reset_password_instructions`, `confirmation_instructions`, `unlock_instructions`, `invitation_instructions`, …), every positional string is masked except method names, GlobalIDs, numbers and UUIDs, so the token Devise passes is never sent. Any other job's arguments are left to the rules above (`["card_declined", "Order 42 for Alice"]` stays).
+  - Keys are checked the same way (two keys masked alike both stay: `[FILTERED]`, `[FILTERED] 2`), and anything nested deeper than 8 levels is sent as `[Object]`. Error messages are cut to 4 KB like every other string.
+  What this costs, on purpose: a URL's query and fragment are dropped even when they are ordinary data (`youtube.com/watch?v=…` reads as `youtube.com/watch`); any 15-16 digit number that passes Luhn is masked, so are some order ids and IMEIs; a slug, username or random id of 16+ characters with mixed case and digits inside a link in a value (a nanoid, `github.com/JohnDoe2024Developer`) is masked; file names are not. Not masked: a token in the request's own route path (`GET /reset/<token>`), a known limit until the agents send the route pattern; a link without `scheme://` inside a sentence (`see /reset?token=…`), a text that is not a URL (`reset_password_token=abc`; its key is still filtered by name), and a short lowercase or letters-only word after `Bearer` / `Basic` (`Bearer of bad news`, `Basic Monthly`, `Basic 2`; this also lets through a real but unusual credential such as `Bearer abcdef`).
+  A redirect param such as `callbackUrl` now arrives as `https://app.example.com/reset` (or `/invite`) instead of with a masked query.
+
+### Changed
+- **Stricter in most places, looser in one.** New: URL-encoded links, token-like path segments, Stripe webhook secrets, JWTs after `_`, card numbers glued to letters (`café4242…`), mailer job tokens, keys, error messages capped before masking. Looser than 0.4.15: before, every word after `Bearer` / `Basic` was masked; now a short letters-only word is kept (`Basic Monthly`, `Bearer of bad news`), and `sk-` needs a digit (`/docs/sk-openai-agent-setup-guide` is kept). A real credential that is short and all lowercase letters (`Bearer abcdef`) is no longer masked.
+
+### Fixed
+- **A sign-out done with GET is recorded.** `GET /logout`, `/sign-out` and `/signout` (a sign-out link) were dropped with the sign-in pages. Only loading a sign-in page (GET, HEAD on `*/login*`, `*/sign-in*`, `*/signin*`, `/session*`, `/api/auth/*`) is left out now; a sign-out route is recorded whatever its method.
+
+### Changed
+- **An outside call's path keeps `api` and a version wherever they sit.** `/api/v2/models` arrived as `/:id/:id/:id` (a version was kept only as the first segment); now `/api/v2/models`. Unknown words are still hidden (`/api/v2/retail/models` → `/api/v2/:id/:id`). Same rule and the same test table (`tests/parity/fixtures/outbound_path_patterns.json`) as the EZLogs server and ez_logs_agent.
+
 ## [0.4.15] — 2026-11-22
 
 ### Changed

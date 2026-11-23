@@ -17,6 +17,8 @@
  * Does NOT buffer, ship, or generate correlation IDs.
  */
 
+import { scrubSecretsInText, uniqueKey } from "./http/sanitize.js";
+
 export type SourceType =
   | "http_request"
   | "background_job"
@@ -80,13 +82,19 @@ export function build(input: BuildInput): Event {
   const resource_ids = validateResourceIds(input.resource_ids ?? []);
   const context_raw = validateContext(input.context ?? null);
   const duration_ms = validateDurationMs(input.duration_ms ?? null);
-  const error_message = input.error_message ?? null;
+  const error_message = input.error_message == null ? null : (capStrings(input.error_message) as string);
 
   validateOutcomeErrorConsistency(outcome, error_message);
 
   // Sanitized, then long strings cut (a long text column, a raw body): one event can never make a
   // post too large to send.
   const source_data = capStrings(sanitizeRecord(source_data_raw)) as Record<string, unknown>;
+  // The request's or outside call's own path keeps its segments (titles read its ids).
+  const rawPath = source_data_raw.path;
+  if (typeof rawPath === "string" && typeof source_data.path === "string") {
+    const capped = rawPath.length > MAX_STRING ? `${rawPath.slice(0, MAX_STRING)}… [${rawPath.length} characters]` : rawPath;
+    source_data.path = scrubSecretsInText(capped, { segments: false });
+  }
   const context = context_raw === null ? null : (capStrings(sanitizeRecord(context_raw)) as Record<string, unknown>);
   const correlation_id = input.correlation_id ?? null;
 
@@ -107,16 +115,16 @@ export function build(input: BuildInput): Event {
 
 const MAX_STRING = 4_096;
 
-/** Strings over 4 KB keep their start and say how long they were (same rule as the Rails agent). */
+/** Strings over 4 KB keep their start and say how long they were, then are value-shape masked, keys too (scrubSecretsInText; same rules as the Rails agent); anything deeper than 8 levels becomes "[Object]". */
 export function capStrings(value: unknown, depth = 0): unknown {
   if (typeof value === "string") {
-    return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}… [${value.length} characters]` : value;
+    return scrubSecretsInText(value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}… [${value.length} characters]` : value);
   }
-  if (depth > 8 || value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object" || value instanceof Date) return value;
+  if (depth > 8) return "[Object]"; // never sent unmasked
   if (Array.isArray(value)) return value.map((v) => capStrings(v, depth + 1));
-  if (value instanceof Date) return value;
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = capStrings(v, depth + 1);
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[uniqueKey(out, scrubSecretsInText(k))] = capStrings(v, depth + 1);
   return out;
 }
 

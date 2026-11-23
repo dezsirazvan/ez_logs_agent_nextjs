@@ -284,12 +284,13 @@ export const DEFAULT_EXCLUDED_PATHS: readonly ExcludedPathPattern[] = Object.fre
   "/api/auth/csrf",
   "/api/auth/providers",
   "/api/auth/_log",
-  // Auth routes (common patterns across Clerk, NextAuth, custom auth):
+  // Sign-in routes (common patterns across Clerk, NextAuth, custom auth):
   // the GETs are page loads, probes and OAuth / email-link callbacks;
-  // the POSTs are sign-in / sign-up / sign-out attempts (succeeded or
-  // failed) and ARE captured. Passwords and tokens in the body are
-  // filtered by the usual param sanitization.
-  ...["*/login*", "*/logout*", "*/sign-in*", "*/sign-out*", "*/signin*", "*/signout*", "/session*"].map(
+  // the POSTs are sign-in / sign-up attempts (succeeded or failed) and
+  // ARE captured. Sign-out routes are never excluded, whatever the
+  // method: a GET /logout link signs out. Passwords and tokens in the
+  // body are filtered by the usual param sanitization.
+  ...["*/login*", "*/sign-in*", "*/signin*", "/session*"].map(
     (path) => Object.freeze({ path, methods: ["GET", "HEAD"] }),
   ),
 ]);

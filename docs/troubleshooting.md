@@ -41,9 +41,9 @@ own rules; if you've customized `next.config.js` with your own
 
 ## Auth events not captured
 
-Auth routes (`/api/auth/*`, `*/login*`, `*/logout*`, `*/sign-in*`,
-`*/sign-out*`, `*/signin*`, `*/signout*`, `/session*`) are excluded
-for **GET / HEAD only**: page loads, session polls and OAuth callbacks
+Sign-in routes (`/api/auth/*`, `*/login*`, `*/sign-in*`, `*/signin*`,
+`/session*`) are excluded for **GET / HEAD only** (a sign-out route is
+never excluded, whatever its method): page loads, session polls and OAuth callbacks
 would otherwise flood the dashboard. POSTs (sign-in, sign-up,
 sign-out, failed logins) ARE captured, with passwords and tokens
 filtered. `/api/auth/session`, `/csrf`, `/providers` and `/_log` are

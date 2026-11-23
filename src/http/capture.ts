@@ -50,6 +50,7 @@ import {
   maskAuthParams,
   passesLuhn,
   scrubSecretsInText,
+  SECRET_ACTION_WORDS,
 } from "./sanitize.js";
 import { runWithEmittedAuditIdsScope } from "../triggers/emit-dedup.js";
 import { runWithDeliverySlot, type DeliverySlot } from "../job-delivery.js";
@@ -1570,15 +1571,6 @@ function isIdShaped(s: string): boolean {
   }
   return false;
 }
-
-// Action-name words that mean "short numeric args are secrets"
-// (setPin(4821), verifyOtp("123456")). Mirrors the server redactor's
-// auth-word list plus card/cvv/code.
-const SECRET_ACTION_WORDS = new Set([
-  "pin", "otp", "code", "verify", "mfa", "2fa", "cvv", "cvc", "card",
-  "password", "passwd", "secret", "token", "sign", "signin", "login",
-  "reset", "credential", "credentials", "unlock",
-]);
 
 // Action-name words that mean "this is about payment cards".
 const PAYMENT_ACTION_WORDS = new Set([

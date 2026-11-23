@@ -175,36 +175,161 @@ export function passesLuhn(digits: string): boolean {
   return sum % 10 === 0;
 }
 
-// Secrets recognizable by their shape inside free text: JWTs, PEM
-// private keys, well-known API key prefixes (Stripe, GitHub, Slack,
-// AWS, OpenAI/Anthropic-style `sk-`), bearer / basic credentials.
+// Value-shape masking, the same rules as the Rails gem's `Sanitizer.scrub_text`
+// and the server's ingest masker (shared vectors and adversarial inputs:
+// tests/fixtures/secret_text_vectors.json). Every rule is linear in the
+// input's length. Whitespace is spelled out so Ruby (ASCII `\s`) and
+// JavaScript (Unicode `\s`) read NBSP and other spaces the same way.
+const WS = " \\t\\n\\r\\f\\v\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+const URL_STOP = WS + "\"'<>\\\\`";
+// A URL keeps its scheme, host and path; its `user:pass@` and everything from `?` or `#` go.
+const URL_PATTERN = new RegExp(
+  `([A-Za-z][A-Za-z0-9+.-]{0,30}://)(?:[^${URL_STOP}/?#]*@)?([^${URL_STOP}?#]*)(?:[?#][^${URL_STOP}]*)?`,
+  "g",
+);
+// The same written URL-encoded (`https%3A%2F%2Fapp%2Freset%3Ftoken%3D…`), any case.
+const ENCODED_URL = new RegExp(
+  `([A-Za-z][A-Za-z0-9+.-]{0,30}%3A%2F%2F)(?:(?:(?!%40|%2F|%3F|%23)[^${URL_STOP}/?#])*%40)?` +
+    `((?:(?!%3F|%23)[^${URL_STOP}?#])*)(?:(?:%3F|%23)[^${URL_STOP}]*)?`,
+  "gi",
+);
+const ENCODED_SCHEME = /%3A%2F%2F/i;
+// A whole value that is a path (`/reset/…?token=…`, `//cdn/x?sig=…`): its query and fragment go.
+const RELATIVE_PATH = new RegExp(`^/[^${WS}]*$`);
+// A path segment that looks generated: 16+ characters with a lowercase letter, an uppercase letter
+// and a digit, never a file name with a "." (webhook and reset tokens; some random ids such as nanoids too), or a Telegram bot token.
+const TOKEN_SEGMENT = /^(?:bot\d+:[A-Za-z0-9_-]+|(?=[^a-z]*[a-z])(?=[^A-Z]*[A-Z])(?=\D*\d)(?![^.]*\.)[\s\S]{16,})$/;
+const SEGMENT_SPLIT = /(\/|%2F)/i;
+// Secrets recognizable by their shape inside free text: PEM private keys (the
+// body ends at the next `-----`), well-known API key prefixes (Stripe, Stripe
+// webhook, GitHub, Slack, AWS). Never inside a word.
+const START = "(?<![A-Za-z0-9])";
 const SECRET_TEXT_PATTERNS: readonly RegExp[] = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
-  /\beyJ[\w-]+\.[\w-]+\.[\w-]+/g,
-  /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]+/g,
-  /\bsk-[A-Za-z0-9_-]{16,}/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bxox[abposr]-[A-Za-z0-9-]+/g,
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----[^-]*(?:-(?!----)[^-]*)*(?:-----END [A-Z ]{0,40}PRIVATE KEY-----)?/g,
+  new RegExp(`${START}(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]+`, "g"),
+  new RegExp(`${START}whsec_[A-Za-z0-9+/=]{8,}`, "g"),
+  new RegExp(`${START}gh[pousr]_[A-Za-z0-9]{20,}`, "g"),
+  new RegExp(`${START}xox[abposr]-[A-Za-z0-9-]+`, "g"),
+  new RegExp(`${START}(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])`, "g"),
 ];
+// Runs judged whole (isJwt, an OpenAI-style key with a digit): a match never rescans its own text.
+const JWT_RUN = new RegExp(`${START}eyJ[\\w-]*(?:\\.[\\w-]*)*`, "g");
+const SK_RUN = new RegExp(`${START}sk-[A-Za-z0-9_-]*`, "g");
+// A word after "Bearer" or "Basic", judged by isCredential (never "Basic Monthly", "Bearer of bad news").
+const AUTH_CREDENTIAL = new RegExp(`${START}(Bearer|Basic)[${WS}]+([\\w.~+/=-]+)`, "gi");
+const CARD_NUMBER = /(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)/g;
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 
+function maskSegments(path: string): string {
+  return path
+    .split(SEGMENT_SPLIT)
+    .map((part) => (TOKEN_SEGMENT.test(part) ? "[FILTERED]" : part))
+    .join("");
+}
+
+// "eyJ…" then dots: a header, a payload, then a signature or a payload of 16+.
+function isJwt(run: string): boolean {
+  const parts = run.split(".");
+  return parts.length >= 2 && parts[0]!.length > 3 && parts[1]!.length > 0 && (parts.length >= 3 || parts[1]!.length >= 16);
+}
+
+// A credential has a digit or symbol, or a lower-then-upper letter pair (base64), or 16+
+// characters; after "Basic" also 8+ characters ("Basic 2", "Basic Membership" are plan names).
+function isCredential(scheme: string, token: string): boolean {
+  const shaped = /[\d._~+/=-]/.test(token) || /[a-z][A-Z]/.test(token);
+  if (scheme.toLowerCase() === "bearer") return shaped || token.length >= 16;
+  return token.length >= 16 || (shaped && token.length >= 8);
+}
+
 /**
- * Mask secrets inside free text (error messages, json string values):
- * the shapes above, `Bearer` / `Basic` credentials and Luhn-valid
- * 15-16 digit card numbers become `"[FILTERED]"`; with `emails`, email
- * addresses too.
+ * Mask secrets inside free text (every string and key an event carries):
+ * URLs (also URL-encoded ones, and a whole value that is a path) lose their
+ * credentials, query and fragment, and token-like path segments; the shapes
+ * above, JWTs, `sk-` keys with a digit, `Bearer` / `Basic` credentials and
+ * Luhn-valid 15-16 digit numbers (in a path too) become `"[FILTERED]"`; with
+ * `emails`, email addresses too.
  */
-export function scrubSecretsInText(text: string, options: { emails?: boolean } = {}): string {
+export function scrubSecretsInText(
+  text: string,
+  options: { emails?: boolean; segments?: boolean } = {},
+): string {
+  // segments: false for the event's own request or outbound `path` (titles read its ids; a token in a
+  // route is a known limit until agents send the route pattern).
+  const cut = options.segments === false ? (p: string) => p : maskSegments;
   let out = text;
+  if (out.includes("://")) out = out.replace(URL_PATTERN, (_m, scheme: string, rest: string) => scheme + cut(rest));
+  if (ENCODED_SCHEME.test(out)) out = out.replace(ENCODED_URL, (_m, scheme: string, rest: string) => scheme + cut(rest));
+  if (RELATIVE_PATH.test(out)) out = cut(out.replace(/[?#][\s\S]*$/, ""));
   for (const pattern of SECRET_TEXT_PATTERNS) out = out.replace(pattern, "[FILTERED]");
-  out = out
-    .replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, "$1 [FILTERED]")
-    .replace(/\b\d(?:[ -]?\d){12,18}\b/g, (match) => {
-      const digits = match.replace(/[ -]/g, "");
-      return (digits.length === 15 || digits.length === 16) && passesLuhn(digits) ? "[FILTERED]" : match;
-    });
+  out = out.replace(JWT_RUN, (run) => (isJwt(run) ? "[FILTERED]" : run));
+  out = out.replace(SK_RUN, (run) => (run.length >= 19 && /\d/.test(run) ? "[FILTERED]" : run));
+  out = out.replace(AUTH_CREDENTIAL, (match, scheme: string, token: string) =>
+    isCredential(scheme, token) ? `${scheme} [FILTERED]` : match,
+  );
+  out = out.replace(CARD_NUMBER, (match) => {
+    const digits = match.replace(/[ -]/g, "");
+    return (digits.length === 15 || digits.length === 16) && passesLuhn(digits) ? "[FILTERED]" : match;
+  });
   return options.emails ? out.replace(EMAIL, "[FILTERED]") : out;
+}
+
+// Action-name words that make an action's unnamed arguments secrets (setPin(4821),
+// verifyOtp("123456"), Devise's reset_password_instructions(user, token)). Same list as the
+// server redactor and the Rails gem.
+export const SECRET_ACTION_WORDS: ReadonlySet<string> = new Set([
+  "pin", "otp", "code", "verify", "mfa", "2fa", "cvv", "cvc", "card",
+  "password", "passwd", "secret", "token", "sign", "signin", "login",
+  "reset", "credential", "credentials", "unlock", "confirmation", "invitation",
+]);
+const METHOD_NAME = /^[a-z]+(?:_[a-z]+)+$/;
+// ActionMailer's job arguments: the mailer class, its method, then "deliver_now" / "deliver_later"
+// (a Rails shape; kept for parity with the gem and the server, it never fires on a JS queue).
+const MAILER_CLASS = /^[A-Z][A-Za-z0-9]*(?:::[A-Z][A-Za-z0-9]*)*$/;
+const MAILER_METHOD = /^[a-z_][a-z0-9_]*$/;
+const DELIVERY = /^deliver_(?:now|later)!?$/;
+const KEPT_CALL_ARG = /^(?:gid:\/\/|\d{1,20}$|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$)/;
+
+function isSecretName(name: string): boolean {
+  const words = name.split("_");
+  const pairs = words.slice(1).map((w, i) => words[i] + w);
+  return [...words, ...pairs].some((w) => SECRET_ACTION_WORDS.has(w));
+}
+
+function maskCallArg(arg: unknown): unknown {
+  if (typeof arg === "string") return METHOD_NAME.test(arg) || KEPT_CALL_ARG.test(arg) ? arg : "[FILTERED]";
+  if (Array.isArray(arg)) return arg.map(maskCallArg);
+  if (isPlainObject(arg)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(arg as Record<string, unknown>)) out[k] = k === "args" ? maskCallArg(v) : v;
+    return out;
+  }
+  return arg;
+}
+
+/**
+ * A mailer job whose method has a secret word (`reset_password_instructions`):
+ * its positional strings are masked, except method names, GlobalIDs, numbers
+ * and UUIDs. Only ActionMailer's own shape (mailer class, method,
+ * deliver_now/deliver_later); an ordinary job's "card_declined" stays. Same
+ * rule as the Rails gem and the server.
+ */
+export function maskSecretCallArgs(args: unknown[]): unknown[] {
+  const [mailer, method, delivery] = args;
+  const mailerCall =
+    args.length > 3 &&
+    typeof mailer === "string" && MAILER_CLASS.test(mailer) &&
+    typeof method === "string" && MAILER_METHOD.test(method) &&
+    typeof delivery === "string" && DELIVERY.test(delivery) &&
+    isSecretName(method);
+  return mailerCall ? args.map((a, i) => (i > 2 ? maskCallArg(a) : a)) : args;
+}
+
+/** A key masked like a value; two keys masked alike both stay ("[FILTERED]", "[FILTERED] 2"). */
+export function uniqueKey(taken: Record<string, unknown>, key: string): string {
+  if (!Object.hasOwn(taken, key)) return key;
+  let n = 2;
+  while (Object.hasOwn(taken, `${key} ${n}`)) n += 1;
+  return `${key} ${n}`;
 }
 
 /**
@@ -212,7 +337,7 @@ export function scrubSecretsInText(text: string, options: { emails?: boolean } =
  * a positional list, same key redaction, depth and array rules.
  */
 export function sanitizeArgs(args: unknown[], userPatterns: readonly string[] = []): unknown {
-  return sanitizeArrayValue(args, 0, userPatterns);
+  return sanitizeArrayValue(maskSecretCallArgs(args), 0, userPatterns);
 }
 
 function sanitizeValue(
