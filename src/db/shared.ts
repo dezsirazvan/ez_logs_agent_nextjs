@@ -98,6 +98,25 @@ export const DB_SENSITIVE_PATTERNS: readonly string[] = Object.freeze([
   "backup_code",
   "one_time_code",
   "login_code",
+  // Credentials under other names: connection strings, webhook URLs, access and seed material,
+  // single-use codes and links (1.5.5 of ez_logs_supabase; every list).
+  "jwt",
+  "webhook_url",
+  "connection_string",
+  "database_url",
+  "access_key",
+  "auth_key",
+  "session_key",
+  "license_key",
+  "encryption_key",
+  "ssh_key",
+  "master_key",
+  "mnemonic",
+  "seed_phrase",
+  "auth_code",
+  "reset_code",
+  "invite_code",
+  "magic_link",
 ]);
 
 export interface DbAttributeChange {

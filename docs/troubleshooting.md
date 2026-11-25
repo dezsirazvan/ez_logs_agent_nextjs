@@ -60,7 +60,7 @@ or wrap it manually with `captureServerAction`.
 ## HTTP 401 from the EZLogs server
 
 1. Verify your API key in the EZLogs dashboard under
-   **Settings → API Keys**.
+   **Install & keys**.
 2. Check for whitespace in `projectToken`: `"ezl_abc123"` not
    `" ezl_abc123 "`.
 3. Confirm the key hasn't been revoked.

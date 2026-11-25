@@ -3,6 +3,11 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.17] — 2026-11-25
+
+### Security
+- **More credential names are never sent.** Request params, Server Action arguments and database columns (the Prisma/Drizzle filter and the `ezlogs_is_sensitive_key` SQL trigger) now also treat as secret any key containing `jwt`, `webhook_url` (a Slack or Discord webhook), `connection_string`, `database_url`, `access_key`, `auth_key`, `session_key`, `license_key`, `encryption_key`, `ssh_key`, `master_key`, `mnemonic`, `seed_phrase`, `auth_code`, `reset_code`, `invite_code`, `magic_link`, and `dsn` as a whole word. Same list in every layer (the Rails agent 0.2.23, `ez_logs_supabase` 1.5.5 and the EZLogs server). `ezlogs_patterns_version()` is `p3`: triggers attached under `p2` re-attach on the next `ezlogs_track`.
+
 ## [0.4.16] — 2026-11-23
 
 ### Security

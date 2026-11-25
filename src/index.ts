@@ -86,7 +86,7 @@ const STARTUP_ANNOUNCED_KEY = Symbol.for("ezlogs-nextjs:startupAnnounced");
 /**
  * One line per process at the default log level, so "is it on?" is
  * answerable from the terminal: where events go and which key, shown
- * the way the dashboard's Settings → API Keys shows it (`ezl_` + first
+ * the way the dashboard's Install & keys page shows it (`ezl_` + first
  * 8 characters). Missing config says so instead.
  */
 function announceStartup(serverUrl: string | null, projectToken: string | null): void {

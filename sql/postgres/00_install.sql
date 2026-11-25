@@ -90,9 +90,9 @@ CREATE INDEX IF NOT EXISTS ezlogs_audit_log_uncorrelated_idx
 CREATE OR REPLACE FUNCTION public.ezlogs_is_sensitive_key(k text) RETURNS boolean
   LANGUAGE sql IMMUTABLE
 AS $$
-  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
-      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code)'
-      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase|jti)([^a-z0-9]|$)'
+  SELECT s ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code|jwt|webhook_url|connection_string|database_url|access_key|auth_key|session_key|license_key|encryption_key|ssh_key|master_key|mnemonic|seed_phrase|auth_code|reset_code|invite_code|magic_link)'
+      OR lower(k) ~ '(password|token|secret|api_key|credit_card|ssn|social_security|encrypted|private_key|public_key|signing_key|pem|cipher|nonce|salt|digest|signature|hmac|credential|passwd|passcode|apikey|card_number|cardnumber|cvv|cvc|verification_code|recovery_code|backup_code|one_time_code|login_code|jwt|webhook_url|connection_string|database_url|access_key|auth_key|session_key|license_key|encryption_key|ssh_key|master_key|mnemonic|seed_phrase|auth_code|reset_code|invite_code|magic_link)'
+      OR s ~ '(^|[^a-z0-9])(pin|otp|totp|iban|mfa|passphrase|jti|dsn)([^a-z0-9]|$)'
     FROM (SELECT lower(regexp_replace(k, '([a-z0-9])([A-Z])', '\1_\2', 'g')) AS s) AS words
 $$;
 
@@ -102,7 +102,7 @@ $$;
 -- `install-triggers` run.
 CREATE OR REPLACE FUNCTION public.ezlogs_patterns_version() RETURNS text
   LANGUAGE sql IMMUTABLE
-AS $$ SELECT 'p2' $$;
+AS $$ SELECT 'p3' $$;
 
 CREATE OR REPLACE FUNCTION public.ezlogs_strip_sensitive(r jsonb) RETURNS jsonb
   LANGUAGE sql IMMUTABLE

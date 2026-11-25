@@ -36,7 +36,7 @@ Install EZLogs in this app by following https://app.ezlogs.io/install/nextjs.md
 The AI does every step below (package, `instrumentation.ts`, config,
 key, database, jobs) and then checks that capture works. It asks you for
 your API key. Signed in at [app.ezlogs.io](https://app.ezlogs.io), the
-prompt shown under a new key in **Settings → API keys** already has your
+prompt shown under a new key in **Install & keys** already has your
 key in it.
 
 **2. By hand:** follow the [quick start](#quick-start-by-hand) below.
