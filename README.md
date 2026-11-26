@@ -24,7 +24,8 @@ person, an AI agent or the system. You also get Pulse (where every person and re
 alerts by email or Slack, MCP so your own AI can read what happened, and signed audit exports.
 
 The agent only reads. It never changes anything in your app and drops passwords, tokens and other
-secrets before anything leaves it. App Router, Pages Router, Server Actions and the Edge runtime
+secrets before anything leaves it. From 0.4.18 it also masks phone numbers, addresses, birth dates,
+IP addresses and identity-document numbers: EZLogs records that one changed, never its value. App Router, Pages Router, Server Actions and the Edge runtime
 are supported. Same wire format as the [Rails agent](https://github.com/dezsirazvan/ez_logs_agent),
 so both show up in one timeline. Free while in beta: [sign up](https://app.ezlogs.io).
 
@@ -433,7 +434,7 @@ record shows by its id.
 |---|---|---|
 | HTTP | Method, path, status, duration, sanitized params (incl. route params like `[id]`), GraphQL op, the `error` / `message` of a JSON error response; tRPC: the procedure (`trpc` param), its input without the superjson / batch envelope, and the zod field error or message of a failed call, named after the procedure (`post.delete: Not allowed`); a batch where some calls failed (HTTP 207), or a failed call in an `httpBatchStreamLink` stream (create-t3-app's default, HTTP 200), is a failure. A streamed response (tRPC's `httpBatchStreamLink`, AI SDK, SSE) is recorded when its body ends, with the DB writes made while it streamed | App Router + Pages Router (auto-wrapped, incl. Auth.js `export const { GET, POST } = handlers`) |
 | Page views | Page loads (the browser loading a page's HTML). `<Link>` prefetches and client-side navigations are not page views: Next strips their markers before middleware runs, so the two can't be told apart there | `middleware.ts` / Next 16 `proxy.ts` (auto-wrapped) |
-| Server Actions | Action name, args, caller IP, outcome, and where a `redirect()` sent the user (`redirect_to`: same-origin path only, no query, token-like segments masked; external redirects are not recorded). A returned failure is a failure with its message: `{ success: false, error }`, `{ error: "…" }` (no truthy `success` / `ok`, no `data`), and a pure form state `{ errors: { field: [...] } \| [...], message? }` (Next.js `useActionState`), next-safe-action, zsa, Conform, zod `safeParse`. Stay successes: `{ message: "Saved" }`, a database row (`id` / `created_at` / `updatedAt` key) with an `error` column, a partial success like `{ imported: 97, errors: [...] }`. `redirect()` / `notFound()` are not failures | File-level + inline `"use server"` (auto-wrapped) |
+| Server Actions | Action name, args, caller IP (EZLogs drops it on arrival and never stores it), outcome, and where a `redirect()` sent the user (`redirect_to`: same-origin path only, no query, token-like segments masked; external redirects are not recorded). A returned failure is a failure with its message: `{ success: false, error }`, `{ error: "…" }` (no truthy `success` / `ok`, no `data`), and a pure form state `{ errors: { field: [...] } \| [...], message? }` (Next.js `useActionState`), next-safe-action, zsa, Conform, zod `safeParse`. Stay successes: `{ message: "Saved" }`, a database row (`id` / `created_at` / `updatedAt` key) with an `error` column, a partial success like `{ imported: 97, errors: [...] }`. `redirect()` / `notFound()` are not failures | File-level + inline `"use server"` (auto-wrapped) |
 | Database | `model_class`, `operation`, full from→to diffs incl. json leaves (trigger path), record name | Postgres triggers, Prisma, Drizzle, supabase-js |
 | Background jobs | `job_class`, `job_id`, `queue`, `retry_count`, sanitized `arguments`, plus the DB writes the job made | BullMQ, Inngest, Trigger.dev, pgmq, Upstash Workflow |
 | Calls to outside services | The host's domain (`stripe.com`), method, the path as a pattern (API versions and the first segment when it is a common collection name such as `charges`; everything else `:id`), status, time. Never a body, query string, header, address or internal host name. Not your app's own Supabase project or Upstash Redis (their writes show as data changes), the agent's own calls, or EZLogs itself. At most 50 per action; `captureOutbound: false` turns it off, `excludedHosts` leaves services out | `fetch`, `http`/`https` (stripe-node, axios, the OpenAI and Resend SDKs) through Node's diagnostics channels: nothing is wrapped or awaited, about the cost of a clock read per call; on Edge, the `fetch` wrapper |
@@ -530,6 +531,38 @@ event. EZLogs is best-effort, not guaranteed delivery.
   named action (`update(4821)`) is shown. Object / FormData arguments
   keep their field names and get the key rule above — pass an object
   if you want values shown.
+- **Personal values (0.4.18).** Phone numbers, postal addresses
+  (street, address lines, house number, postcode or zip), precise
+  locations (latitude, longitude), birth dates, IP addresses and
+  identity-document numbers (passport, national, tax or VAT id, ID
+  card, driver's licence) are sent as `"[FILTERED]"`. A change to one is
+  still sent, without its values, so EZLogs reads "changed the phone",
+  "set the address", "removed the phone", never the number. Decided by
+  key name, the same rule as the Rails agent, the Supabase install and
+  the EZLogs server (`src/personal-fields.ts`), in row changes (Prisma,
+  Drizzle, supabase-js and the trigger reader) and new rows, json
+  leaves (`profile.phone`), request params and GraphQL variables at any
+  depth, and job arguments by key. A phone written with its country
+  code (`+40 721 000 333`) or an IP address passed to a job by position
+  is masked too. The trigger keeps the raw value in `ezlogs_audit_log`,
+  in your own database, until the agent sends the row.
+  - **Not masked:** a key ending in `id`, `ids`, `uuid`, `type`,
+    `kind`, `count`, `at`, `status`, `state`, `verified` or `confirmed`
+    (`address_id`, `phone_confirmed_at`, `phone_status`), an email
+    (`email`, `email_address`: it names who did what), and `null`,
+    blank and true/false values (`phone_verified: true`).
+  - **By model:** a model or table that is itself a list of phones,
+    addresses or IPs (`PhoneNumber`, `user_addresses`) has its value
+    columns treated as personal, and its records are never named by
+    their values (a personal `displayNameFor` column is never used).
+  - The EZLogs server applies the same rule on arrival, so with an
+    older agent version these values are still never stored.
+  What this costs, on purpose: the rule reads names, not intent, so a
+  business's own address or phone is hidden too; searching EZLogs for
+  a phone number finds nothing; there is no switch to send these
+  values. Health or other special-category data can't be recognised by
+  a column name: leave it out with `excludedTables` or
+  `excludedGraphqlVariableKeys`.
 - **Database rows (trigger path).** Columns with sensitive names are
   removed by the trigger itself, so they are never written to
   `ezlogs_audit_log`. An update that only touches such columns writes

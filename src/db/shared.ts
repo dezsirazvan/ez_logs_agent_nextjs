@@ -22,6 +22,7 @@ import { pushEvent } from "../pipeline/buffer.js";
 import { current as currentCorrelation } from "../correlation.js";
 import { getCurrentActor } from "../actor.js";
 import { matchesSensitiveKey, scrubSecretsInText } from "../http/sanitize.js";
+import { isPersonalColumn, isPersonalKey, isPersonalTable, maskPersonalNested, maskPersonalValue } from "../personal-fields.js";
 
 export type DbOperation = "create" | "update" | "destroy";
 
@@ -281,32 +282,66 @@ function buildContext(input: DbEmitInput): Record<string, unknown> | null {
     input.initialAttributes
   ) {
     const filtered = filterMeaningfulAttributes(input.initialAttributes);
-    if (filtered !== null) context.initial_attributes = filtered;
+    if (filtered !== null) context.initial_attributes = maskPersonalAttributes(filtered, personalTable(input));
   }
 
   if (input.operation === "update" && input.changes) {
     const filtered = filterMeaningfulChanges(input.changes);
     if (filtered.length > 0) {
+      const table = personalTable(input);
       context.changes = filtered.map((c) => {
+        // A personal field (personal-fields.ts): the change, never the
+        // values. Masked after the diff above, so only changed values
+        // reach here and two masked sides mean it changed.
+        const hidden = isPersonalPath(c.attribute, table);
         const out: Record<string, unknown> = {
           attribute: c.attribute,
-          to: formatForJson(c.to),
+          to: hidden ? maskPersonalValue(c.to) : maskPersonalNested(formatForJson(c.to)),
         };
         // Only include `from` when we actually have a previous value.
         // Sending null when we don't know would render as "empty → val"
         // in the dashboard, which is misleading.
-        if (c.from !== undefined) out.from = formatForJson(c.from);
+        if (c.from !== undefined) out.from = hidden ? maskPersonalValue(c.from) : maskPersonalNested(formatForJson(c.from));
         return out;
       });
     }
   }
 
-  const displayName =
-    input.displayName ??
-    (input.modelInstance ? resolveDisplayName(input.modelClass, input.modelInstance) : null);
+  // A row of a list of phones or addresses would be named by the number or the street.
+  const displayName = personalTable(input)
+    ? null
+    : (input.displayName ??
+      (input.modelInstance ? resolveDisplayName(input.modelClass, input.modelInstance) : null));
   if (displayName !== null) context.display_name = displayName;
 
   return Object.keys(context).length === 0 ? null : context;
+}
+
+// The row's model or table when it is a list of phones, addresses or IPs
+// (`PhoneNumber`, `user_addresses`): its value columns are personal.
+function personalTable(input: DbEmitInput): string | null {
+  for (const name of [input.modelClass, input.table]) {
+    if (name && isPersonalTable(name)) return name;
+  }
+  return null;
+}
+
+// A dotted json leaf (`profile.phone`) is personal when any of its keys is;
+// a column by its name or its table.
+function isPersonalPath(path: string, table: string | null): boolean {
+  const keys = path.split(".");
+  return keys.some((key) => isPersonalKey(key)) || (keys.length === 1 && isPersonalColumn(path, table));
+}
+
+function maskPersonalAttributes(
+  attrs: Record<string, unknown>,
+  table: string | null,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(attrs)) {
+    out[key] = isPersonalColumn(key, table) ? maskPersonalValue(value) : maskPersonalNested(value);
+  }
+  return out;
 }
 
 export function filterMeaningfulAttributes(
@@ -569,13 +604,14 @@ export function resolveDisplayName(
   try {
     const config = configuration();
     const resolver = config.displayNameFor[modelClass];
-    const resolved = applyResolver(resolver, instance);
+    // A configured column that is a phone or an address never names a row.
+    const resolved = typeof resolver === "string" && isPersonalKey(resolver) ? null : applyResolver(resolver, instance);
     if (resolved !== null) return resolved;
 
     // Normalized column name (lowercase, no `_`) -> value.
     const columns = new Map<string, unknown>();
     for (const key of Object.keys(instance)) {
-      if (isDbSensitive(key)) continue;
+      if (isDbSensitive(key) || isPersonalKey(key)) continue; // never a secret, a phone or an address
       const norm = key.toLowerCase().replace(/_/g, "");
       if (!columns.has(norm)) columns.set(norm, instance[key]);
     }

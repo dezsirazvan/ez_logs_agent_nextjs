@@ -19,6 +19,8 @@
  * parity test exercises both — do not deviate without bumping format.
  */
 
+import { isPersonalKey, maskPersonalTextDeep, maskPersonalValue } from "../personal-fields.js";
+
 export const SENSITIVE_VARIABLE_PATTERNS: readonly string[] = Object.freeze([
   "password",
   "passwd",
@@ -357,7 +359,8 @@ export function uniqueKey(taken: Record<string, unknown>, key: string): string {
  * a positional list, same key redaction, depth and array rules.
  */
 export function sanitizeArgs(args: unknown[], userPatterns: readonly string[] = []): unknown {
-  return sanitizeArrayValue(maskSecretCallArgs(args), 0, userPatterns);
+  // Phones and IPs passed by position (an SMS job's "+40 721 000 333"): no name says what they are.
+  return maskPersonalTextDeep(sanitizeArrayValue(maskSecretCallArgs(args), 0, userPatterns));
 }
 
 function sanitizeValue(
@@ -367,6 +370,8 @@ function sanitizeValue(
   userPatterns: readonly string[],
 ): unknown {
   if (isSensitiveKey(key, userPatterns)) return "[FILTERED]";
+  // A phone, an address, an IP (personal-fields.ts): never its value, at any depth.
+  if (isPersonalKey(key)) return maskPersonalValue(value);
   if (isPlainObject(value)) {
     return sanitizeNestedObject(value as Record<string, unknown>, depth, userPatterns);
   }
