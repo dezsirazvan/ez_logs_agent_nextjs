@@ -1,26 +1,32 @@
 # ezlogs-nextjs
 
-[Website](https://ezlogs.io/) · [Documentation](https://ezlogs.io/nextjs/) · [Ruby sister agent](https://github.com/dezsirazvan/ez_logs_agent)
+[Website](https://ezlogs.io/) · [Documentation](https://ezlogs.io/nextjs/) · [Rails agent](https://github.com/dezsirazvan/ez_logs_agent) · [Supabase](https://github.com/dezsirazvan/ez_logs_supabase)
 
-**Drop-in activity logging for Next.js.** Captures HTTP requests,
-database changes, Server Actions, and background jobs. Ships them to
-the EZLogs server as plain-English Action cards your whole team can
-read.
+**Know what your app and its AI agents did, in plain English.**
 
-Wire-format identical to the Ruby agent (`ez_logs_agent`). Same
-server ingests both. App Router, Pages Router, Server Actions
-(file-level and inline), Edge runtime — all supported.
+This package records what happens in your Next.js app (requests, Server Actions, background jobs,
+database changes, calls to outside services) and sends it to [EZLogs](https://ezlogs.io). There,
+each thing someone did becomes one card anyone in your company can read:
 
 ```
-Password Reset — jessica@example.com
-2:23 PM, January 15, 2026
+00:27  Refund 'RF-3JRW' failed
+       Changed the status from pending to failed (card expired, 32.10 EUR)
+       Reason: Card expired (card ending 0069)
+       Agent · Rebooking assistant · 2 entities
 
-  ✓ Reset link created (expires in 1 hour)
-  ✓ Email sent to jessica@example.com
-  ✓ All active sessions logged out (2 devices)
-
-Status: Completed successfully
+00:26  Marked sailing 'Wed 07:10 Brackwater → Holm' as cancelled
+       Changed the status from scheduled to cancelled, marked 30 bookings as disrupted
+       Tomás Rivera · 31 entities
 ```
+
+The request, the jobs it queued and every row they changed land in one card, with who did it: a
+person, an AI agent or the system. You also get Pulse (where every person and record stands now),
+alerts by email or Slack, MCP so your own AI can read what happened, and signed audit exports.
+
+The agent only reads. It never changes anything in your app and drops passwords, tokens and other
+secrets before anything leaves it. App Router, Pages Router, Server Actions and the Edge runtime
+are supported. Same wire format as the [Rails agent](https://github.com/dezsirazvan/ez_logs_agent),
+so both show up in one timeline. Free while in beta: [sign up](https://app.ezlogs.io).
 
 ---
 
@@ -433,7 +439,7 @@ record shows by its id.
 | Calls to outside services | The host's domain (`stripe.com`), method, the path as a pattern (API versions and the first segment when it is a common collection name such as `charges`; everything else `:id`), status, time. Never a body, query string, header, address or internal host name. Not your app's own Supabase project or Upstash Redis (their writes show as data changes), the agent's own calls, or EZLogs itself. At most 50 per action; `captureOutbound: false` turns it off, `excludedHosts` leaves services out | `fetch`, `http`/`https` (stripe-node, axios, the OpenAI and Resend SDKs) through Node's diagnostics channels: nothing is wrapped or awaited, about the cost of a clock read per call; on Edge, the `fetch` wrapper |
 
 Every event in one inbound request shares a `correlation_id` so the
-server stitches them into a single Action card.
+server stitches them into a single action.
 
 **Automatic exclusions** (no config needed):
 `_next`, `_vercel`, `__nextjs_*`, health-checks, static assets, and
