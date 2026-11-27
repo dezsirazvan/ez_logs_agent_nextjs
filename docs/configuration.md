@@ -45,7 +45,9 @@ ezlogs.init({
   // ==========================================
   // A request on an excluded path is not captured, and (with captureHttp on)
   // neither are the orphan DB writes its route handler makes while it runs;
-  // a job run there keeps its events.
+  // a job run there keeps its events. An excluded job sends nothing, its
+  // DB writes and outside calls included (not Inngest 3 functions or
+  // BullMQ's listener-only fallback without processFn).
   excludedPaths: ["/admin/preview*", "/internal/*"],
   excludedTables: ["audit_logs", "versions"],
   excludedJobClasses: ["app/internal/heartbeat"],

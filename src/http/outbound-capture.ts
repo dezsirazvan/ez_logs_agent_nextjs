@@ -16,7 +16,7 @@
 // Supabase actor lookup and pre-reads run inside runInternal), the app's own data stores reached
 // over HTTP (its Supabase project, its Upstash Redis), and excludedHosts.
 
-import { current as currentCorrelation } from "../correlation.js";
+import { current as currentCorrelation, excludedCorrelation } from "../correlation.js";
 import { configuration } from "../configuration.js";
 import { createScopedStorage } from "../edge-fallback.js";
 import { build, type Event } from "../event-builder.js";
@@ -86,7 +86,8 @@ export function correlationForCall(origin: string): string | null {
     if (config.captureOutbound === false) return null;
     if (internal.read()) return null;
     const id = currentCorrelation();
-    if (!id) return null;
+    // An excluded job's call: never recorded (decided at the call's start, in the caller's context).
+    if (!id || id === excludedCorrelation()) return null;
     if (isOwnOrExcluded(origin)) return null;
     return id;
   } catch {

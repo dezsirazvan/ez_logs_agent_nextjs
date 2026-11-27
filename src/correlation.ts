@@ -85,13 +85,15 @@ const storage = createScopedStorage<CorrelationScope>(
 // it does not survive an await: those events are sent as before.
 interface ExcludedScope {
   active: boolean;
+  /** An excluded job's own correlation: every event that carries it is dropped too. */
+  correlationId?: string | undefined;
 }
 const excludedStorage = createScopedStorage<ExcludedScope>(
   Symbol.for("ezlogs-nextjs:excluded-request-storage"),
 );
 
-export function runExcluded<R>(callback: () => R): R {
-  const scope: ExcludedScope = { active: true };
+export function runExcluded<R>(callback: () => R, correlationId?: string): R {
+  const scope: ExcludedScope = { active: true, correlationId };
   let result: R;
   try {
     result = excludedStorage.run(scope, callback);
@@ -108,6 +110,16 @@ export function runExcluded<R>(callback: () => R): R {
     scope.active = false;
   }
   return result;
+}
+
+/** The excluded job's correlation, while its scope is active. */
+export function excludedCorrelation(): string | null {
+  try {
+    const scope = excludedStorage.read();
+    return scope?.active === true ? (scope.correlationId ?? null) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function isExcluded(): boolean {

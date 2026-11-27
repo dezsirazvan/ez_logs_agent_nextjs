@@ -33,6 +33,8 @@ import {
   emitJobEvent,
   extractCorrelationFromPayload,
   flushJobAuditLog,
+  isExcludedJob,
+  runExcludedJob,
   signedActorToken,
   readActorToken,
   ACTOR_PAYLOAD_KEY,
@@ -231,6 +233,17 @@ function inngestV4Hooks() {
         const event = body.event;
         const attempt = typeof body.ctx?.attempt === "number" ? body.ctx.attempt : 0;
         const runId = args.runId || body.ctx?.run_id || null;
+        // An excluded function sends nothing, its writes included (runJobWithCapture's rule).
+        // The serve request is still this run's delivery (no HTTP card for it), as before.
+        if (isExcludedJob(fnId)) {
+          return await runExcludedJob(() => insideV4Run.run(true, async () => {
+            try {
+              return await next();
+            } finally {
+              if (executed) markJobDelivery();
+            }
+          }));
+        }
         return await runInsideInngestCorrelation(event, () => insideV4Run.run(true, async () => {
           const startedAt = new Date();
           try {

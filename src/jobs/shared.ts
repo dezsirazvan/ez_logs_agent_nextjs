@@ -24,6 +24,7 @@ import {
   current as currentCorrelation,
   endCorrelationScope,
   generate as generateCorrelation,
+  runExcluded,
   runWithCorrelation,
 } from "../correlation.js";
 import { configuration } from "../configuration.js";
@@ -131,6 +132,37 @@ export function emitJobEvent(input: JobEmitInput): void {
 }
 
 /**
+ * An excluded job sends nothing, its writes and outside calls included (as the Ruby agent and an
+ * excluded path). It runs under its own fresh id, so its DB rows are still tagged (trigger mode
+ * claims them at the end, never leaving them for the sweeper) and every event carrying that id is
+ * dropped while it runs. Work it starts under another id (a job of its own) is captured as usual.
+ */
+export function runExcludedJob<T>(work: () => Promise<T>): Promise<T> {
+  const correlationId = generateCorrelation();
+  const body = async (): Promise<T> => {
+    const startedAt = new Date();
+    try {
+      return await work();
+    } finally {
+      await flushJobAuditLog(startedAt);
+    }
+  };
+  return runExcluded(
+    () => runWithCorrelation(correlationId, () => runWithActorScope(() => body().finally(endCorrelationScope), null)),
+    correlationId,
+  );
+}
+
+export function isExcludedJob(jobClass: string): boolean {
+  try {
+    const config = configuration();
+    return config.captureJobs !== false && config.allExcludedJobClasses().includes(jobClass);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Wrap a job-execution function so events are produced on success and
  * failure, exceptions are re-raised, and correlation flows through.
  *
@@ -169,6 +201,8 @@ export async function runJobWithCapture<T>(
   },
   work: () => Promise<T>,
 ): Promise<T> {
+  if (isExcludedJob(meta.jobClass)) return runExcludedJob(work);
+
   // Use the propagated correlation, or generate a new one if absent.
   // Mirrors Sidekiq server middleware: `job["correlation_id"] || Correlation.generate`.
   const correlationId = meta.correlationId ?? generateCorrelation();

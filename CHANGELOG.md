@@ -3,6 +3,11 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.19] — 2026-11-27
+
+### Fixed
+- **An excluded job sends nothing, its database writes included.** A job in `excludedJobClasses` (BullMQ, Trigger.dev, Supabase Queues, Upstash Workflow steps, Inngest 4 functions) used to drop only its own job event: what it wrote still went out, as an action with no job behind it. It now runs under its own id and nothing carrying that id is sent: its row changes (trigger mode included: the rows are still tagged and claimed when the job ends, never left for the sweeper), its outside calls and its job event, the same rule as the Rails gem. A job it starts is captured as usual, and jobs that are not excluded are captured exactly as before. Not covered: an Inngest 3 function (the middleware cannot wrap its body) and BullMQ's listener-only fallback (no `processFn`): their writes are sent as before.
+
 ## [0.4.18] — 2026-11-26
 
 ### Privacy
