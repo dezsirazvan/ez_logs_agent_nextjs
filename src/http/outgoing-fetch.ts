@@ -21,7 +21,7 @@
 import { current as currentCorrelation } from "../correlation.js";
 import { configuration } from "../configuration.js";
 import { logger } from "../logger.js";
-import { channelsRecordCalls, correlationForCall, now, recordCall } from "./outbound-capture.js";
+import { channelsRecordCalls, correlationForCall, now, recordCall, signOutWatch } from "./outbound-capture.js";
 import { loadNodeBuiltin } from "../node-builtin.js";
 
 const HEADER = "x-correlation-id";
@@ -42,6 +42,7 @@ export function patchGlobalFetch(): void {
     // Where Node's channels don't record calls (Edge), the call is measured here, around the
     // promise the app already awaits: nothing is added to its wait (http/outbound-capture.ts).
     const measure = channelsRecordCalls() ? null : startMeasure(input, init);
+    const signOut = channelsRecordCalls() ? null : watchSignOut(input, init);
     let enriched: { input: Parameters<typeof fetch>[0]; init: Parameters<typeof fetch>[1] } = { input, init };
     try {
       // Never the agent's own POST to EZLogs: on serverless its flush runs inside the request.
@@ -52,6 +53,7 @@ export function patchGlobalFetch(): void {
     }
     // Called once, outside the try: a fetch that throws must never be sent a second time.
     const call = originalFetch!.call(globalThis, enriched.input, enriched.init);
+    if (signOut) call.then((response) => signOut(response.status), () => undefined);
     return measure ? measure(call) : call;
   };
 
@@ -201,6 +203,14 @@ function toEzlogsServer(input: Parameters<typeof fetch>[0]): boolean {
     return url.startsWith(server.replace(/\/+$/, "")) && sameOrigin(url, server);
   } catch {
     return false;
+  }
+}
+
+function watchSignOut(input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]): ((status: number) => void) | null {
+  try {
+    return signOutWatch(methodOf(input, init), urlOf(input));
+  } catch {
+    return null;
   }
 }
 

@@ -16,7 +16,7 @@
 // Supabase actor lookup and pre-reads run inside runInternal), the app's own data stores reached
 // over HTTP (its Supabase project, its Upstash Redis), and excludedHosts.
 
-import { current as currentCorrelation, excludedCorrelation } from "../correlation.js";
+import { current as currentCorrelation, currentScope, excludedCorrelation } from "../correlation.js";
 import { configuration } from "../configuration.js";
 import { createScopedStorage } from "../edge-fallback.js";
 import { build, type Event } from "../event-builder.js";
@@ -95,6 +95,29 @@ export function correlationForCall(origin: string): string | null {
   }
 }
 
+// Supabase Auth's sign-out (`POST /auth/v1/logout`, what supabase.auth.signOut() sends), answered
+// 2xx inside a request: the person signed out there, whatever the route's name or method. Sent as
+// the request's `signed_out`, the evidence field the Ruby agent sends from Warden. Read on every
+// call, its host included (the Supabase host is never an outbound step).
+const SIGN_OUT_PATH = /^\/auth\/v1\/logout(?:[?#]|$)/;
+
+export function signOutWatch(method: string, url: string): ((status: number) => void) | null {
+  try {
+    if (method.toUpperCase() !== "POST") return null;
+    const parsed = new URL(url, "http://local");
+    if (!SIGN_OUT_PATH.test(parsed.pathname)) return null;
+    // scope=others ends the person's other sessions and keeps this one: not a sign-out here.
+    if (parsed.searchParams.get("scope") === "others") return null;
+    const scope = currentScope();
+    if (!scope || !currentCorrelation()) return null;
+    return (status) => {
+      if (status >= 200 && status < 300) scope.signedOut = true;
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function now(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
@@ -120,6 +143,7 @@ export function recordCall(correlationId: string, startedAt: number, url: string
 interface CallState { id: string; started: number; url: string; method: string; done: boolean }
 const undiciCalls = new WeakMap<object, CallState>();
 const httpCalls = new WeakMap<object, CallState>();
+const signOuts = new WeakMap<object, (status: number) => void>();
 // On globalThis like the buffer: a bundler that duplicates this module must not subscribe twice
 // (every call recorded twice) or let the fetch wrapper measure beside live channels.
 const STATE_KEY = Symbol.for("ezlogs-nextjs:outbound-channels");
@@ -167,6 +191,8 @@ function onUndiciCreate(message: unknown): void {
     const request = (message as { request?: UndiciRequest } | null)?.request;
     if (!request) return;
     const origin = String(request.origin ?? "");
+    const signOut = signOutWatch(String(request.method ?? "GET"), String(request.path ?? "/"));
+    if (signOut) signOuts.set(request as object, signOut);
     const id = correlationForCall(origin);
     if (!id) return;
     undiciCalls.set(request as object, { id, started: now(), url: origin + String(request.path ?? "/"), method: String(request.method ?? "GET"), done: false });
@@ -178,6 +204,7 @@ function onUndiciCreate(message: unknown): void {
 function onUndiciHeaders(message: unknown): void {
   try {
     const m = message as { request?: object; response?: { statusCode?: number } } | null;
+    if (m?.request) signOuts.get(m.request)?.(Number(m.response?.statusCode ?? 0));
     const state = m?.request ? undiciCalls.get(m.request) : undefined;
     if (!state || state.done) return;
     state.done = true;
@@ -206,6 +233,8 @@ function onHttpStart(message: unknown): void {
     const request = (message as { request?: HttpRequest } | null)?.request;
     if (!request) return;
     const origin = `${String(request.protocol ?? "https:")}//${String(request.host ?? "")}`;
+    const signOut = signOutWatch(String(request.method ?? "GET"), String(request.path ?? "/"));
+    if (signOut) signOuts.set(request as object, signOut);
     const id = correlationForCall(origin);
     if (!id) return;
     httpCalls.set(request as object, { id, started: now(), url: origin + String(request.path ?? "/"), method: String(request.method ?? "GET"), done: false });
@@ -217,6 +246,7 @@ function onHttpStart(message: unknown): void {
 function onHttpFinish(message: unknown): void {
   try {
     const m = message as { request?: object; response?: { statusCode?: number } } | null;
+    if (m?.request) signOuts.get(m.request)?.(Number(m.response?.statusCode ?? 0));
     const state = m?.request ? httpCalls.get(m.request) : undefined;
     if (!state || state.done) return;
     state.done = true;
@@ -286,7 +316,7 @@ const API_VERBS = new Set([
   "refund", "reject", "remove", "resend", "restore", "retrieve", "reverse", "search", "send", "start",
   "stop", "sync", "update", "upload", "validate", "verify", "void",
 ]);
-const API_NOUNS = new Set(["auth", "balance", "chat", "checkout", "item", "link", "token"]);
+const API_NOUNS = new Set(["auth", "balance", "chat", "checkout", "graphql", "item", "link", "token"]);
 
 /**
  * The server's rule, kept by REST structure (keepSegment: "/v1/customers/cus_9x/orders" →

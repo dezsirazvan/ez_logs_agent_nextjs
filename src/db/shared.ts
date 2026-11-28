@@ -358,10 +358,22 @@ export function filterMeaningfulAttributes(
   return Object.keys(out).length === 0 ? null : out;
 }
 
+// A stored password hash (encrypted_password, password_digest, passwordHash, hashed_password, ...).
+// Its change is sent as one fact, `password`, never a value: as the Ruby agent and the Supabase
+// install's pw_changed ("changed the password").
+const PASSWORD_HASH_COLUMN =
+  /^(?:encrypted_?password|(?:\w+_)?password_?digest|(?:hashed|crypted)_?password|password_?(?:hash|crypted))$/i;
+const PASSWORD_CHANGE: DbAttributeChange = Object.freeze({ attribute: "password", from: "[FILTERED]", to: "[FILTERED]" });
+
 export function filterMeaningfulChanges(
   changes: DbAttributeChange[],
 ): DbAttributeChange[] {
-  return flattenNestedChanges(changes).filter((c) => {
+  // Only with a known before-value: a write that merely carries the hash (Prisma's `data: { ...user }`,
+  // an upsert) would otherwise read as a password change that never happened.
+  const passwordChanged = changes.some(
+    (c) => PASSWORD_HASH_COLUMN.test(c.attribute) && c.from !== undefined && c.to !== undefined && !sameJson(c.from, c.to),
+  );
+  const kept = flattenNestedChanges(changes).filter((c) => {
     if (!isMeaningfulAttribute(c.attribute)) return false;
     if (!isScalar(c.to)) return false;
     // If `from` is undefined, the adapter didn't have a previous value
@@ -371,6 +383,7 @@ export function filterMeaningfulChanges(
     if (!isScalar(c.from)) return false;
     return valuesActuallyChanged(c.from, c.to);
   });
+  return passwordChanged ? [...kept, PASSWORD_CHANGE] : kept;
 }
 
 // json/jsonb columns: one change per changed leaf, as a dotted path

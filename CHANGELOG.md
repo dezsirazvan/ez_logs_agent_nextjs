@@ -3,6 +3,15 @@
 All notable changes to `ezlogs-nextjs` are documented here.
 Earlier releases (0.1.x) were not tracked in a changelog.
 
+## [0.4.20] — 2026-11-27
+
+### Added
+- **Supabase sign-outs read "Signed out".** When `supabase.auth.signOut()` runs inside a request (Supabase Auth's `POST /auth/v1/logout`, answered 2xx), the request is sent with `signed_out: true`, the evidence field the Rails gem sends from Warden, whatever the route is called or its method (a `GET /logout` route handler included). Before, such a route read "Viewed logout". A refused or unrelated auth call marks nothing, nor does `signOut({ scope: "others" })` (it keeps the current session).
+
+### Changed
+- **A password change is shown, never its hash.** A changed password hash column (`encrypted_password`, `password_digest`, `passwordHash`, `hashed_password`, ...) is sent as one change, `password`, with both values `[FILTERED]` ("changed the password"), when the value before the write is known (trigger mode, and any adapter that reads it); a write that only carries the hash with no before-value (a Prisma `data: { ...user }`, an upsert) is not claimed as a change. In trigger mode the audit row keeps two fixed markers for that column, never anything read from the hash: rerun `npx install-triggers` to update the trigger function. Same rule as the Rails gem 0.2.26.
+- **A GraphQL endpoint reads as `/graphql`** in an outbound call's path pattern, instead of `/:id`.
+
 ## [0.4.19] — 2026-11-27
 
 ### Fixed

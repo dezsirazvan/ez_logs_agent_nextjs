@@ -12,6 +12,7 @@
  * contains values that were actually known at capture time.
  */
 
+import { currentScope } from "../correlation.js";
 import { isSensitiveKey, sanitizeRequestParams, scrubSecretsInText } from "./sanitize.js";
 
 export interface HttpCaptureInput {
@@ -58,6 +59,8 @@ export function buildHttpSourceData(
     user_agent: input.userAgent,
     remote_ip: input.remoteIp,
   };
+  // Supabase Auth confirmed a sign-out inside this request (outbound-capture.ts signOutWatch).
+  if (currentScope()?.signedOut) source.signed_out = true;
 
   // For Server Actions, parse the camelCase action name into a verb +
   // entity pair. The dashboard's NLP layer uses these to render

@@ -176,6 +176,8 @@ CREATE OR REPLACE FUNCTION public.ezlogs_audit_trigger() RETURNS trigger
 AS $$
 DECLARE
   resource_id_value text;
+  fast_path boolean := false;
+  pw_key text;
   pk_column_name    text;
   old_raw           jsonb;
   new_raw           jsonb;
@@ -210,6 +212,7 @@ BEGIN
      AND ARRAY(SELECT jsonb_object_keys(COALESCE(new_raw, old_raw))) = TG_ARGV[2]::text[] THEN
     old_json := old_raw - TG_ARGV[1]::text[];
     new_json := new_raw - TG_ARGV[1]::text[];
+    fast_path := true;
   ELSE
     old_json := public.ezlogs_strip_sensitive(old_raw);
     new_json := public.ezlogs_strip_sensitive(new_raw);
@@ -220,6 +223,19 @@ BEGIN
   -- secret (a `token` table keyed by the token) yields NULL, not the
   -- secret. `->>X` returns NULL when X doesn't exist or is NULL.
   resource_id_value := COALESCE(new_json->>pk_column_name, old_json->>pk_column_name);
+  -- A password hash that changed is kept as a fact only: two fixed markers, never anything read
+  -- from the hash. The agent sends it as "password" (src/db/shared.ts PASSWORD_HASH_COLUMN, same names).
+  IF TG_OP = 'UPDATE' THEN
+    FOR pw_key IN
+      SELECT k FROM unnest(CASE WHEN fast_path THEN TG_ARGV[1]::text[] ELSE ARRAY(SELECT jsonb_object_keys(old_raw)) END) AS k
+       WHERE k ~* '^(encrypted_?password|([a-z0-9]+_)*password_?digest|(hashed|crypted)_?password|password_?(hash|crypted))$'
+         AND old_raw->k IS DISTINCT FROM new_raw->k
+    LOOP
+      old_json := old_json || jsonb_build_object(pw_key, '[FILTERED]');
+      new_json := new_json || jsonb_build_object(pw_key, '[CHANGED]');
+    END LOOP;
+  END IF;
+
   -- Nothing visible changed (only sensitive columns, or a no-op
   -- UPDATE): skip the row.
   IF TG_OP = 'UPDATE' AND old_json = new_json THEN

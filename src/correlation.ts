@@ -71,6 +71,8 @@ interface CorrelationScope {
   expiresAt: number;
   /** A Drizzle transaction's state on this request (src/db/drizzle.ts). */
   drizzleTx?: unknown;
+  /** Supabase Auth confirmed a sign-out during this request (http/outbound-capture.ts signOutWatch). */
+  signedOut?: boolean;
 }
 const storage = createScopedStorage<CorrelationScope>(
   Symbol.for("ezlogs-nextjs:correlation-storage"),
